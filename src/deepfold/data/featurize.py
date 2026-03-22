@@ -330,6 +330,15 @@ def featurize(
             token_resolved_mask.astype(np.float32)
         )  # (N,) float
 
+    # ------------------------------------------------------------------
+    # Padding masks (all-ones at single-sample level; collate pads with 0)
+    # Convention: 1.0 = real, 0.0 = padding (float, following Boltz-1)
+    # ------------------------------------------------------------------
+    features["token_pad_mask"] = torch.ones(N, dtype=torch.float32)  # (N,)
+    features["atom_pad_mask"] = torch.ones(N_atom, dtype=torch.float32)  # (N_atom,)
+    n_pairs = len(pair_idx_np)
+    features["pair_valid_mask"] = torch.ones(n_pairs, dtype=torch.float32)  # (n_pairs,)
+
     return features
 
 
