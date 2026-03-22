@@ -48,6 +48,9 @@ def main():
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--release-cutoff", type=str, default=None,
+                        help="Only train on structures released before this date (YYYY-MM-DD)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     # Load config from YAML
@@ -60,6 +63,11 @@ def main():
         cfg.training.grad_accum_steps = args.grad_accum_steps
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
+
+    # Reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Set crop schedule from config
     set_crop_schedule(cfg.training.crop_schedule)
@@ -129,12 +137,33 @@ def main():
     if not train_paths:
         raise FileNotFoundError(f"No NPZ files found in {data_dir}")
 
+    # Filter by release date cutoff if manifest + cutoff provided
+    if args.release_cutoff and args.manifest:
+        import json
+        with open(args.manifest) as f:
+            manifest = json.load(f)
+        valid_ids = {
+            r["id"] for r in manifest
+            if r.get("structure", {}).get("released", "9999") <= args.release_cutoff
+        }
+        before = len(train_paths)
+        train_paths = [p for p in train_paths if p.stem in valid_ids]
+        if rank0:
+            logger.info(
+                "Release cutoff %s: %d → %d structures (%.1f%%)",
+                args.release_cutoff, before, len(train_paths),
+                100 * len(train_paths) / before,
+            )
+        if not train_paths:
+            raise FileNotFoundError(f"No structures before cutoff {args.release_cutoff}")
+
     train_dataset = DeepFoldDataset(
         data_paths=train_paths,
         max_tokens=get_crop_size(start_step),
         max_msa_seqs=cfg.msa.max_depth,
         msa_dir=args.msa_dir,
         training=True,
+        seed=args.seed,
     )
 
     # Build sampler: cluster-weighted (if manifest provided) or random
