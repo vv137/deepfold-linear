@@ -268,7 +268,7 @@ def _scatter_add_at_indices(
         source: (B, K, D)
         indices: (B, K) long
     """
-    target.scatter_add_(1, indices.unsqueeze(-1).expand_as(source), source)
+    target.scatter_add_(1, indices.unsqueeze(-1).expand_as(source), source.to(target.dtype))
 
 
 class MSAModule(nn.Module):

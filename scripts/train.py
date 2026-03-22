@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     args = parser.parse_args()
 
     # Load config from YAML
@@ -55,6 +56,8 @@ def main():
         cfg.training.total_steps = args.total_steps
     if args.grad_accum_steps is not None:
         cfg.training.grad_accum_steps = args.grad_accum_steps
+    if args.batch_size is not None:
+        cfg.training.batch_size = args.batch_size
 
     # Set crop schedule from config
     set_crop_schedule(cfg.training.crop_schedule)
@@ -149,9 +152,10 @@ def main():
         if rank0:
             logger.info("Using DistributedSampler")
 
+    batch_size = cfg.training.batch_size
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers,
@@ -173,7 +177,7 @@ def main():
             val_sampler = DistributedSampler(val_dataset, shuffle=False) if use_ddp else None
             val_loader = torch.utils.data.DataLoader(
                 val_dataset,
-                batch_size=1,
+                batch_size=batch_size,
                 shuffle=False,
                 sampler=val_sampler,
                 num_workers=args.num_workers,
@@ -182,7 +186,7 @@ def main():
             )
 
     if rank0:
-        logger.info("Training on %d structures", len(train_paths))
+        logger.info("Training on %d structures (batch_size=%d)", len(train_paths), batch_size)
         if val_loader:
             logger.info("Validation on %d structures", len(val_paths))
 

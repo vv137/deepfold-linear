@@ -156,22 +156,46 @@ def batch_augment(
     Each of the M copies gets centered, then a different random SO(3) rotation
     (and, if training, a different small Gaussian translation).
 
+    Supports both unbatched and batched inputs:
+
     Args:
-        x:        (N_atom, 3) coordinates (already centered from featurize).
+        x:        (N_atom, 3) or (B, N_atom, 3) coordinates.
         M:        number of augmented copies.
         s_trans:  translation std (Å). Only applied during training.
         training: if False, skip translation.
 
     Returns:
-        (M, N_atom, 3) augmented coordinate copies.
+        Unbatched: (M, N_atom, 3)
+        Batched:   (M, B, N_atom, 3)
     """
-    # x is (N_atom, 3) → (M, N_atom, 3) via independent rotations
+    if x.dim() == 2:
+        # Unbatched: (N_atom, 3) → (M, N_atom, 3)
+        R = random_rotation_matrices_torch(M, x.device, x.dtype)  # (M, 3, 3)
+        x_exp = x.unsqueeze(0).expand(M, -1, -1)  # (M, N_atom, 3)
+        x_rot = torch.bmm(x_exp, R.transpose(1, 2))  # (M, N_atom, 3)
+
+        if training:
+            t = torch.randn(M, 1, 3, device=x.device, dtype=x.dtype) * s_trans
+            x_rot = x_rot + t
+
+        return x_rot
+
+    # Batched: (B, N_atom, 3) → (M, B, N_atom, 3)
+    B, N_atom, _ = x.shape
     R = random_rotation_matrices_torch(M, x.device, x.dtype)  # (M, 3, 3)
-    x_exp = x.unsqueeze(0).expand(M, -1, -1)  # (M, N_atom, 3)
-    x_rot = torch.bmm(x_exp, R.transpose(1, 2))  # (M, N_atom, 3)
+
+    # Expand x to (M, B, N_atom, 3) and R to (M, B, 3, 3)
+    x_exp = x.unsqueeze(0).expand(M, -1, -1, -1)  # (M, B, N_atom, 3)
+    R_exp = R[:, None, :, :].expand(-1, B, -1, -1)  # (M, B, 3, 3)
+
+    # Reshape for bmm: (M*B, N_atom, 3) @ (M*B, 3, 3)
+    x_flat = x_exp.reshape(M * B, N_atom, 3)
+    R_flat = R_exp.reshape(M * B, 3, 3)
+    x_rot = torch.bmm(x_flat, R_flat.transpose(1, 2)).view(M, B, N_atom, 3)
 
     if training:
-        t = torch.randn(M, 1, 3, device=x.device, dtype=x.dtype) * s_trans
+        # One translation per (M, B) pair
+        t = torch.randn(M, B, 1, 3, device=x.device, dtype=x.dtype) * s_trans
         x_rot = x_rot + t
 
     return x_rot
