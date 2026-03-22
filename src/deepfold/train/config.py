@@ -28,6 +28,7 @@ class ModelConfig:
 class TrainingConfig:
     lr: float = 1e-4
     weight_decay: float = 0.01
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.999])
     warmup_steps: int = 5000
     total_steps: int = 500_000
     ema_decay: float = 0.999

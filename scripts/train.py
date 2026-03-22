@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import multiprocessing
 import os
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,10 @@ from deepfold.train.trainer import (
     train_step,
     val_step,
 )
+
+# Python 3.14 defaults to forkserver which requires picklable worker args.
+# Use fork for compatibility with closures and CUDA context sharing.
+multiprocessing.set_start_method("fork", force=True)
 
 LOG_FMT = "%(asctime)s %(levelname)s %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
@@ -151,7 +156,8 @@ def main():
         logger.info("Loss weights: %s", cfg.loss_weights.to_dict())
 
     optimizer = build_optimizer(
-        model, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
+        model, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay,
+        betas=tuple(cfg.training.betas),
     )
     ema = EMA(
         model, decay=cfg.training.ema_decay, warmup_steps=cfg.training.ema_warmup_steps
@@ -287,7 +293,13 @@ def main():
             )
 
     if rank0:
-        logger.info("Training on %d structures (batch_size=%d)", len(train_paths), batch_size)
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        effective_batch = batch_size * cfg.training.grad_accum_steps * world_size
+        logger.info(
+            "Training on %d structures (batch_size=%d, accum=%d, gpus=%d, effective=%d)",
+            len(train_paths), batch_size, cfg.training.grad_accum_steps,
+            world_size, effective_batch,
+        )
         if val_loader:
             logger.info("Validation on %d structures", len(val_paths))
 
@@ -335,7 +347,8 @@ def main():
             )
 
             if result is None:
-                # OOM — skip rest of this step
+                # OOM — discard entire step (no optimizer step was taken)
+                metrics = None
                 oom_count += 1
                 if rank0:
                     logger.warning("OOM skip #%d at step %d", oom_count, step)
@@ -350,9 +363,10 @@ def main():
         if rank0 and step % args.log_every == 0:
             logger.info(
                 "step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f "
-                "lr=%.6f crop=%d",
+                "grad_norm=%.4f lr=%.6f crop=%d",
                 step, metrics["loss"], metrics["l_diff"], metrics["l_lddt"],
-                metrics["l_disto"], metrics["l_trunk_coord"], metrics["lr"], crop_size,
+                metrics["l_disto"], metrics["l_trunk_coord"],
+                metrics["grad_norm"], metrics["lr"], crop_size,
             )
 
         # Validation

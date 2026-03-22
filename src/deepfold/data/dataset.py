@@ -706,7 +706,7 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
           padded with 0.0 (marks padding positions)
     """
     if len(batch) == 1:
-        return batch[0]
+        return {k: v.unsqueeze(0) for k, v in batch[0].items()}
 
     # Collect all keys (use first sample; all samples have the same keys)
     keys = batch[0].keys()
