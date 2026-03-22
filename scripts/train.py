@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +24,8 @@ from deepfold.train.trainer import (
     val_step,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG_FMT = "%(asctime)s %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +38,12 @@ def main():
     parser.add_argument("--msa-dir", type=str, default=None,
                         help="Directory with MSA NPZ files ({pdb}_{chain}.npz)")
     parser.add_argument("--val-data-dir", type=str, default=None)
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--output-dir", type=str, default="runs",
+                        help="Base directory for run outputs (auto-generates timestamped subdir)")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Custom run name (default: YYYYMMDD_HHMMSS)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Override checkpoint directory (default: <run_dir>/checkpoints)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--save-every", type=int, default=10_000)
@@ -86,6 +93,41 @@ def main():
 
     rank0 = local_rank == 0
 
+    # ---- Output directory setup (rank 0 only) ----
+    run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.output_dir) / run_name
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else run_dir / "checkpoints"
+
+    if rank0:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # File logging
+        file_handler = logging.FileHandler(run_dir / "train.log")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(LOG_FMT))
+        logging.getLogger().addHandler(file_handler)
+
+        # Save resolved config for reproducibility
+        import yaml as _yaml
+        config_snapshot = {
+            "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
+            "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
+            "loss_weights": cfg.loss_weights.to_dict(),
+            "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
+            "diffusion": {k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)},
+            "msa": {k: getattr(cfg.msa, k) for k in vars(cfg.msa)},
+        }
+        with open(run_dir / "config.yaml", "w") as f:
+            _yaml.dump(config_snapshot, f, default_flow_style=False, sort_keys=False)
+
+        # Save CLI args
+        with open(run_dir / "args.txt", "w") as f:
+            for k, v in sorted(vars(args).items()):
+                f.write(f"{k}: {v}\n")
+
+        logger.info("Run directory: %s", run_dir)
+
     # Build model from config (with loss weights)
     model = DeepFoldLinear(
         d_model=cfg.model.d_model,
@@ -130,7 +172,9 @@ def main():
     if use_ddp:
         model = DDP(model, device_ids=[local_rank])
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # Checkpoint dir already created by rank 0 above; non-rank-0 needs the path
+    if not rank0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Data loaders ----
     data_dir = Path(args.data_dir)
@@ -338,7 +382,7 @@ def main():
         # Checkpointing
         if rank0 and step % args.save_every == 0:
             raw_model = model.module if use_ddp else model
-            path = os.path.join(args.checkpoint_dir, f"step_{step}.pt")
+            path = os.path.join(checkpoint_dir, f"step_{step}.pt")
             torch.save({
                 "step": step,
                 "model": raw_model.state_dict(),

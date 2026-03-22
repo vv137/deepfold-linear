@@ -7,5 +7,7 @@ __pycache__/
 dist/
 build/
 checkpoints/
+runs/
+*.pkl
 .pytest_cache/
 
