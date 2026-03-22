@@ -168,8 +168,23 @@ def main():
 
     # Build sampler: cluster-weighted (if manifest provided) or random
     train_sampler = None
+    # Build path lookup for alignment between sampler records and dataset
+    path_by_stem = {p.stem: p for p in train_paths}
     if args.manifest and cfg.sampler.type == "cluster":
         records = load_manifest(args.manifest)
+        # Filter records to match date-filtered dataset and re-order train_paths
+        # to match records so sampler index i → data_paths[i]
+        records = [r for r in records if r.id in path_by_stem]
+        train_paths = [path_by_stem[r.id] for r in records]
+        # Rebuild dataset with aligned paths
+        train_dataset = DeepFoldDataset(
+            data_paths=train_paths,
+            max_tokens=get_crop_size(start_step),
+            max_msa_seqs=cfg.msa.max_depth,
+            msa_dir=args.msa_dir,
+            training=True,
+            seed=args.seed,
+        )
         train_sampler = ClusterWeightedSampler(
             records=records,
             alpha_prot=cfg.sampler.alpha_prot,
