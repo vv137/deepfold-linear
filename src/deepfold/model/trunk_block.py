@@ -1,4 +1,7 @@
-"""Token UOT+EGNN Block (SPEC §8). 48 blocks in trunk, 2 in diffusion."""
+"""Token UOT+EGNN Block (SPEC §8). 48 blocks in trunk.
+
+Supports both unbatched (N, d) and batched (B, N, d) inputs via dual-mode pattern.
+"""
 
 import torch
 import torch.nn as nn
@@ -67,80 +70,93 @@ class TokenUOTBlock(nn.Module):
         w_dist: torch.Tensor,
         pos_bins: torch.Tensor,
         geo_gate: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            h:          (N, 512) token representation
-            x_res:      (N, 3) token coordinates
-            mu:         (H, N) row marginals
-            nu:         (H, N) column marginals
-            log_u_prev: (H, N) or None — warm-start
-            log_v_prev: (H, N) or None
-            w_rel_res:  PositionBias module or (H, N, N) precomputed
+            h:          (N, 512) or (B, N, 512) token representation
+            x_res:      (N, 3) or (B, N, 3) token coordinates
+            mu:         (H, N) or (B, H, N) row marginals
+            nu:         (H, N) or (B, H, N) column marginals
+            log_u_prev: (H, N) or (B, H, N) or None — warm-start
+            log_v_prev: (H, N) or (B, H, N) or None
+            w_rel_res:  PositionBias module or (H, N, N) or (B, H, N, N) precomputed
             w_dist:     (H,) per-head geometry weight
-            pos_bins:   (N, N) int, 68-bin position encoding
+            pos_bins:   (N, N) or (B, N, N) int, 68-bin position encoding
             geo_gate:   (H,) or None — sigma-gated for diffusion blocks
+            mask:       (B, N) bool/float, 1=real 0=pad. Only for batched.
 
         Returns:
             h, x_res, log_u, log_v
         """
-        N = h.shape[0]
+        # Dual-mode: detect unbatched and add B dim
+        unbatched = h.dim() == 2
+        if unbatched:
+            h = h.unsqueeze(0)
+            x_res = x_res.unsqueeze(0)
+            mu = mu.unsqueeze(0)
+            nu = nu.unsqueeze(0)
+            if log_u_prev is not None:
+                log_u_prev = log_u_prev.unsqueeze(0)
+            if log_v_prev is not None:
+                log_v_prev = log_v_prev.unsqueeze(0)
+            if isinstance(w_rel_res, torch.Tensor) and w_rel_res.dim() == 3:
+                w_rel_res = w_rel_res.unsqueeze(0)
+            pos_bins = pos_bins.unsqueeze(0)
+
+        B, N, _ = h.shape
         H = self.n_heads
         d_h = self.d_head
 
-        # ---- Pre-norm ----
-        h_n = self.ln_attn(h)
-        Q = self.w_q(h_n).view(N, H, d_h)
-        K = self.w_k(h_n).view(N, H, d_h)
-        V = self.w_v(h_n).view(N, H, d_h)
-        G = self.w_g(h_n).view(N, H, d_h)
+        if mask is None:
+            mask = h.new_ones(B, N)
 
-        # Transpose to (H, N, d_h)
-        Q = Q.permute(1, 0, 2)
-        K = K.permute(1, 0, 2)
-        V = V.permute(1, 0, 2)
-        G = G.permute(1, 0, 2)
+        # ---- Pre-norm ----
+        h_n = self.ln_attn(h)  # (B, N, d_model)
+        Q = self.w_q(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)  # (B, H, N, d_h)
+        K = self.w_k(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
+        V = self.w_v(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
+        G = self.w_g(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
         # ---- Cost matrix (SPEC §7.1) ----
-        # LN on Q, K for Sinkhorn stability
         Q_ln = F.layer_norm(Q, [d_h])
         K_ln = F.layer_norm(K, [d_h])
-        content = -torch.einsum("hid,hjd->hij", Q_ln, K_ln) / (d_h**0.5)  # (H, N, N)
+        content = -torch.einsum("bhid,bhjd->bhij", Q_ln, K_ln) / (d_h**0.5)  # (B, H, N, N)
 
-        # Position bias
-        if isinstance(w_rel_res, torch.Tensor) and w_rel_res.dim() == 3:
-            pos_bias = w_rel_res
+        # Position bias — precomputed (B, H, N, N) tensor or PositionBias module
+        if isinstance(w_rel_res, torch.Tensor):
+            pos_bias = w_rel_res if w_rel_res.dim() == 4 else w_rel_res.unsqueeze(0)
         else:
-            pos_bias = w_rel_res(pos_bins)  # (H, N, N)
+            pos_bias = w_rel_res(pos_bins)
+            if pos_bias.dim() == 3:
+                pos_bias = pos_bias.unsqueeze(0)
 
         # Geometry bias
-        dist = torch.cdist(x_res, x_res)  # (N, N)
-        f_dist = dist / (self.r_0 + dist)  # (N, N), bounded [0, 1)
+        dist = torch.cdist(x_res, x_res)  # (B, N, N)
+        f_dist = dist / (self.r_0 + dist)  # (B, N, N), bounded [0, 1)
 
-        # Per-head geometry weight
         effective_w_dist = w_dist  # (H,)
         if geo_gate is not None:
-            effective_w_dist = geo_gate * w_dist  # sigma-gated for diffusion
+            effective_w_dist = geo_gate * w_dist
 
-        geo_bias = effective_w_dist[:, None, None] * f_dist.unsqueeze(0)  # (H, N, N)
+        geo_bias = effective_w_dist[None, :, None, None] * f_dist[:, None, :, :]  # (B, H, N, N)
 
-        C = content + pos_bias + geo_bias  # (H, N, N)
+        C = content + pos_bias + geo_bias  # (B, H, N, N)
 
         # ---- Sinkhorn ----
         init_u = log_u_prev
         init_v = log_v_prev
 
-        log_mu = torch.log(mu.clamp(min=1e-8))
+        log_mu = torch.log(mu.clamp(min=1e-8))  # (B, H, N)
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # FP32 for Sinkhorn log-domain stability (SPEC §18).
-        # .float() casts are differentiable — gradients flow through dtype conversion.
+        # FP32 for Sinkhorn log-domain stability (SPEC §18)
         C_fp32 = C.float()
         log_mu_fp32 = log_mu.float()
         log_nu_fp32 = log_nu.float()
         eps_fp32 = self.eps.float()
-        init_u_fp32 = init_u.float()
-        init_v_fp32 = init_v.float()
+        init_u_fp32 = init_u.float() if init_u is not None else None
+        init_v_fp32 = init_v.float() if init_v is not None else None
 
         log_u, log_v = sinkhorn_solve(
             C_fp32,
@@ -151,26 +167,35 @@ class TokenUOTBlock(nn.Module):
             K=K_ITER,
             log_u_init=init_u_fp32,
             log_v_init=init_v_fp32,
+            mask=mask,
         )
 
         # ---- Transport output + EGNN ----
         o, T_norm, x_centroid = compute_transport_output(
-            V.float(), G.float(), log_u, log_v, C_fp32, eps_fp32, x_res.float()
+            V.float(), G.float(), log_u, log_v, C_fp32, eps_fp32,
+            x_res.float(), mask=mask,
         )
 
         # h update (invariant)
-        h = h + self.w_o(o.to(h.dtype))
+        h_update = self.w_o(o.to(h.dtype))  # (B, N, d_model)
+        # Zero out padded positions
+        h_update = h_update * mask.unsqueeze(-1)
+        h = h + h_update
 
         # ---- EGNN x_res update (equivariant, SPEC §8) ----
-        # Three gradient sources flow through x_res per the backward analysis:
-        # 1. EGNN: ∂L/∂x through centroid displacement (via gamma)
-        # 2. Geometry cost: ∂L/∂x through distance term in C_ij (via IFT → grad_C)
-        # 3. Pass-through from next block
-        delta = x_res.unsqueeze(0).float() - x_centroid  # (H, N, 3)
-        x_update = torch.einsum("h,hnc->nc", self.gamma, delta)  # (N, 3)
+        delta = x_res.unsqueeze(1).float() - x_centroid  # (B, H, N, 3)
+        x_update = torch.einsum("h,bhnc->bnc", self.gamma, delta)  # (B, N, 3)
+        x_update = x_update * mask.unsqueeze(-1)
         x_res = x_res + x_update.to(x_res.dtype)
 
         # ---- SwiGLU transition ----
-        h = h + self.swiglu(self.ln_ff(h))
+        ff_update = self.swiglu(self.ln_ff(h))
+        ff_update = ff_update * mask.unsqueeze(-1)
+        h = h + ff_update
 
-        return h, x_res, log_u.to(h.dtype), log_v.to(h.dtype)
+        log_u_out = log_u.to(h.dtype)
+        log_v_out = log_v.to(h.dtype)
+
+        if unbatched:
+            return h.squeeze(0), x_res.squeeze(0), log_u_out.squeeze(0), log_v_out.squeeze(0)
+        return h, x_res, log_u_out, log_v_out
