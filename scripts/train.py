@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -185,20 +186,27 @@ def main():
             training=True,
             seed=args.seed,
         )
+        # Offset seed by rank so DDP ranks sample different structures
+        sampler_seed = args.seed + (local_rank if use_ddp else 0)
         train_sampler = ClusterWeightedSampler(
             records=records,
             alpha_prot=cfg.sampler.alpha_prot,
             alpha_nucl=cfg.sampler.alpha_nucl,
             alpha_ligand=cfg.sampler.alpha_ligand,
             beta=cfg.sampler.beta,
+            seed=sampler_seed,
             samples_per_epoch=cfg.sampler.samples_per_epoch,
         )
         if rank0:
             logger.info("Using cluster-weighted sampler (%d records)", len(records))
     elif use_ddp:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=args.seed)
         if rank0:
             logger.info("Using DistributedSampler")
+
+    def _worker_init_fn(worker_id):
+        """Seed each DataLoader worker uniquely to avoid duplicate augmentations."""
+        np.random.seed(args.seed + worker_id + local_rank * 1000)
 
     batch_size = cfg.training.batch_size
     train_loader = torch.utils.data.DataLoader(
@@ -212,6 +220,7 @@ def main():
         drop_last=True,
         prefetch_factor=4 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
+        worker_init_fn=_worker_init_fn if args.num_workers > 0 else None,
     )
 
     val_loader = None
