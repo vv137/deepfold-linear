@@ -13,6 +13,9 @@ model:
   max_cycles: 5
   inference_cycles: 3
 
+msa:
+  max_depth: 128              # max MSA rows after subsampling (uniform random [1, max_depth])
+
 training:
   batch_size: 1
   lr: 1.0e-4

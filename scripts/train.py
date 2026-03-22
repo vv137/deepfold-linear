@@ -132,6 +132,7 @@ def main():
     train_dataset = DeepFoldDataset(
         data_paths=train_paths,
         max_tokens=get_crop_size(start_step),
+        max_msa_seqs=cfg.msa.max_depth,
         msa_dir=args.msa_dir,
         training=True,
     )

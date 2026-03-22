@@ -57,6 +57,11 @@ class LossWeights:
 
 
 @dataclass
+class MSAConfig:
+    max_depth: int = 128  # max MSA rows after uniform subsampling
+
+
+@dataclass
 class DiffusionConfig:
     multiplicity: int = 16
     sigma_max: float = 160.0
@@ -85,6 +90,7 @@ class Config:
     loss_weights: LossWeights = field(default_factory=LossWeights)
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    msa: MSAConfig = field(default_factory=MSAConfig)
 
 
 def _apply_dict(obj, d: dict) -> None:
@@ -117,5 +123,7 @@ def load_config(path: Optional[str | Path] = None) -> Config:
         _apply_dict(cfg.sampler, raw["sampler"])
     if "diffusion" in raw:
         _apply_dict(cfg.diffusion, raw["diffusion"])
+    if "msa" in raw:
+        _apply_dict(cfg.msa, raw["msa"])
 
     return cfg
