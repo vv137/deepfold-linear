@@ -40,8 +40,10 @@ def _make_batch(N=8, N_atom=16, S=2, device="cpu"):
     protein_mask = torch.ones(N, dtype=torch.bool, device=device)
     msa_feat = torch.randn(S, N, 34, device=device)
 
-    c_atom = torch.randn(N_atom, 32, device=device)
-    p_lm = torch.randn(0, 16, device=device)
+    # D_REF = 197: pos(3) + charge(1) + mask(1) + element_onehot(128) + name_onehot(64)
+    c_atom = torch.randn(N_atom, 197, device=device)
+    # Raw atom pair features: disp(3) + inv_dist(1) + valid(1) = 5
+    p_lm = torch.randn(0, 5, device=device)
     p_lm_idx = torch.zeros(0, 2, dtype=torch.long, device=device)
 
     token_idx = torch.arange(N, device=device).repeat_interleave(N_atom // N)[:N_atom]
@@ -60,6 +62,9 @@ def _make_batch(N=8, N_atom=16, S=2, device="cpu"):
         if mask.any():
             x_res_true[i] = x_atom_true[mask].mean(dim=0)
 
+    atom_resolved_mask = torch.ones(N_atom, device=device)
+    token_resolved_mask = torch.ones(N, device=device)
+
     return {
         "token_type": token_type,
         "profile": profile,
@@ -76,6 +81,8 @@ def _make_batch(N=8, N_atom=16, S=2, device="cpu"):
         "protein_mask": protein_mask,
         "x_atom_true": x_atom_true,
         "x_res_true": x_res_true,
+        "atom_resolved_mask": atom_resolved_mask,
+        "token_resolved_mask": token_resolved_mask,
     }
 
 
