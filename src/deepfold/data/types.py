@@ -379,7 +379,9 @@ class StructureInfo:
     method: Optional[str] = None
     deposited: Optional[str] = None
     released: Optional[str] = None
+    revised: Optional[str] = None
     num_chains: Optional[int] = None
+    num_interfaces: Optional[int] = None
 
 
 @dataclass
