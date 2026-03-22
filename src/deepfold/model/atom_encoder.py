@@ -2,6 +2,9 @@
 
 Aggregates atom-level chemical information into the token representation.
 Runs once before recycling. ~400K params.
+
+Supports both unbatched and batched inputs via dual-mode pattern:
+detect unbatched (c_atom.dim()==2) -> unsqueeze(0), process batched, squeeze back.
 """
 
 import torch
@@ -16,11 +19,23 @@ class AtomToTokenEncoder(nn.Module):
     """
     Single block of local gated self-attention, then mean-pool to token level.
 
-    c_atom:    (N_atom, 128)  frozen atom reference features
-    p_lm:      (local, 16)    frozen intra-token atom pair features
-    token_idx: (N_atom,)      maps each atom to its token
-    N:         int             number of tokens
-    Returns:   (N, 512)       per-token atom summary
+    Unbatched:
+        c_atom:    (N_atom, 128)  frozen atom reference features
+        p_lm:      (n_pairs, 16)  frozen intra-token atom pair features
+        token_idx: (N_atom,)      maps each atom to its token
+        N:         int             number of tokens
+        Returns:   (N, 512)       per-token atom summary
+
+    Batched:
+        c_atom:         (B, N_atom, 128)
+        p_lm:           (B, n_pairs, 16)
+        p_lm_idx:       (B, n_pairs, 2)
+        token_idx:      (B, N_atom)
+        n_tokens:       int
+        atom_pad_mask:  (B, N_atom) bool, True for real atoms
+        pair_pad_mask:  (B, n_pairs) bool, True for real pairs
+        token_pad_mask: (B, N) bool, True for real tokens
+        Returns:        (B, N, 512)
     """
 
     def __init__(self, d_atom: int = 128, d_model: int = 512, n_heads: int = 4):
@@ -54,61 +69,108 @@ class AtomToTokenEncoder(nn.Module):
         p_lm_idx: torch.Tensor,
         token_idx: torch.Tensor,
         n_tokens: int,
+        atom_pad_mask: torch.Tensor | None = None,
+        pair_pad_mask: torch.Tensor | None = None,
+        token_pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            c_atom:    (N_atom, 128) frozen atom reference features
-            p_lm:      (n_pairs, 16) frozen atom pair features
-            p_lm_idx:  (n_pairs, 2) indices [i, j] into atom dimension
-            token_idx: (N_atom,) maps each atom to its token
-            n_tokens:  int, number of tokens N
+            c_atom:         (N_atom, 128) or (B, N_atom, 128)
+            p_lm:           (n_pairs, 16) or (B, n_pairs, 16)
+            p_lm_idx:       (n_pairs, 2) or (B, n_pairs, 2) indices [i, j] into atom dim
+            token_idx:      (N_atom,) or (B, N_atom) maps each atom to its token
+            n_tokens:       int, number of tokens N
+            atom_pad_mask:  (B, N_atom) bool, True for real atoms (batched only)
+            pair_pad_mask:  (B, n_pairs) bool, True for real pairs (batched only)
+            token_pad_mask: (B, N) bool, True for real tokens (batched only)
 
         Returns:
-            (N, 512) per-token atom summary
+            (N, 512) or (B, N, 512)
         """
-        N_atom = c_atom.shape[0]
+        unbatched = c_atom.dim() == 2
+        if unbatched:
+            c_atom = c_atom.unsqueeze(0)
+            p_lm = p_lm.unsqueeze(0)
+            p_lm_idx = p_lm_idx.unsqueeze(0)
+            token_idx = token_idx.unsqueeze(0)
+
+        B, N_atom, _ = c_atom.shape
         H = self.n_heads
         d_h = self.d_head
-        q = c_atom  # (N_atom, 128)
+        n_pairs = p_lm.shape[1]
+        q = c_atom  # (B, N_atom, 128)
 
         # --- Gated local self-attention ---
-        q_n = self.ln_attn(q)  # (N_atom, 128)
-        Q = self.w_q(q_n).view(N_atom, H, d_h)  # (N_atom, 4, 32)
-        K = self.w_k(q_n).view(N_atom, H, d_h)
-        V = self.w_v(q_n).view(N_atom, H, d_h)
-        G = self.w_g(q_n).view(N_atom, H, d_h)
+        q_n = self.ln_attn(q)  # (B, N_atom, 128)
+        Q = self.w_q(q_n).view(B, N_atom, H, d_h)  # (B, N_atom, H, d_h)
+        K = self.w_k(q_n).view(B, N_atom, H, d_h)
+        V = self.w_v(q_n).view(B, N_atom, H, d_h)
+        G = self.w_g(q_n).view(B, N_atom, H, d_h)
 
-        # Compute attention scores: (H, N_atom, N_atom)
-        scores = torch.einsum("ihd,jhd->hij", Q, K) / (d_h**0.5)  # (H, N_atom, N_atom)
+        # Attention scores: (B, H, N_atom, N_atom)
+        scores = torch.einsum("bihd,bjhd->bhij", Q, K) / (d_h**0.5)
 
         # Add pair bias for intra-token pairs
-        if p_lm.shape[0] > 0:
-            bias = self.pair_bias_proj(p_lm)  # (n_pairs, H)
-            # Scatter pair bias into attention scores
-            src_idx = p_lm_idx[:, 0]  # (n_pairs,)
-            dst_idx = p_lm_idx[:, 1]  # (n_pairs,)
+        if n_pairs > 0:
+            bias = self.pair_bias_proj(p_lm)  # (B, n_pairs, H)
             pair_bias = torch.zeros(
-                H, N_atom, N_atom, device=q.device, dtype=bias.dtype
+                B, H, N_atom, N_atom, device=q.device, dtype=bias.dtype
             )
-            pair_bias[:, src_idx, dst_idx] = bias.T  # (H, n_pairs)
+            b_idx = torch.arange(B, device=q.device).unsqueeze(1).expand(-1, n_pairs)  # (B, n_pairs)
+            src_idx = p_lm_idx[..., 0]  # (B, n_pairs)
+            dst_idx = p_lm_idx[..., 1]  # (B, n_pairs)
+
+            if pair_pad_mask is not None:
+                b_idx = b_idx[pair_pad_mask]
+                src_idx = src_idx[pair_pad_mask]
+                dst_idx = dst_idx[pair_pad_mask]
+                bias_flat = bias[pair_pad_mask]  # (valid_pairs, H)
+            else:
+                b_idx = b_idx.reshape(-1)
+                src_idx = src_idx.reshape(-1)
+                dst_idx = dst_idx.reshape(-1)
+                bias_flat = bias.reshape(-1, H)  # (B*n_pairs, H)
+
+            # Vectorized scatter: h_idx broadcasts over all heads
+            h_idx = torch.arange(H, device=q.device)
+            pair_bias[
+                b_idx[:, None], h_idx[None, :], src_idx[:, None], dst_idx[:, None]
+            ] = bias_flat
+
             scores = scores + pair_bias
 
         # Mask: only attend within same token (local attention)
-        token_mask = token_idx.unsqueeze(0) == token_idx.unsqueeze(
-            1
-        )  # (N_atom, N_atom)
-        scores = scores.masked_fill(~token_mask[None, :, :], float("-inf"))
+        token_mask = token_idx[:, :, None] == token_idx[:, None, :]  # (B, N_atom, N_atom)
 
-        attn = F.softmax(scores, dim=-1)  # (H, N_atom, N_atom)
-        att_out = torch.einsum("hij,jhd->ihd", attn, V)  # (H, N_atom, d_h)
-        att_out = att_out.permute(1, 0, 2).reshape(N_atom, -1)  # (N_atom, 128)
+        # Apply atom padding mask if batched
+        if atom_pad_mask is not None:
+            # Both query and key must be real atoms
+            pair_valid = atom_pad_mask[:, :, None] & atom_pad_mask[:, None, :]  # (B, N_atom, N_atom)
+            token_mask = token_mask & pair_valid
 
-        G_flat = G.reshape(N_atom, -1)  # (N_atom, 128)
+        scores = scores.masked_fill(~token_mask[:, None, :, :], float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)  # (B, H, N_atom, N_atom)
+        # Replace NaN from all-inf rows (padded atoms) with 0
+        attn = attn.nan_to_num(0.0)
+
+        att_out = torch.einsum("bhij,bjhd->bihd", attn, V)  # (B, N_atom, H, d_h)
+        att_out = att_out.reshape(B, N_atom, -1)  # (B, N_atom, 128)
+
+        G_flat = G.reshape(B, N_atom, -1)  # (B, N_atom, 128)
         q = q + torch.sigmoid(G_flat) * self.w_o(att_out)
 
         # --- SwiGLU transition ---
         q = q + self.swiglu(self.ln_ff(q))
 
         # --- Project and scatter_mean to token level ---
-        atom_feat = self.to_token(q)  # (N_atom, 512)
-        return scatter_mean(atom_feat, token_idx, n_tokens)  # (N, 512)
+        atom_feat = self.to_token(q)  # (B, N_atom, 512)
+        out = scatter_mean(atom_feat, token_idx, n_tokens)  # (B, N, 512)
+
+        # Zero-pad token positions where token_pad_mask == False
+        if token_pad_mask is not None:
+            out = out * token_pad_mask.unsqueeze(-1).float()
+
+        if unbatched:
+            out = out.squeeze(0)
+        return out
