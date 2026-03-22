@@ -492,54 +492,93 @@ class DeepFoldDataset(Dataset):
 # Collate function
 # ---------------------------------------------------------------------------
 
-# Keys that should NOT be padded / stacked (variable structure)
-_SKIP_KEYS = set()
+# Keys whose padding value is 0.0 (marks padding positions in masks).
+# These are float mask tensors where 1.0 = real, 0.0 = padding.
+_MASK_KEYS = {"token_pad_mask", "atom_pad_mask", "pair_valid_mask", "msa_pad_mask"}
 
 
 def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Collate a batch of samples, padding variable-length tensors.
 
-    Since the model uses **no batch dimension** (single sample per forward),
-    with batch_size=1 this simply returns the single sample dict.
+    For batch_size=1 returns the single sample dict (no batch dim) for
+    backward compatibility.
 
-    For batch_size > 1 (e.g., gradient accumulation in the outer loop),
-    we pad along dim 0 (tokens, atoms, pairs) and stack.
+    For batch_size>1, pads each tensor to the max size along every
+    dimension and stacks along a new dim 0 to produce (B, ...) tensors.
+    Padding conventions:
+        - Float/int tensors: zero-padded
+        - Bool tensors (e.g. bond_matrix): False-padded
+        - Mask tensors (token_pad_mask, atom_pad_mask, pair_valid_mask):
+          padded with 0.0 (marks padding positions)
     """
     if len(batch) == 1:
         return batch[0]
 
+    # Collect all keys (use first sample; all samples have the same keys)
     keys = batch[0].keys()
     collated: dict[str, Tensor] = {}
 
     for key in keys:
         values = [b[key] for b in batch]
 
-        # Check if all shapes match
-        shapes = [v.shape for v in values]
-        if all(s == shapes[0] for s in shapes):
-            collated[key] = torch.stack(values, dim=0)
+        # Determine pad value based on key/dtype
+        pad_value: float | bool
+        if values[0].dtype == torch.bool:
+            pad_value = False
         else:
-            # Pad to max shape along each dimension, then stack
-            collated[key] = _pad_and_stack(values)
+            # For mask keys, 0.0 is the correct pad (marks padding).
+            # For all other float/int keys, 0 is also the correct pad.
+            pad_value = 0
+
+        collated[key] = _pad_and_stack(values, pad_value=pad_value)
+
+    # Generate msa_pad_mask if msa_feat is present and batched
+    if "msa_feat" in collated and collated["msa_feat"].ndim == 4:
+        # msa_feat shape: (B, S, N_prot, 34) — build mask (B, S, N_prot)
+        # where 1.0 = real MSA position, 0.0 = padding
+        B = len(batch)
+        msa_shapes = [b["msa_feat"].shape for b in batch]  # each (S_i, N_prot_i, 34)
+        max_S = max(s[0] for s in msa_shapes)
+        max_N_prot = max(s[1] for s in msa_shapes)
+        msa_mask = torch.zeros(B, max_S, max_N_prot, dtype=torch.float32)
+        for i, s in enumerate(msa_shapes):
+            msa_mask[i, : s[0], : s[1]] = 1.0
+        collated["msa_pad_mask"] = msa_mask
 
     return collated
 
 
-def _pad_and_stack(tensors: list[Tensor]) -> Tensor:
-    """Pad tensors to the same shape and stack along a new batch dim."""
+def _pad_and_stack(
+    tensors: list[Tensor],
+    pad_value: float | bool = 0,
+) -> Tensor:
+    """Pad tensors to the same shape and stack along a new batch dim.
+
+    Parameters
+    ----------
+    tensors : list[Tensor]
+        Tensors of the same ndim but potentially different sizes.
+    pad_value : float | bool
+        Value to use for padding (0 for int/float, False for bool).
+    """
     ndim = tensors[0].ndim
     max_shape = list(tensors[0].shape)
     for t in tensors[1:]:
         for d in range(ndim):
             max_shape[d] = max(max_shape[d], t.shape[d])
 
+    # Fast path: all shapes already match
+    if all(list(t.shape) == max_shape for t in tensors):
+        return torch.stack(tensors, dim=0)
+
     padded = []
     for t in tensors:
-        pad_widths = []
-        # F.pad expects padding in reverse dimension order: (last_dim_left, last_dim_right, ...)
+        pad_widths: list[int] = []
+        # F.pad expects padding in reverse dimension order:
+        # (last_dim_left, last_dim_right, second_last_left, ...)
         for d in reversed(range(ndim)):
             pad_widths.extend([0, max_shape[d] - t.shape[d]])
-        padded.append(torch.nn.functional.pad(t, pad_widths, value=0))
+        padded.append(torch.nn.functional.pad(t, pad_widths, value=pad_value))
 
     return torch.stack(padded, dim=0)
 
