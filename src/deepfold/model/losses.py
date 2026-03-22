@@ -15,28 +15,36 @@ _NUCLEOTIDE_LOSS_WEIGHT = 5.0
 _LIGAND_LOSS_WEIGHT = 10.0
 
 
-def _atom_type_weights(
-    token_idx: torch.Tensor,
-    token_type: torch.Tensor,
-) -> torch.Tensor:
-    """Per-atom loss weights based on molecule type (Boltz-1 convention).
-
-    Protein=1×, nucleotide=5×, nonpolymer=10×.
-
-    Args:
-        token_idx: (N_atom,) int — atom → token mapping
-        token_type: (N,) int — mol_type per token
-
-    Returns:
-        (N_atom,) float weights
-    """
-    atom_mol = token_type[token_idx]  # (N_atom,)
+def _mol_type_to_weights(atom_mol: torch.Tensor) -> torch.Tensor:
+    """Convert per-atom molecule types to loss weights. Works on any shape."""
     w = torch.ones_like(atom_mol, dtype=torch.float32)
     w = w + _NUCLEOTIDE_LOSS_WEIGHT * (
         (atom_mol == const.MOL_DNA).float() + (atom_mol == const.MOL_RNA).float()
     )
     w = w + _LIGAND_LOSS_WEIGHT * (atom_mol == const.MOL_NONPOLYMER).float()
     return w
+
+
+def _atom_type_weights(
+    token_idx: torch.Tensor,
+    token_type: torch.Tensor,
+) -> torch.Tensor:
+    """Per-atom loss weights based on molecule type (Boltz-1 convention).
+
+    Protein=1x, nucleotide=5x, nonpolymer=10x.
+
+    Args:
+        token_idx:  (B, N_atom) or (N_atom,) int — atom -> token mapping
+        token_type: (B, N) or (N,) int — mol_type per token
+
+    Returns:
+        (B, N_atom) or (N_atom,) float weights
+    """
+    if token_idx.dim() == 1:
+        return _mol_type_to_weights(token_type[token_idx])
+
+    # Batched: (B, N_atom), (B, N) -> (B, N_atom)
+    return _mol_type_to_weights(torch.gather(token_type, 1, token_idx))
 
 
 # ============================================================================
@@ -54,31 +62,52 @@ def edm_diffusion_loss(
     """
     EDM-weighted diffusion loss with resolved masking (Boltz-1).
 
-    L_diff = weight(σ) × Σ(mse × w × mask) / Σ(3 × w × mask)
+    L_diff = weight(sigma) * sum(mse * w * mask) / sum(3 * w * mask)
 
     Args:
-        x_pred:        (N_atom, 3) predicted denoised coords
-        x_true:        (N_atom, 3) ground truth coords
-        sigma:         scalar noise level
-        resolved_mask: (N_atom,) float, 1 for resolved atoms, 0 otherwise
-        atom_weights:  (N_atom,) float, per-atom type weights
+        x_pred:        (B, N_atom, 3) or (N_atom, 3) predicted denoised coords
+        x_true:        (B, N_atom, 3) or (N_atom, 3) ground truth coords
+        sigma:         (B,) or scalar noise level
+        resolved_mask: (B, N_atom) or (N_atom,) float, 1 for resolved, 0 otherwise
+        atom_weights:  (B, N_atom) or (N_atom,) float, per-atom type weights
     """
     sigma_data = SIGMA_DATA
-    edm_weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
 
-    # Per-atom squared error summed over xyz
-    mse = ((x_pred - x_true) ** 2).sum(dim=-1)  # (N_atom,)
+    # Unbatched path
+    if x_pred.dim() == 2:
+        edm_weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
+        mse = ((x_pred - x_true) ** 2).sum(dim=-1)  # (N_atom,)
+        if resolved_mask is None:
+            resolved_mask = torch.ones(mse.shape[0], device=mse.device)
+        if atom_weights is None:
+            atom_weights = torch.ones(mse.shape[0], device=mse.device)
+        numerator = (mse * atom_weights * resolved_mask).sum()
+        denominator = (3.0 * atom_weights * resolved_mask).sum().clamp(min=1.0)
+        return edm_weight * numerator / denominator
+
+    # Batched path: (B, N_atom, 3)
+    B = x_pred.shape[0]
+    N_atom = x_pred.shape[1]
+
+    # sigma: scalar or (B,) -> edm_weight (B,)
+    if sigma.dim() == 0:
+        sigma = sigma.expand(B)
+    edm_weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2  # (B,)
+
+    # Per-atom MSE: (B, N_atom)
+    mse = ((x_pred - x_true) ** 2).sum(dim=-1)
 
     if resolved_mask is None:
-        resolved_mask = torch.ones(mse.shape[0], device=mse.device)
+        resolved_mask = torch.ones(B, N_atom, device=mse.device)
     if atom_weights is None:
-        atom_weights = torch.ones(mse.shape[0], device=mse.device)
+        atom_weights = torch.ones(B, N_atom, device=mse.device)
 
-    # Weighted mean following Boltz-1: divide by 3 * sum(weights) for xyz normalization
-    numerator = (mse * atom_weights * resolved_mask).sum()
-    denominator = (3.0 * atom_weights * resolved_mask).sum().clamp(min=1.0)
+    # Per-sample loss: (B,)
+    numerator = (mse * atom_weights * resolved_mask).sum(dim=1)  # (B,)
+    denominator = (3.0 * atom_weights * resolved_mask).sum(dim=1).clamp(min=1.0)  # (B,)
 
-    return edm_weight * numerator / denominator
+    per_sample = edm_weight * numerator / denominator  # (B,)
+    return per_sample.mean()
 
 
 # ============================================================================
@@ -101,33 +130,76 @@ def smooth_lddt(
              sigmoid((threshold - |d_pred - d_true|) * slope)
 
     Args:
-        x_pred: (M, 3) predicted coordinates (atom or token level)
-        x_true: (M, 3) ground truth coordinates
+        x_pred: (B, M, 3) or (M, 3) predicted coordinates
+        x_true: (B, M, 3) or (M, 3) ground truth coordinates
         cutoff: distance cutoff for valid pairs
         thresholds: LDDT thresholds in Angstroms
         slope: sigmoid steepness
-        resolved_mask: (M,) float, 1 for resolved, 0 otherwise
+        resolved_mask: (B, M) or (M,) float, 1 for resolved, 0 otherwise
     """
-    M = x_pred.shape[0]
+    # Unbatched path
+    if x_pred.dim() == 2:
+        return _smooth_lddt_single(x_pred, x_true, cutoff, thresholds, slope, resolved_mask)
 
-    # Pairwise distances
-    d_pred = torch.cdist(x_pred, x_pred)  # (M, M)
-    d_true = torch.cdist(x_true, x_true)  # (M, M)
+    # Batched path: (B, M, 3)
+    B, M, _ = x_pred.shape
+
+    # Pairwise distances: (B, M, M)
+    d_pred = torch.cdist(x_pred, x_pred)
+    d_true = torch.cdist(x_true, x_true)
 
     # Valid pairs: true distance < cutoff, exclude diagonal, both resolved
-    valid = (d_true < cutoff) & (torch.eye(M, device=x_pred.device) == 0)
+    eye = torch.eye(M, device=x_pred.device).unsqueeze(0)  # (1, M, M)
+    valid = (d_true < cutoff) & (eye == 0)
 
     if resolved_mask is not None:
-        pair_mask = resolved_mask[:, None] * resolved_mask[None, :]  # (M, M)
+        # (B, M) -> (B, M, M) outer product mask
+        pair_mask = resolved_mask.unsqueeze(-1) * resolved_mask.unsqueeze(-2)
+        valid = valid & (pair_mask > 0)
+
+    # Per-sample LDDT
+    dev = (d_pred - d_true).abs()  # (B, M, M)
+
+    # Compute per-sample losses
+    losses = []
+    for b in range(B):
+        valid_b = valid[b]
+        if not valid_b.any():
+            losses.append((x_pred[b] * 0).sum())
+            continue
+        dev_b = dev[b]
+        scores = []
+        for t in thresholds:
+            s = torch.sigmoid((t - dev_b[valid_b]) * slope)
+            scores.append(s)
+        lddt_b = torch.stack(scores, dim=0).mean(dim=0).mean()
+        losses.append(1.0 - lddt_b)
+
+    return torch.stack(losses).mean()
+
+
+def _smooth_lddt_single(
+    x_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    cutoff: float,
+    thresholds: tuple[float, ...],
+    slope: float,
+    resolved_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Original unbatched smooth LDDT."""
+    M = x_pred.shape[0]
+    d_pred = torch.cdist(x_pred, x_pred)
+    d_true = torch.cdist(x_true, x_true)
+
+    valid = (d_true < cutoff) & (torch.eye(M, device=x_pred.device) == 0)
+    if resolved_mask is not None:
+        pair_mask = resolved_mask[:, None] * resolved_mask[None, :]
         valid = valid & (pair_mask > 0)
 
     if not valid.any():
         return (x_pred * 0).sum()
 
-    # Distance deviation
-    dev = (d_pred - d_true).abs()  # (M, M)
-
-    # Smooth LDDT per threshold
+    dev = (d_pred - d_true).abs()
     scores = []
     for t in thresholds:
         s = torch.sigmoid((t - dev[valid]) * slope)
@@ -175,25 +247,98 @@ class DistogramLoss(nn.Module):
         h_res: torch.Tensor,
         x_true: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        token_pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            h_res:      (N, 512) token representations
-            x_true:     (N, 3) ground truth token coordinates
-            valid_mask: (N, N) optional mask
+            h_res:          (B, N, 512) or (N, 512) token representations
+            x_true:         (B, N, 3) or (N, 3) ground truth token coordinates
+            valid_mask:     (B, N, N) or (N, N) optional explicit mask
+            token_pad_mask: (B, N) float, 1=valid 0=pad. Used to build valid_mask
+                            if valid_mask is not provided. Batched mode only.
         """
+        # Unbatched path
+        if h_res.dim() == 2:
+            return self._forward_unbatched(h_res, x_true, valid_mask)
+
+        # Batched path: (B, N, d)
+        B, N, _ = h_res.shape
+
+        # Build valid_mask from token_pad_mask if not provided
+        if valid_mask is None and token_pad_mask is not None:
+            valid_mask = token_pad_mask.unsqueeze(-1) * token_pad_mask.unsqueeze(-2)
+
+        # Ground truth distance bins (FP32 for precision)
+        d_true = torch.cdist(x_true.float(), x_true.float())  # (B, N, N)
+        target_bins = self.distance_to_bins(d_true)  # (B, N, N)
+
+        # O(N) projections
+        h = self.ln(h_res.float()).to(h_res.dtype)
+        U = self.w_u(h)  # (B, N, d_low)
+        V = self.w_v(h)  # (B, N, d_low)
+
+        # Accumulate per-sample losses
+        total_loss = torch.zeros(1, device=h_res.device, dtype=torch.float32)
+        total_count = 0
+        T = self.tile_size
+
+        for b in range(B):
+            sample_loss = torch.zeros(1, device=h_res.device, dtype=torch.float32)
+            sample_count = 0
+
+            for i0 in range(0, N, T):
+                ie = min(i0 + T, N)
+                U_tile = U[b, i0:ie]
+
+                for j0 in range(0, N, T):
+                    je = min(j0 + T, N)
+                    V_tile = V[b, j0:je]
+
+                    Z = U_tile[:, None, :] * V_tile[None, :, :]  # (ti, tj, d_low)
+                    logits = self.to_bins(Z)  # (ti, tj, num_bins)
+                    targets = target_bins[b, i0:ie, j0:je]
+
+                    if valid_mask is not None:
+                        m = valid_mask[b, i0:ie, j0:je] > 0
+                        if m.any():
+                            tile_n = m.sum().item()
+                            sample_loss = sample_loss + F.cross_entropy(
+                                logits[m].float(), targets[m], reduction="mean"
+                            ) * tile_n
+                            sample_count += tile_n
+                    else:
+                        tile_n = (ie - i0) * (je - j0)
+                        sample_loss = sample_loss + F.cross_entropy(
+                            logits.reshape(-1, self.num_bins).float(),
+                            targets.reshape(-1),
+                            reduction="mean",
+                        ) * tile_n
+                        sample_count += tile_n
+
+            if sample_count > 0:
+                total_loss = total_loss + sample_loss / sample_count
+                total_count += 1
+
+        if total_count == 0:
+            return total_loss.squeeze()
+        return (total_loss / total_count).squeeze()
+
+    def _forward_unbatched(
+        self,
+        h_res: torch.Tensor,
+        x_true: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Original unbatched forward path."""
         N = h_res.shape[0]
 
-        # Ground truth distance bins (FP32 for precision with BF16 models)
         d_true = torch.cdist(x_true.float(), x_true.float())
-        target_bins = self.distance_to_bins(d_true)  # (N, N)
+        target_bins = self.distance_to_bins(d_true)
 
-        # O(N) projections (LayerNorm stabilizes input from deep trunk)
         h = self.ln(h_res.float()).to(h_res.dtype)
-        U = self.w_u(h)  # (N, d_low)
-        V = self.w_v(h)  # (N, d_low)
+        U = self.w_u(h)
+        V = self.w_v(h)
 
-        # Accumulate in FP32 to avoid precision loss across tiles
         total_loss = torch.zeros(1, device=h_res.device, dtype=torch.float32)
         count = 0
         T = self.tile_size
@@ -206,12 +351,12 @@ class DistogramLoss(nn.Module):
                 je = min(j0 + T, N)
                 V_tile = V[j0:je]
 
-                Z = U_tile[:, None, :] * V_tile[None, :, :]  # (ti, tj, d_low)
-                logits = self.to_bins(Z)  # (ti, tj, num_bins)
+                Z = U_tile[:, None, :] * V_tile[None, :, :]
+                logits = self.to_bins(Z)
                 targets = target_bins[i0:ie, j0:je]
 
                 if valid_mask is not None:
-                    m = valid_mask[i0:ie, j0:je] > 0  # ensure bool
+                    m = valid_mask[i0:ie, j0:je] > 0
                     if m.any():
                         tile_n = m.sum().item()
                         total_loss = total_loss + F.cross_entropy(
