@@ -428,6 +428,8 @@ class DeepFoldDataset(Dataset):
             struct = tokenize_boltz_structure(struct)
 
         tokens = struct["tokens"]
+        if len(tokens) == 0:
+            raise ValueError(f"No valid tokens (all chains masked): {path.name}")
         atoms = struct["atoms"]
         # Use token-level bonds (from tokenization or pre-existing)
         bonds = struct.get("token_bonds", struct.get(
