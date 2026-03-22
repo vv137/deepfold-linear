@@ -33,6 +33,7 @@ class TrainingConfig:
     ema_decay: float = 0.999
     ema_warmup_steps: int = 1000
     max_grad_norm: float = 1.0
+    batch_size: int = 1
     grad_accum_steps: int = 1
     crop_schedule: list = field(
         default_factory=lambda: [[0, 256], [100_000, 384], [300_000, 512], [500_000, 768]]

@@ -108,20 +108,29 @@ class DeepFoldLinear(nn.Module):
         x_res_true: torch.Tensor | None = None,
         atom_resolved_mask: torch.Tensor | None = None,
         token_resolved_mask: torch.Tensor | None = None,
+        token_pad_mask: torch.Tensor | None = None,
+        atom_pad_mask: torch.Tensor | None = None,
+        pair_valid_mask: torch.Tensor | None = None,
+        msa_pad_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Full forward pass: trunk -> diffusion (training) or trunk -> sampling (inference).
 
+        Supports both unbatched (N, ...) and batched (B, N, ...) inputs.
+        Mask tensors (token_pad_mask, atom_pad_mask, pair_valid_mask, msa_pad_mask)
+        are floats with 1.0=valid, 0.0=padding. They are only needed for batched
+        inputs (B>1) where samples have been padded to the same length.
+
         Returns dict with 'x_atom_pred' and losses if training.
         """
         device = token_type.device
+        is_batched = token_type.dim() >= 2
 
         # Embed atom features once — shared by trunk and diffusion (SPEC §3.3, §3.4)
-        # c_atom raw: (N_atom, 197) → embedded: (N_atom, 128)
+        # nn.Linear handles arbitrary leading dims; [...] slicing works for both
+        # unbatched (N, D) and batched (B, N, D) inputs.
         c_atom = self.atom_single_embed(c_atom)
-        # p_lm raw: (n_pairs, 5) = [disp(3), inv_dist(1), valid(1)]
-        # AtomPairEmbedding takes disp (3) and valid (1), computes inv_dist internally
-        p_lm = self.atom_pair_embed(p_lm[:, :3], p_lm[:, 4:5])  # → (n_pairs, 16)
+        p_lm = self.atom_pair_embed(p_lm[..., :3], p_lm[..., 4:5])
 
         # ---- Trunk ----
         h_res, mu, nu, x_res = self.trunk(
@@ -138,6 +147,11 @@ class DeepFoldLinear(nn.Module):
             global_idx,
             bond_matrix,
             protein_mask,
+            token_pad_mask=token_pad_mask,
+            # msa_pad_mask from collate is (B, S, N_prot); MSA module expects (B, N_prot)
+            msa_pad_mask=msa_pad_mask.amax(dim=1) if (
+                msa_pad_mask is not None and msa_pad_mask.dim() == 3
+            ) else msa_pad_mask,
         )
 
         result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res}
@@ -150,10 +164,12 @@ class DeepFoldLinear(nn.Module):
             # Per-atom loss weights by mol_type (Boltz-1: nucleotide 5×, ligand 10×)
             atom_weights = _atom_type_weights(token_idx, token_type)
 
-            # Generate M augmented copies of atom coords: each with its own rotation + translation
+            # Generate M augmented copies of atom coords
+            # Unbatched: (N_atom, 3) → (M, N_atom, 3)
+            # Batched:   (B, N_atom, 3) → (M, B, N_atom, 3)
             x_atom_aug = batch_augment(
                 x_atom_true, M, s_trans=self.s_trans, training=True
-            )  # (M, N_atom, 3)
+            )
 
             # Sample M noise levels (one per augmented sample)
             sigmas = sample_training_sigma(M, device)  # (M,)
@@ -166,7 +182,7 @@ class DeepFoldLinear(nn.Module):
             l_lddt_parts = []
 
             for i in range(M):
-                x_true_i = x_atom_aug[i]  # (N_atom, 3)
+                x_true_i = x_atom_aug[i]  # (N_atom, 3) or (B, N_atom, 3)
                 sigma_i = sigmas[i]
 
                 noise = torch.randn_like(x_true_i)
@@ -181,6 +197,9 @@ class DeepFoldLinear(nn.Module):
                     x_noisy_i,
                     sigma_i,
                     token_idx,
+                    token_pad_mask,
+                    atom_pad_mask,
+                    pair_valid_mask,
                     use_reentrant=True,
                 )
 
@@ -199,12 +218,19 @@ class DeepFoldLinear(nn.Module):
             l_lddt = torch.stack(l_lddt_parts).mean()
 
             # Trunk-only losses (not multiplied — computed once)
-            # Build (N, N) pair mask for distogram from token resolved mask
-            if token_resolved_mask is not None:
-                disto_mask = token_resolved_mask[:, None] * token_resolved_mask[None, :]
+            if is_batched:
+                # Batched: use token_pad_mask for distogram
+                l_disto = self.distogram_loss(
+                    h_res, x_res_true, token_pad_mask=token_pad_mask
+                )
             else:
-                disto_mask = None
-            l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
+                # Unbatched: build (N, N) pair mask from resolved mask
+                if token_resolved_mask is not None:
+                    disto_mask = token_resolved_mask[:, None] * token_resolved_mask[None, :]
+                else:
+                    disto_mask = None
+                l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
+
             l_trunk_coord = smooth_lddt(
                 x_res, x_res_true, resolved_mask=token_resolved_mask
             )
