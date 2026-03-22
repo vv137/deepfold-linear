@@ -199,9 +199,7 @@ def tokenize_boltz_structure(struct: dict) -> dict:
     # --- Build atom_to_token map (vectorized for standard residues) ---
     atom_to_token = np.full(len(atoms), -1, dtype=np.int64)
     if n_std > 0:
-        std_res = residues[std_idx]
         for ti, ri in enumerate(std_idx):
-            a_s = int(std_res[ti - std_idx[0] if std_idx[0] == std_idx[0] else 0]["atom_idx"])
             a_s = int(residues[ri]["atom_idx"])
             a_c = int(residues[ri]["atom_num"])
             atom_to_token[a_s:a_s + a_c] = ti
@@ -651,19 +649,33 @@ class DeepFoldDataset(Dataset):
             # The crop selects N_prot protein tokens with global res_idx.
             # We need to extract the columns corresponding to cropped positions.
             chain_res_start = int(chain["res_idx"])
-            prot_global_idx = cropped_tokens["res_idx"][msa_mask].astype(np.int64)
-            # Local indices within the chain
+            chain_asym = int(chain["asym_id"])
+
+            # Only align tokens from THIS chain (multi-chain crops mix chains)
+            this_chain_mask = msa_mask & (cropped_tokens["asym_id"] == chain_asym)
+            if not this_chain_mask.any():
+                continue
+
+            prot_global_idx = cropped_tokens["res_idx"][this_chain_mask].astype(np.int64)
             local_idx = prot_global_idx - chain_res_start
 
-            # Filter valid indices
-            valid = (local_idx >= 0) & (local_idx < L_msa)
-            if not valid.all():
-                # Some cropped positions are outside MSA range — use only valid ones
-                local_idx = np.clip(local_idx, 0, L_msa - 1)
+            # Clamp out-of-range (shouldn't happen but be safe)
+            local_idx = np.clip(local_idx, 0, L_msa - 1)
 
-            # Extract columns for the cropped protein positions
-            msa_crop = msa_seqs[:, local_idx]  # (S, N_prot)
-            del_crop = msa_dels[:, local_idx]   # (S, N_prot)
+            # Build full (S, N_prot) MSA — fill this chain's columns, leave
+            # other chains' columns as gap token (index 1)
+            N_prot = int(msa_mask.sum())
+            msa_crop = np.full((S, N_prot), 1, dtype=np.int64)  # gap token
+            del_crop = np.zeros((S, N_prot), dtype=np.float32)
+
+            # Find positions of this chain within the protein-masked tokens
+            prot_positions = np.where(msa_mask)[0]
+            chain_positions = np.where(this_chain_mask)[0]
+            # Map chain_positions to their index within prot_positions
+            prot_local = np.searchsorted(prot_positions, chain_positions)
+
+            msa_crop[:, prot_local] = msa_seqs[:, local_idx]
+            del_crop[:, prot_local] = msa_dels[:, local_idx]
 
             return msa_crop, del_crop
 
