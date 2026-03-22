@@ -3,8 +3,6 @@
 Supports both unbatched and batched inputs via dual-mode pattern.
 """
 
-import random
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -178,8 +176,13 @@ class Trunk(nn.Module):
         uot_pos_bias = self.pos_bias(pos_bins)  # (B, H, N, N)
 
         # ---- Sample cycle count (SPEC §5.3) ----
+        # Use a device tensor + broadcast so all DDP ranks get the same
+        # cycle count — prevents forward/backward desync.
         if self.training:
-            num_cycles = random.randint(1, self.max_cycles)
+            _nc = torch.randint(1, self.max_cycles + 1, (1,), device=device)
+            if torch.distributed.is_initialized():
+                torch.distributed.broadcast(_nc, src=0)
+            num_cycles = int(_nc.item())
         else:
             num_cycles = self.inference_cycles
 
