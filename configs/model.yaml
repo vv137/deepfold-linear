@@ -1,0 +1,61 @@
+# DeepFold-Linear model configuration (SPEC v4.5)
+
+model:
+  d_model: 512
+  d_msa: 64
+  d_atom: 128
+  h_res: 16
+  h_msa: 8
+  n_msa_blocks: 4
+  n_uot_blocks: 48
+  n_atom_blocks: 10
+  sigma_data: 16.0
+  max_cycles: 5
+  inference_cycles: 3
+
+training:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 5000
+  total_steps: 500000
+  ema_decay: 0.999
+  ema_warmup_steps: 1000
+  max_grad_norm: 1.0
+  grad_accum_steps: 128
+  crop_schedule:
+    - [0, 768]
+    # - [0, 256]
+    # - [100000, 384]
+    # - [300000, 512]
+    # - [500000, 768]
+
+loss_weights:
+  w_diff: 1.0
+  w_lddt: 1.0
+  w_disto: 0.2
+  w_trunk_coord: 0.5
+
+sampler:
+  type: cluster           # "cluster" or "random"
+  alpha_prot: 3.0
+  alpha_nucl: 3.0
+  alpha_ligand: 1.0
+  beta: 1.0
+  samples_per_epoch: 100000
+
+diffusion:
+  multiplicity: 16
+  sigma_max: 160.0
+  sigma_min: 0.002
+  sigma_data: 16.0
+  p_mean: -1.2
+  p_std: 1.2
+  rho: 7.0
+  inference_steps: 200
+
+sinkhorn:
+  lambda: 1.0
+  eps_heads: [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0, 4.0]
+  k_iter: 20
+  k_max_infer: 20
+  tol_infer: 0.0001
