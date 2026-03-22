@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--manifest", type=str, default=None,
                         help="JSON manifest for cluster-weighted sampling")
+    parser.add_argument("--msa-dir", type=str, default=None,
+                        help="Directory with MSA NPZ files ({pdb}_{chain}.npz)")
     parser.add_argument("--val-data-dir", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None,
@@ -130,6 +132,7 @@ def main():
     train_dataset = DeepFoldDataset(
         data_paths=train_paths,
         max_tokens=get_crop_size(start_step),
+        msa_dir=args.msa_dir,
         training=True,
     )
 

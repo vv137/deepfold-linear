@@ -267,6 +267,86 @@ def tokenize_boltz_structure(struct: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load Boltz-style MSA NPZ and return (residue_types, deletions) per sequence.
+
+    Returns
+    -------
+    (msa_seqs, msa_dels) or None if loading fails.
+        msa_seqs: (S, L) int array of residue type IDs
+        msa_dels: (S, L) float array of deletion counts
+    """
+    try:
+        data = np.load(path, allow_pickle=True)
+    except Exception:
+        return None
+
+    sequences = data["sequences"]
+    residues = data["residues"]
+    deletions = data.get("deletions", np.array([], dtype=[("res_idx", "i2"), ("deletion", "i2")]))
+
+    S = len(sequences)
+    if S == 0:
+        return None
+
+    # Determine sequence length from first sequence
+    s0 = sequences[0]
+    L = int(s0["res_end"] - s0["res_start"])
+    if L == 0:
+        return None
+
+    msa_seqs = np.zeros((S, L), dtype=np.int64)
+    msa_dels = np.zeros((S, L), dtype=np.float32)
+
+    for i, seq in enumerate(sequences):
+        rs, re = int(seq["res_start"]), int(seq["res_end"])
+        n = re - rs
+        if n != L:
+            # Variable-length alignment — truncate/pad to query length
+            n = min(n, L)
+        msa_seqs[i, :n] = residues["res_type"][rs:rs + n]
+
+        # Sparse deletions → dense
+        ds, de = int(seq["del_start"]), int(seq["del_end"])
+        for d in deletions[ds:de]:
+            ridx = int(d["res_idx"])
+            if 0 <= ridx < L:
+                msa_dels[i, ridx] = float(d["deletion"])
+
+    return msa_seqs, msa_dels
+
+
+def subsample_msa(
+    msa_seqs: np.ndarray,
+    msa_dels: np.ndarray,
+    max_seqs: int,
+    rng: np.random.RandomState,
+    training: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subsample MSA to max depth, always keeping query (row 0).
+
+    During training, randomly picks depth in [1, max_seqs] (Boltz convention).
+    During inference, uses full max_seqs.
+    """
+    S, L = msa_seqs.shape
+    if S <= 1:
+        return msa_seqs, msa_dels
+
+    if training:
+        # Random depth between 1 and max_seqs (Boltz-1 convention)
+        target = rng.randint(1, max_seqs + 1)
+    else:
+        target = max_seqs
+
+    if S <= target:
+        return msa_seqs, msa_dels
+
+    # Always keep query (row 0), subsample the rest
+    other_idx = rng.choice(S - 1, size=min(target - 1, S - 1), replace=False) + 1
+    idx = np.concatenate([[0], np.sort(other_idx)])
+    return msa_seqs[idx], msa_dels[idx]
+
+
 class DeepFoldDataset(Dataset):
     """Dataset that loads structures, crops, and featurizes.
 
@@ -284,6 +364,7 @@ class DeepFoldDataset(Dataset):
         data_paths: list[Path],
         max_tokens: int = 256,
         max_msa_seqs: int = 128,
+        msa_dir: Optional[Union[str, Path]] = None,
         training: bool = True,
         seed: int = 42,
     ):
@@ -296,6 +377,8 @@ class DeepFoldDataset(Dataset):
             Crop size in tokens. Updated externally via ``set_crop_size()``.
         max_msa_seqs : int
             Maximum MSA depth.
+        msa_dir : str or Path, optional
+            Directory with MSA NPZ files (named ``{pdb}_{chain}.npz``).
         training : bool
             If True, include ground-truth coordinates and use random cropping.
         seed : int
@@ -305,6 +388,7 @@ class DeepFoldDataset(Dataset):
         self.data_paths = list(data_paths)
         self.max_tokens = max_tokens
         self.max_msa_seqs = max_msa_seqs
+        self.msa_dir = Path(msa_dir) if msa_dir else None
         self.training = training
         self.rng = np.random.RandomState(seed)
 
@@ -337,6 +421,7 @@ class DeepFoldDataset(Dataset):
         """Core processing pipeline for a single structure."""
         # 1. Load
         struct = load_structure_npz(path)
+        struct["_source_path"] = str(path)
 
         # Tokenize if raw Boltz format (has 'residues' but no 'tokens')
         if "tokens" not in struct and "residues" in struct:
@@ -461,6 +546,15 @@ class DeepFoldDataset(Dataset):
         # MSA mask (vectorized)
         msa_mask = (token_types == const.MOL_PROTEIN) | (token_types == const.MOL_RNA)
 
+        # Load real MSA if available
+        msa_data_np = None
+        msa_del_np = None
+
+        if self.msa_dir is not None:
+            msa_data_np, msa_del_np = self._load_chain_msa(
+                struct, cropped_tokens, msa_mask
+            )
+
         # 5. Featurize
         features = featurize(
             token_types=token_types,
@@ -479,13 +573,99 @@ class DeepFoldDataset(Dataset):
             token_atom_counts=crop.token_to_atom_count,
             token_center_coords=token_center_coords,
             token_bonds=bond_pairs,
-            msa_data=None,  # TODO: integrate real MSA when available
-            msa_deletion=None,
+            msa_data=msa_data_np,
+            msa_deletion=msa_del_np,
             msa_mask=msa_mask,
             training=self.training,
         )
 
         return features
+
+    def _load_chain_msa(
+        self,
+        struct: dict,
+        cropped_tokens: np.ndarray,
+        msa_mask: np.ndarray,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Load and subsample MSA for the first protein chain in the crop.
+
+        Returns (msa_seqs, msa_dels) aligned to the protein positions in the crop,
+        or (None, None) if no MSA is available.
+        """
+        N_prot = int(msa_mask.sum())
+        if N_prot == 0 or self.msa_dir is None:
+            return None, None
+
+        # Find chain info: get PDB ID from file path (e.g., "101m" from "101m.npz")
+        chains = struct.get("chains", None)
+        if chains is None:
+            return None, None
+
+        # Get the first protein chain's MSA
+        # MSA files named {pdb}_{chain_letter}.npz (lowercase)
+        pdb_id = None
+        for path in [struct.get("_source_path", None)]:
+            if path is not None:
+                pdb_id = Path(path).stem
+                break
+
+        if pdb_id is None:
+            return None, None
+
+        # Find unique protein chain IDs in the crop
+        prot_chain_ids = np.unique(cropped_tokens["asym_id"][msa_mask])
+
+        # Try to load MSA for the first protein chain
+        for chain in chains:
+            if int(chain["asym_id"]) not in prot_chain_ids:
+                continue
+            if int(chain["mol_type"]) != const.MOL_PROTEIN:
+                continue
+
+            # Construct MSA filename: {pdb}_{chain_letter}.npz
+            chain_letter = str(chain["name"]).strip().lower()
+            # Remove trailing digit (e.g., "A1" → "a")
+            chain_letter = chain_letter.rstrip("0123456789")
+            msa_path = self.msa_dir / f"{pdb_id}_{chain_letter}.npz"
+
+            if not msa_path.exists():
+                continue
+
+            result = load_msa_npz(msa_path)
+            if result is None:
+                continue
+
+            msa_seqs, msa_dels = result
+
+            # Subsample to max depth
+            msa_seqs, msa_dels = subsample_msa(
+                msa_seqs, msa_dels, self.max_msa_seqs, self.rng, self.training
+            )
+
+            S, L_msa = msa_seqs.shape
+
+            # Align MSA to cropped protein positions:
+            # The MSA has L_msa residues (full chain length).
+            # The crop selects N_prot protein tokens with global res_idx.
+            # We need to extract the columns corresponding to cropped positions.
+            chain_res_start = int(chain["res_idx"])
+            prot_global_idx = cropped_tokens["res_idx"][msa_mask].astype(np.int64)
+            # Local indices within the chain
+            local_idx = prot_global_idx - chain_res_start
+
+            # Filter valid indices
+            valid = (local_idx >= 0) & (local_idx < L_msa)
+            if not valid.all():
+                # Some cropped positions are outside MSA range — use only valid ones
+                local_idx = np.clip(local_idx, 0, L_msa - 1)
+
+            # Extract columns for the cropped protein positions
+            msa_crop = msa_seqs[:, local_idx]  # (S, N_prot)
+            del_crop = msa_dels[:, local_idx]   # (S, N_prot)
+
+            return msa_crop, del_crop
+
+        return None, None
 
 
 # ---------------------------------------------------------------------------
