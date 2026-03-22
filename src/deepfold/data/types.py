@@ -396,6 +396,7 @@ class ChainInfo:
     num_residues: int
     valid: bool = True
     entity_id: Optional[int | str] = None
+    template_id: Optional[int | str] = None
 
 
 @dataclass
