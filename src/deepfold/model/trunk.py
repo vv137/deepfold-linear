@@ -3,6 +3,8 @@
 Supports both unbatched and batched inputs via dual-mode pattern.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,14 +62,17 @@ class Trunk(nn.Module):
 
         # Token UOT+EGNN blocks — wrapped with activation checkpointing
         # (like Boltz-1's checkpoint_wrapper) for DDP compatibility.
-        self.uot_blocks = nn.ModuleList(
-            [
-                checkpoint_wrapper(
-                    TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i),
-                    checkpoint_impl=CheckpointImpl.REENTRANT,
-                )
-                for i in range(n_uot_blocks)
-            ]
+        # REENTRANT required: NO_REENTRANT breaks autocast context on recompute.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*REENTRANT.*", category=FutureWarning)
+            self.uot_blocks = nn.ModuleList(
+                [
+                    checkpoint_wrapper(
+                        TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i),
+                        checkpoint_impl=CheckpointImpl.REENTRANT,
+                    )
+                    for i in range(n_uot_blocks)
+                ]
         )
 
         # Shared position bias for UOT blocks (SPEC §4.3)

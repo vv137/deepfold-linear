@@ -347,6 +347,7 @@ def main():
 
         # Gradient accumulation loop
         metrics = None
+        step_oom = False
         for micro in range(grad_accum):
             try:
                 batch = next(train_iter)
@@ -371,16 +372,23 @@ def main():
             )
 
             if result is None:
-                # OOM — discard entire step (no optimizer step was taken)
-                metrics = None
-                oom_count += 1
-                if rank0:
-                    logger.warning("OOM skip #%d at step %d", oom_count, step)
+                step_oom = True
                 break
             metrics = result
 
-        if metrics is None:
-            continue  # entire step skipped due to OOM
+        # DDP: broadcast OOM across all ranks so everyone skips together
+        # (prevents deadlock when one rank OOMs but others wait for all-reduce)
+        if use_ddp:
+            oom_flag = torch.tensor([1 if step_oom else 0], device=device)
+            dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+            step_oom = oom_flag.item() > 0
+
+        if step_oom:
+            oom_count += 1
+            optimizer.zero_grad(set_to_none=True)
+            if rank0:
+                logger.warning("OOM skip #%d at step %d", oom_count, step)
+            continue
 
         ema.update(model.module if use_ddp else model)
 
