@@ -9,6 +9,8 @@ Fuses the nested Python tile loops from MSA block §6.2 step 4:
 
 Vectorised: uses tl.dot for all matrix products, streams S in chunks,
 and chunks over D to keep SRAM usage bounded.
+
+Supports batched inputs: U, V → (B, S, N, R), h_coevol → (B, N, D).
 """
 
 import torch
@@ -18,15 +20,15 @@ import triton.language as tl
 
 @triton.jit
 def _coevol_kernel(
-    # U: (S, N, R), V: (S, N, R)
+    # U: (B, S, N, R), V: (B, S, N, R)
     U_ptr,
     V_ptr,
-    # h_coevol: (N, D)
+    # h_coevol: (B, N, D)
     H_COEVOL_ptr,
     # Scalar weight projection: weight (R,), bias (1,)
     W_WEIGHT_ptr,
     B_WEIGHT_ptr,
-    # Outputs: h_agg (N, D), c_bar (N, R)
+    # Outputs: h_agg (B, N, D), c_bar (B, N, R)
     H_AGG_ptr,
     C_BAR_ptr,
     # Dims
@@ -34,19 +36,25 @@ def _coevol_kernel(
     N: tl.constexpr,
     R: tl.constexpr,
     D: tl.constexpr,
-    # Strides for U, V: (S, N, R)
+    # Strides for U, V: (B, S, N, R)
+    stride_ub,
     stride_us,
     stride_un,
     stride_ur,
+    stride_vb,
     stride_vs,
     stride_vn,
     stride_vr,
-    # Strides for h_coevol: (N, D)
+    # Strides for h_coevol: (B, N, D)
+    stride_hb,
     stride_hn,
     stride_hd,
-    # Strides for outputs
+    # Strides for h_agg: (B, N, D)
+    stride_ab,
     stride_an,
     stride_ad,
+    # Strides for c_bar: (B, N, R)
+    stride_cb,
     stride_cn,
     stride_cr,
     # Tile sizes
@@ -57,8 +65,8 @@ def _coevol_kernel(
 ):
     """Compute co-evolution aggregation in a single tiled pass.
 
-    Grid: (ceil(N / BLOCK_I),).  Each program owns one row tile
-    and iterates over all J tiles.
+    Grid: (B, ceil(N / BLOCK_I)).  Each program owns one batch element
+    and one row tile, iterating over all J tiles.
 
     For each (i-tile, j-tile) pair we compute:
       c_tile[:,:,r]  = (1/S) * U[:,i,r]^T @ V[:,j,r]   for r in 0..R-1
@@ -67,10 +75,18 @@ def _coevol_kernel(
       h_agg[i]      += w_tile @ h_coevol[j]             (BLOCK_I, D)
       c_bar[i]      += c_tile.sum(dim=1)                (BLOCK_I, R)
     """
-    pid_i = tl.program_id(0)
+    pid_b = tl.program_id(0)
+    pid_i = tl.program_id(1)
     i_start = pid_i * BLOCK_I
     i_idx = i_start + tl.arange(0, BLOCK_I)  # (BLOCK_I,)
     i_mask = i_idx < N
+
+    # Batch offsets for each pointer
+    U_batch = U_ptr + pid_b * stride_ub
+    V_batch = V_ptr + pid_b * stride_vb
+    H_batch = H_COEVOL_ptr + pid_b * stride_hb
+    A_batch = H_AGG_ptr + pid_b * stride_ab
+    C_batch = C_BAR_ptr + pid_b * stride_cb
 
     inv_S = 1.0 / S
 
@@ -100,10 +116,9 @@ def _coevol_kernel(
                 s_idx = s_start + tl.arange(0, S_CHUNK)  # (S_CHUNK,)
                 s_mask = s_idx < S
 
-                # Load U_sr: (S_CHUNK, BLOCK_I) — U[s, i, r]
-                # Pointer: U_ptr + s*stride_us + i*stride_un + r*stride_ur
+                # Load U_sr: (S_CHUNK, BLOCK_I) — U[b, s, i, r]
                 u_ptrs = (
-                    U_ptr
+                    U_batch
                     + s_idx[:, None] * stride_us
                     + i_idx[None, :] * stride_un
                     + r * stride_ur
@@ -112,9 +127,9 @@ def _coevol_kernel(
                     u_ptrs, mask=s_mask[:, None] & i_mask[None, :], other=0.0
                 )  # (S_CHUNK, BLOCK_I)
 
-                # Load V_sr: (S_CHUNK, BLOCK_J) — V[s, j, r]
+                # Load V_sr: (S_CHUNK, BLOCK_J) — V[b, s, j, r]
                 v_ptrs = (
-                    V_ptr
+                    V_batch
                     + s_idx[:, None] * stride_vs
                     + j_idx[None, :] * stride_vn
                     + r * stride_vr
@@ -149,7 +164,7 @@ def _coevol_kernel(
 
             # Load h_coevol[j, d]: (BLOCK_J, D_CHUNK)
             h_ptrs = (
-                H_COEVOL_ptr + j_idx[:, None] * stride_hn + d_idx[None, :] * stride_hd
+                H_batch + j_idx[:, None] * stride_hn + d_idx[None, :] * stride_hd
             )  # (BLOCK_J, D_CHUNK)
             h_chunk = tl.load(
                 h_ptrs, mask=j_mask[:, None] & d_mask[None, :], other=0.0
@@ -160,35 +175,44 @@ def _coevol_kernel(
 
             # Atomic-add to output
             out_ptrs = (
-                H_AGG_ptr + i_idx[:, None] * stride_an + d_idx[None, :] * stride_ad
+                A_batch + i_idx[:, None] * stride_an + d_idx[None, :] * stride_ad
             )  # (BLOCK_I, D_CHUNK)
             tl.atomic_add(out_ptrs, agg_chunk, mask=i_mask[:, None] & d_mask[None, :])
 
     # ---- store c_bar ----
     c_bar_ptrs = (
-        C_BAR_ptr + i_idx[:, None] * stride_cn + r_idx[None, :] * stride_cr
+        C_batch + i_idx[:, None] * stride_cn + r_idx[None, :] * stride_cr
     )  # (BLOCK_I, R)
     tl.store(c_bar_ptrs, c_bar_acc, mask=i_mask[:, None] & (r_idx[None, :] < R))
 
 
 def triton_coevol(
-    U: torch.Tensor,  # (S, N, R)
-    V: torch.Tensor,  # (S, N, R)
-    h_coevol: torch.Tensor,  # (N, D)
+    U: torch.Tensor,  # (S, N, R) or (B, S, N, R)
+    V: torch.Tensor,  # (S, N, R) or (B, S, N, R)
+    h_coevol: torch.Tensor,  # (N, D) or (B, N, D)
     w_weight: torch.Tensor,  # (R,)
     b_weight: torch.Tensor,  # (1,)
     BLOCK_I: int = 32,
     BLOCK_J: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Triton co-evolution aggregation.
+    Triton co-evolution aggregation with batch support.
+
+    Accepts both unbatched (S, N, R) and batched (B, S, N, R) inputs.
+    Unbatched inputs are promoted to B=1 internally.
 
     Returns:
-        h_agg: (N, D) weighted aggregation
-        c_bar: (N, R) co-evolution profile
+        h_agg: (N, D) or (B, N, D) weighted aggregation
+        c_bar: (N, R) or (B, N, R) co-evolution profile
     """
-    S, N, R = U.shape
-    D = h_coevol.shape[1]
+    unbatched = U.dim() == 3
+    if unbatched:
+        U = U.unsqueeze(0)
+        V = V.unsqueeze(0)
+        h_coevol = h_coevol.unsqueeze(0)
+
+    B, S, N, R = U.shape
+    D = h_coevol.shape[2]
 
     U = U.contiguous().float()
     V = V.contiguous().float()
@@ -196,15 +220,15 @@ def triton_coevol(
     w_weight = w_weight.contiguous().float()
     b_weight = b_weight.contiguous().float()
 
-    h_agg = torch.zeros(N, D, device=U.device, dtype=torch.float32)
-    c_bar = torch.zeros(N, R, device=U.device, dtype=torch.float32)
+    h_agg = torch.zeros(B, N, D, device=U.device, dtype=torch.float32)
+    c_bar = torch.zeros(B, N, R, device=U.device, dtype=torch.float32)
 
     # S_CHUNK must divide S or the kernel handles the tail via masking.
     # Pick 32 as a good default; for small S fall back to S itself.
     S_CHUNK = min(32, S)
     D_CHUNK = min(64, D)
 
-    grid = ((N + BLOCK_I - 1) // BLOCK_I,)
+    grid = (B, (N + BLOCK_I - 1) // BLOCK_I)
     _coevol_kernel[grid](
         U,
         V,
@@ -220,19 +244,26 @@ def triton_coevol(
         U.stride(0),
         U.stride(1),
         U.stride(2),
+        U.stride(3),
         V.stride(0),
         V.stride(1),
         V.stride(2),
+        V.stride(3),
         h_coevol.stride(0),
         h_coevol.stride(1),
+        h_coevol.stride(2),
         h_agg.stride(0),
         h_agg.stride(1),
+        h_agg.stride(2),
         c_bar.stride(0),
         c_bar.stride(1),
+        c_bar.stride(2),
         BLOCK_I=BLOCK_I,
         BLOCK_J=BLOCK_J,
         S_CHUNK=S_CHUNK,
         D_CHUNK=D_CHUNK,
     )
 
+    if unbatched:
+        return h_agg.squeeze(0), c_bar.squeeze(0)
     return h_agg, c_bar
