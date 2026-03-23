@@ -1756,7 +1756,13 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 3. **Distogram tiling Triton kernel** (fuse the Python tile loops in Section 11.3)
 4. **Mixed precision strategy** (BF16 for most, FP32 for Sinkhorn log-domain)
 
-**Status**: Item 1 is dramatically de-risked by flash-sinkhorn's existing implementation — the hard part (IO-aware tiling, online LSE, streaming SRAM management) is solved. Our adaptations are modular extensions, not rewrites. Items 2–3 are performance optimizations using Python-level tiling in the reference. Item 4 is a training-time optimization.
+**Current memory profile** (no checkpointing, crop=384, B200 192GB):
+- Cost matrix per block: `(B, H, N, N)` = `(1, 16, 384, 384)` × 4B = 9.4MB
+- Autograd stores 48 blocks' intermediates: ~450MB total
+- At crop=1024: ~3.2GB — still fits comfortably in 192GB
+- Checkpointing removed for DDP compatibility; B200 has sufficient memory
+
+**Status**: Flash-Sinkhorn (item 1) is the critical path for scaling beyond crop ~2048 where the O(N²) Sinkhorn intermediates (~50GB at N=2048) would exceed single-GPU memory. Until then, dense PyTorch Sinkhorn on high-memory GPUs (B200, H100 80GB) is sufficient. Items 2–3 are performance optimizations. Item 4 is active (BF16 autocast for trunk, FP32 for Sinkhorn log-domain).
 
 ### Inference Optimizations
 

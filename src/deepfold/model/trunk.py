@@ -3,15 +3,9 @@
 Supports both unbatched and batched inputs via dual-mode pattern.
 """
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-    CheckpointImpl,
-)
 
 from deepfold.model.msa import MSAModule
 from deepfold.model.trunk_block import TokenUOTBlock
@@ -60,19 +54,12 @@ class Trunk(nn.Module):
             h_res=h_res,
         )
 
-        # Token UOT+EGNN blocks — wrapped with activation checkpointing
-        # (like Boltz-1's checkpoint_wrapper) for DDP compatibility.
-        # REENTRANT required: NO_REENTRANT breaks autocast context on recompute.
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*REENTRANT.*", category=FutureWarning)
-            self.uot_blocks = nn.ModuleList(
-                [
-                    checkpoint_wrapper(
-                        TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i),
-                        checkpoint_impl=CheckpointImpl.REENTRANT,
-                    )
-                    for i in range(n_uot_blocks)
-                ]
+        # Token UOT+EGNN blocks
+        self.uot_blocks = nn.ModuleList(
+            [
+                TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i)
+                for i in range(n_uot_blocks)
+            ]
         )
 
         # Shared position bias for UOT blocks (SPEC §4.3)

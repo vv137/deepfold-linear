@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold.model.sinkhorn import sinkhorn_solve, compute_transport_output
+from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
 from deepfold.model.primitives import SwiGLU
 
 K_ITER = 20
@@ -118,10 +119,9 @@ class TokenUOTBlock(nn.Module):
         V = self.w_v(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         G = self.w_g(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        # ---- Cost matrix (SPEC §7.1) ----
+        # ---- Flash Sinkhorn Attention: O(N) memory ----
         Q_ln = F.layer_norm(Q, [d_h])
         K_ln = F.layer_norm(K, [d_h])
-        content = -torch.einsum("bhid,bhjd->bhij", Q_ln, K_ln) / (d_h**0.5)  # (B, H, N, N)
 
         # Position bias — precomputed (B, H, N, N) tensor or PositionBias module
         if isinstance(w_rel_res, torch.Tensor):
@@ -131,50 +131,47 @@ class TokenUOTBlock(nn.Module):
             if pos_bias.dim() == 3:
                 pos_bias = pos_bias.unsqueeze(0)
 
-        # Geometry bias
-        dist = torch.cdist(x_res, x_res)  # (B, N, N)
-        f_dist = dist / (self.r_0 + dist)  # (B, N, N), bounded [0, 1)
-
         effective_w_dist = w_dist  # (H,)
         if geo_gate is not None:
             effective_w_dist = geo_gate * w_dist
 
-        geo_bias = effective_w_dist[None, :, None, None] * f_dist[:, None, :, :]  # (B, H, N, N)
-
-        C = content + pos_bias + geo_bias  # (B, H, N, N)
-
-        # ---- Sinkhorn ----
-        init_u = log_u_prev
-        init_v = log_v_prev
-
         log_mu = torch.log(mu.clamp(min=1e-8))  # (B, H, N)
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # FP32 for Sinkhorn log-domain stability (SPEC §18)
-        C_fp32 = C.float()
-        log_mu_fp32 = log_mu.float()
-        log_nu_fp32 = log_nu.float()
-        eps_fp32 = self.eps.float()
-        init_u_fp32 = init_u.float() if init_u is not None else None
-        init_v_fp32 = init_v.float() if init_v is not None else None
+        # Per-sample flash_sinkhorn_attn (unbatched kernel, O(N) memory)
+        o_list, xc_list, lu_list, lv_list = [], [], [], []
+        for b in range(B):
+            o_b, xc_b, lu_b, lv_b = flash_sinkhorn_attn(
+                Q_ln[b],              # (H, N, d_h)
+                K_ln[b],
+                V[b],
+                G[b],
+                x_res[b],             # (N, 3)
+                pos_bias[b],          # (H, N, N)
+                self.eps,             # (H,)
+                effective_w_dist,     # (H,)
+                log_mu[b],            # (H, N)
+                log_nu[b],
+                K_iter=K_ITER,
+                lam=1.0,
+                r_0=self.r_0,
+                log_u_init=log_u_prev[b] if log_u_prev is not None else None,
+                log_v_init=log_v_prev[b] if log_v_prev is not None else None,
+            )
+            o_list.append(o_b)        # (N, H*d_h)
+            xc_list.append(xc_b)      # (H, N, 3)
+            lu_list.append(lu_b)      # (H, N)
+            lv_list.append(lv_b)      # (H, N)
 
-        log_u, log_v = sinkhorn_solve(
-            C_fp32,
-            log_mu_fp32,
-            log_nu_fp32,
-            eps=eps_fp32,
-            lam=1.0,
-            K=K_ITER,
-            log_u_init=init_u_fp32,
-            log_v_init=init_v_fp32,
-            mask=mask,
-        )
+        o = torch.stack(o_list, dim=0)              # (B, N, H*d_h)
+        x_centroid = torch.stack(xc_list, dim=0)    # (B, H, N, 3)
+        log_u = torch.stack(lu_list, dim=0)          # (B, H, N)
+        log_v = torch.stack(lv_list, dim=0)          # (B, H, N)
 
-        # ---- Transport output + EGNN ----
-        o, T_norm, x_centroid = compute_transport_output(
-            V.float(), G.float(), log_u, log_v, C_fp32, eps_fp32,
-            x_res.float(), mask=mask,
-        )
+        # Zero out padded positions (flash kernel is unbatched, doesn't know mask)
+        mask_hn = mask.unsqueeze(1)  # (B, 1, N) broadcast over H
+        log_u = log_u * mask_hn
+        log_v = log_v * mask_hn
 
         # h update (invariant)
         h_update = self.w_o(o.to(h.dtype))  # (B, N, d_model)

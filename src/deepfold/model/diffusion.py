@@ -5,15 +5,10 @@ context. End-to-end gradient from diffusion loss through h_res into trunk.
 """
 
 import math
-import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-    CheckpointImpl,
-)
 
 from deepfold.model.primitives import SwiGLU, zero_init_linear
 
@@ -360,19 +355,10 @@ class DiffusionModule(nn.Module):
         # Atom coordinate embedding
         self.atom_coord_proj = nn.Linear(3, d_atom)
 
-        # Atom blocks — wrapped with activation checkpointing for memory
-        # efficiency (10 blocks × M=16 diffusion samples would OOM otherwise)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*REENTRANT.*", category=FutureWarning)
-            self.atom_blocks = nn.ModuleList(
-                [
-                    checkpoint_wrapper(
-                        AtomBlock(d_atom, d_model),
-                        checkpoint_impl=CheckpointImpl.REENTRANT,
-                    )
-                    for _ in range(n_atom_blocks)
-                ]
-            )
+        # Atom blocks
+        self.atom_blocks = nn.ModuleList(
+            [AtomBlock(d_atom, d_model) for _ in range(n_atom_blocks)]
+        )
 
         # Final coordinate output — zero init (SPEC §9.2)
         self.ln_out = nn.LayerNorm(d_atom)
