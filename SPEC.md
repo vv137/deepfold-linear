@@ -1728,14 +1728,16 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
    - FourierEmbedding (frozen random), AdaLN (sigmoid-bounded), AdaLN-Zero output gates
    - c_in coordinate scaling, c_noise formula, LayerNorm on Fourier/pair features, LinearNoBias
 
-0.5. ~~**Flash-Sinkhorn Triton kernels — forward + CG-IFT backward**~~ ✅
+0.5. ~~**Flash-Sinkhorn Triton kernels + gradient correctness**~~ ✅
    - All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
    - Mask support: `-1e9` bias on padded positions in all score computations
-   - CG (conjugate gradient) replaces fixed-point iteration for IFT backward (~10 iters vs 20)
-   - Performance at N=384: fwd 0.6ms + bwd 0.7ms = 1.3ms, 37MB peak (vs dense: 4.1ms, 878MB)
-   - Forward numerical accuracy: < 1e-3 max diff vs dense PyTorch
+   - Flash forward (Triton): N=384 in 0.6ms, O(N) memory
+   - Training backward: dense unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
+   - IFT backward (CG-based): implemented but gives incorrect gradients for UOT with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
+   - FP32 marginal fix: mu.float() before log() prevents BF16 underflow in softmax Jacobian backward
+   - Kabsch alignment: disable autocast for SVD/det (BF16 not supported)
    - Coevol kernel wired into MSA (inference), distogram kernel wired into losses (eval)
-   - trunk_block.py uses flash for both training and inference (no dense fallback needed)
+   - trunk_block.py: dense unrolled for training, flash for inference
 
 1. **Flash-Sinkhorn kernel — further optimization from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
 
