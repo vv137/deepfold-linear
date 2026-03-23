@@ -411,6 +411,7 @@ def main():
                 total_steps=cfg.training.total_steps,
                 base_lr=cfg.training.lr,
                 is_accumulating=not is_last_micro,
+                grad_accum_steps=grad_accum,
             )
 
             del batch

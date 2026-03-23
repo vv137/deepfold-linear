@@ -153,6 +153,7 @@ def train_step(
     total_steps: int = 500_000,
     base_lr: float = 1e-4,
     is_accumulating: bool = False,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     """Single training step with mixed precision (SPEC §13.2, §18).
 
@@ -178,7 +179,7 @@ def train_step(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
             outputs = model(**batch)
-            loss = outputs["loss"]
+            loss = outputs["loss"] / grad_accum_steps
 
         # Backward
         grad_norm = float("nan")
