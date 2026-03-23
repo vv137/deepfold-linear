@@ -10,8 +10,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+from dotenv import load_dotenv
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+
+load_dotenv()  # load WANDB_API_KEY from .env
 
 from deepfold.data.crop import get_crop_size, set_crop_schedule
 from deepfold.data.dataset import DeepFoldDataset, collate_fn
@@ -132,6 +135,31 @@ def main():
                 f.write(f"{k}: {v}\n")
 
         logger.info("Run directory: %s", run_dir)
+
+    # ---- WandB init (rank 0 only) ----
+    use_wandb = cfg.wandb.enabled and rank0
+    if use_wandb:
+        import wandb
+
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.name or run_name,
+            tags=cfg.wandb.tags,
+            config={
+                "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
+                "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
+                "loss_weights": cfg.loss_weights.to_dict(),
+                "diffusion": {k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)},
+                "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
+                "msa": {k: getattr(cfg.msa, k) for k in vars(cfg.msa)},
+                "args": vars(args),
+            },
+            dir=str(run_dir),
+        )
+        logger.info("WandB initialized: %s/%s", cfg.wandb.project, wandb.run.name)
+    else:
+        wandb = None  # type: ignore
 
     # Build model from config (with loss weights)
     model = DeepFoldLinear(
@@ -400,6 +428,20 @@ def main():
                 metrics["l_disto"], metrics["l_trunk_coord"],
                 metrics["grad_norm"], metrics["lr"], crop_size,
             )
+            if use_wandb and step % cfg.wandb.log_every == 0:
+                wandb.log(
+                    {
+                        "train/loss": metrics["loss"],
+                        "train/l_diff": metrics["l_diff"],
+                        "train/l_lddt": metrics["l_lddt"],
+                        "train/l_disto": metrics["l_disto"],
+                        "train/l_trunk_coord": metrics["l_trunk_coord"],
+                        "train/grad_norm": metrics["grad_norm"],
+                        "train/lr": metrics["lr"],
+                        "train/crop_size": crop_size,
+                    },
+                    step=step,
+                )
 
         # Validation
         if val_loader and step % args.val_every == 0:
@@ -415,15 +457,17 @@ def main():
                 n_val += 1
             ema.restore(raw_model)
             if rank0 and n_val > 0:
+                val_avg = {k: v / n_val for k, v in val_metrics_sum.items()}
                 logger.info(
                     "[val] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f",
-                    step,
-                    val_metrics_sum["loss"] / n_val,
-                    val_metrics_sum["l_diff"] / n_val,
-                    val_metrics_sum["l_lddt"] / n_val,
-                    val_metrics_sum["l_disto"] / n_val,
-                    val_metrics_sum["l_trunk_coord"] / n_val,
+                    step, val_avg["loss"], val_avg["l_diff"], val_avg["l_lddt"],
+                    val_avg["l_disto"], val_avg["l_trunk_coord"],
                 )
+                if use_wandb:
+                    wandb.log(
+                        {f"val/{k}": v for k, v in val_avg.items()},
+                        step=step,
+                    )
 
         # Checkpointing (barrier ensures all ranks finished the step)
         if step % args.save_every == 0:
@@ -454,6 +498,9 @@ def main():
 
     if rank0 and oom_count > 0:
         logger.info("Total OOM skips: %d", oom_count)
+
+    if use_wandb:
+        wandb.finish()
 
     if use_ddp:
         dist.destroy_process_group()

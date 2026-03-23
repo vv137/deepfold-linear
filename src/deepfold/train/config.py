@@ -85,6 +85,16 @@ class SamplerConfig:
 
 
 @dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = "deepfold-linear"
+    entity: str | None = None
+    name: str | None = None  # run name; None = auto-generated
+    tags: list[str] = field(default_factory=list)
+    log_every: int = 1  # log every N optimizer steps
+
+
+@dataclass
 class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -92,6 +102,7 @@ class Config:
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     msa: MSAConfig = field(default_factory=MSAConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
 
 def _apply_dict(obj, d: dict) -> None:
@@ -126,5 +137,7 @@ def load_config(path: Optional[str | Path] = None) -> Config:
         _apply_dict(cfg.diffusion, raw["diffusion"])
     if "msa" in raw:
         _apply_dict(cfg.msa, raw["msa"])
+    if "wandb" in raw:
+        _apply_dict(cfg.wandb, raw["wandb"])
 
     return cfg

@@ -58,6 +58,14 @@ diffusion:
   rho: 7.0
   inference_steps: 200
 
+wandb:
+  enabled: false
+  project: deepfold-linear
+  entity: null  # your wandb team/user; null = default
+  name: null    # run name; null = auto-generated
+  tags: []
+  log_every: 1  # log every N optimizer steps
+
 sinkhorn:
   lambda: 1.0
   eps_heads:

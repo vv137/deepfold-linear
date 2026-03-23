@@ -9,6 +9,8 @@ dependencies = [
     "scipy>=1.11.0",
     "pyyaml>=6.0",
     "numpy>=1.24.0",
+    "wandb>=0.25.1",
+    "python-dotenv>=1.2.2",
 ]
 
 [project.optional-dependencies]
