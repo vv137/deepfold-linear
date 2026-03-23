@@ -241,7 +241,7 @@ class Trunk(nn.Module):
                         pos_bins,
                         None,  # geo_gate
                         token_pad_mask,  # mask
-                        use_reentrant=True,
+                        use_reentrant=False,
                     )
                 else:
                     with torch.no_grad():

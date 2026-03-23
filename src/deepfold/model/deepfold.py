@@ -200,7 +200,7 @@ class DeepFoldLinear(nn.Module):
                     token_pad_mask,
                     atom_pad_mask,
                     pair_valid_mask,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
 
                 l_diff_parts.append(edm_diffusion_loss(
