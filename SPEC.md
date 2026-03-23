@@ -1728,7 +1728,16 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
    - FourierEmbedding (frozen random), AdaLN (sigmoid-bounded), AdaLN-Zero output gates
    - c_in coordinate scaling, c_noise formula, LayerNorm on Fourier/pair features, LinearNoBias
 
-1. **Flash-Sinkhorn kernel — adapt from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
+0.5. ~~**Flash-Sinkhorn Triton kernels — forward + CG-IFT backward**~~ ✅
+   - All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
+   - Mask support: `-1e9` bias on padded positions in all score computations
+   - CG (conjugate gradient) replaces fixed-point iteration for IFT backward (~10 iters vs 20)
+   - Performance at N=384: fwd 0.6ms + bwd 0.7ms = 1.3ms, 37MB peak (vs dense: 4.1ms, 878MB)
+   - Forward numerical accuracy: < 1e-3 max diff vs dense PyTorch
+   - Coevol kernel wired into MSA (inference), distogram kernel wired into losses (eval)
+   - trunk_block.py uses flash for both training and inference (no dense fallback needed)
+
+1. **Flash-Sinkhorn kernel — further optimization from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
 
    Foundation: FlashSinkhorn (Ye et al. 2026, arXiv:2602.03067) provides fused Triton kernels for IO-aware streaming Sinkhorn with O(nd) memory. Already supports unbalanced OT via `reach` parameter, transport application `P*V`, analytic gradients, early stopping, and half-precision. 32× forward / 161× end-to-end speedups on A100.
 
