@@ -543,6 +543,9 @@ def flash_sinkhorn_attn(
     """
     Flash-Sinkhorn attention with O(N) memory forward+backward.
 
+    Uses Triton kernels for both forward AND backward when available.
+    Falls back to FlashSinkhornAttn (Python-tiled backward) on CPU.
+
     Accepts both unbatched and batched inputs:
     Unbatched:
         Q_ln: (H, N, d_h), x_res: (N, 3), pos_bias: (H, N, N), etc.
@@ -570,15 +573,50 @@ def flash_sinkhorn_attn(
         if mask is not None:
             mask = mask.unsqueeze(0)
 
-    result = FlashSinkhornAttn.apply(
-        Q_ln, K_ln, V, G,
-        x_res, pos_bias,
-        eps, w_dist, log_mu, log_nu,
-        K_iter, lam, r_0,
-        log_u_init, log_v_init,
-        mask,
-    )
+    B, H, N, d_h = Q_ln.shape
+
+    if mask is None:
+        mask = Q_ln.new_ones(B, N)
+
+    try:
+        # Triton path: FlashSinkhornFunction has Triton forward + Triton backward
+        from deepfold.model.kernels.sinkhorn_kernel import flash_sinkhorn as _triton_fn
+
+        # flash_sinkhorn returns (O_avg, x_centroid, log_u, log_v)
+        # with Triton backward — no Python-tiled IFT needed
+        O_avg, x_centroid, log_u, log_v = _triton_fn(
+            Q_ln, K_ln, V, x_res, pos_bias,
+            eps, w_dist, log_mu, log_nu,
+            K_iter, lam, r_0,
+            log_u_init, log_v_init,
+            mask=mask,
+        )
+    except Exception:
+        # CPU fallback: use FlashSinkhornAttn (Python-tiled backward)
+        result = FlashSinkhornAttn.apply(
+            Q_ln, K_ln, V, G,
+            x_res, pos_bias,
+            eps, w_dist, log_mu, log_nu,
+            K_iter, lam, r_0,
+            log_u_init, log_v_init,
+            mask,
+        )
+        if unbatched:
+            return tuple(t.squeeze(0) for t in result)
+        return result
+
+    # Apply gating: sigmoid(G) * O_avg → gated output
+    sig_G = torch.sigmoid(G)
+    o_gated = sig_G * O_avg  # (B, H, N, d_h)
+    o_flat = o_gated.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, H*d_h)
+
+    # Zero padded positions
+    mask_expand = mask.unsqueeze(-1)  # (B, N, 1)
+    o_flat = o_flat * mask_expand
+    mask_hn = mask.unsqueeze(1)  # (B, 1, N)
+    log_u = log_u * mask_hn
+    log_v = log_v * mask_hn
 
     if unbatched:
-        return tuple(t.squeeze(0) for t in result)
-    return result
+        return o_flat.squeeze(0), x_centroid.squeeze(0), log_u.squeeze(0), log_v.squeeze(0)
+    return o_flat, x_centroid, log_u, log_v
