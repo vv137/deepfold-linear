@@ -290,26 +290,30 @@ def bench_flash_sinkhorn_backward():
         log_mu = torch.log(torch.ones(H, N, device=device) / N)
         log_nu = torch.log(torch.ones(H, N, device=device) / N)
 
-        # Python IFT backward (flash_sinkhorn_attn.py)
+        # Python IFT backward (flash_sinkhorn_attn.py) — batched B=1
         def ref_backward():
             q, k, v, g, x, pb, wd = [
                 t.detach().float().requires_grad_(True)
                 for t in [Q_data, K_data, V_data, G_data, x_data, pb_data, wd_data]
             ]
             o, xc, _, _ = FlashSinkhornAttn.apply(
-                q, k, v, g, x, pb, eps, wd, log_mu, log_nu, 7, 1.0, 10.0, None, None
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0),
+                x.unsqueeze(0), pb.unsqueeze(0), eps, wd,
+                log_mu.unsqueeze(0), log_nu.unsqueeze(0), 7, 1.0, 10.0, None, None
             )
             (o.sum() + xc.sum()).backward()
             return q.grad, k.grad, v.grad, x.grad, wd.grad, pb.grad
 
-        # Triton IFT backward
+        # Triton IFT backward — batched B=1
         def tri_backward():
             q, k, v, x, pb, wd = [
                 t.detach().float().requires_grad_(True)
                 for t in [Q_data, K_data, V_data, x_data, pb_data, wd_data]
             ]
             O, xc, _, _ = FlashSinkhornFunction.apply(
-                q, k, v, x, pb, eps, wd, log_mu, log_nu, 7, 1.0, 10.0, None, None, 32
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+                x.unsqueeze(0), pb.unsqueeze(0), eps, wd,
+                log_mu.unsqueeze(0), log_nu.unsqueeze(0), 7, 1.0, 10.0, None, None, 32
             )
             (O.sum() + xc.sum()).backward()
             return q.grad, k.grad, v.grad, x.grad, wd.grad, pb.grad
