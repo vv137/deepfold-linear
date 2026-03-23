@@ -1032,8 +1032,15 @@ UOT handles crop boundaries naturally: unbalanced marginals allow residues at th
 ### 11.1 EDM Diffusion Loss
 
 ```
-L_diff = ((σ² + σ_data²) / (σ · σ_data)²) · ||D_θ(x_σ; σ) − x_0||²
+# 1. Weighted Kabsch alignment: align ground truth to prediction (AF3 Alg 28)
+#    Under no_grad — gradients only flow through x_pred in the MSE.
+x_aligned = weighted_rigid_align(x_true, x_pred, atom_weights, resolved_mask)  # detached
+
+# 2. MSE against aligned target, weighted by EDM schedule
+L_diff = ((σ² + σ_data²) / (σ · σ_data)²) · ||D_θ(x_σ; σ) − x_aligned||²
 ```
+
+**Weighted rigid alignment** (Kabsch/SVD): Before computing MSE, the ground truth coordinates are rigidly aligned to the prediction via weighted SVD. This removes the rotational/translational degrees of freedom that the SE(3)-invariant model cannot control. The alignment is computed under `no_grad` with `.detach()` — gradients flow only through `x_pred` in the MSE, not through the SVD. Boltz-1 and AF3 both do this.
 
 EDM preconditioning:
 
@@ -1042,7 +1049,7 @@ EDM preconditioning:
 | c_skip | σ_data² / (σ² + σ_data²) |
 | c_out | σ · σ_data / sqrt(σ² + σ_data²) |
 | c_in | 1 / sqrt(σ² + σ_data²) |
-| c_noise | ln(σ) / 4 |
+| c_noise | ln(σ/σ_data) · 0.25 |
 
 The network predicts the denoised signal. The EDM weighting ensures equal contribution across noise levels.
 

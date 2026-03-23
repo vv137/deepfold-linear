@@ -6,7 +6,10 @@ Supports both unbatched and batched inputs via dual-mode pattern.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+)
 
 from deepfold.model.msa import MSAModule
 from deepfold.model.trunk_block import TokenUOTBlock
@@ -55,10 +58,14 @@ class Trunk(nn.Module):
             h_res=h_res,
         )
 
-        # Token UOT+EGNN blocks
+        # Token UOT+EGNN blocks — wrapped with activation checkpointing
+        # (like Boltz-1's checkpoint_wrapper) for DDP compatibility.
         self.uot_blocks = nn.ModuleList(
             [
-                TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i)
+                checkpoint_wrapper(
+                    TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i),
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
                 for i in range(n_uot_blocks)
             ]
         )
@@ -228,8 +235,8 @@ class Trunk(nn.Module):
 
             for block in self.uot_blocks:
                 if is_last:
-                    h_res, x_res, log_u_prev, log_v_prev = checkpoint(
-                        block,
+                    # checkpoint_wrapper handles activation checkpointing
+                    h_res, x_res, log_u_prev, log_v_prev = block(
                         h_res,
                         x_res,
                         mu,
@@ -239,9 +246,7 @@ class Trunk(nn.Module):
                         uot_pos_bias,
                         self.w_dist,
                         pos_bins,
-                        None,  # geo_gate
-                        token_pad_mask,  # mask
-                        use_reentrant=True,
+                        mask=token_pad_mask,
                     )
                 else:
                     with torch.no_grad():

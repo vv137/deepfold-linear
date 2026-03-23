@@ -183,12 +183,13 @@ class TestEdmLossBatched:
         # Compute with original
         loss1 = edm_diffusion_loss(x_pred, x_true, sigma)
 
-        # Modify sample 1 pred
+        # Modify sample 1 pred with per-atom noise (structural change, not
+        # a global translation which Kabsch alignment would remove)
         x_pred2 = x_pred.clone()
-        x_pred2[1] = x_pred2[1] + 10.0
+        x_pred2[1] = x_pred2[1] + torch.randn(N_atom, 3) * 5.0
         loss2 = edm_diffusion_loss(x_pred2, x_true, sigma)
 
-        # Loss should differ since sample 1 changed
+        # Loss should differ since sample 1's structure changed
         assert not torch.allclose(loss1, loss2)
 
     def test_edm_loss_unbatched_compat(self):

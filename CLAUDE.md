@@ -71,6 +71,8 @@
   * LayerNorm on Fourier features before t_proj (AF3 Alg 21 line 9)
   * LayerNorm on pair features before pair_bias_proj (AF3 Alg 24 line 8)
   * t_proj and pair_bias_proj → bias=False (AF3 uses LinearNoBias)
+  * Weighted Kabsch alignment in diffusion loss (AF3 Alg 28, Boltz-1): align ground truth to prediction under no_grad before MSE
+  * UOT blocks wrapped with checkpoint_wrapper (Boltz-1 pattern) for DDP compatibility
 
 ## Known Boltz-1 Divergences
 

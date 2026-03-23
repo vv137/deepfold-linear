@@ -48,6 +48,62 @@ def _atom_type_weights(
 
 
 # ============================================================================
+# Weighted Rigid Alignment (AF3 Algorithm 28, Boltz-1)
+# ============================================================================
+
+
+def weighted_rigid_align(
+    true_coords: torch.Tensor,
+    pred_coords: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Align ground truth to prediction via weighted Kabsch (SVD).
+
+    Aligns true_coords to pred_coords under no_grad — gradients only
+    flow through the MSE against the aligned target, not through SVD.
+
+    Args:
+        true_coords:  (B, N, 3) ground truth
+        pred_coords:  (B, N, 3) predicted (alignment target)
+        weights:      (B, N) per-atom alignment weights
+        mask:         (B, N) 1=valid, 0=pad
+
+    Returns:
+        (B, N, 3) true_coords rigidly aligned to pred_coords (detached)
+    """
+    w = (mask * weights).unsqueeze(-1)  # (B, N, 1)
+    w_sum = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+    # Weighted centroids
+    true_c = (true_coords * w).sum(dim=1, keepdim=True) / w_sum
+    pred_c = (pred_coords * w).sum(dim=1, keepdim=True) / w_sum
+
+    # Center
+    true_centered = true_coords - true_c
+    pred_centered = pred_coords - pred_c
+
+    # Weighted cross-covariance: H = P^T W X
+    H = torch.einsum("bni,bnj->bij", w * pred_centered, true_centered)
+
+    # SVD in float32 for numerical stability
+    H_f32 = H.float()
+    U, S, Vh = torch.linalg.svd(H_f32)
+    V = Vh.mH  # (B, 3, 3)
+
+    # Ensure proper rotation (det=+1)
+    d = torch.det(U @ Vh).sign()  # (B,)
+    D = torch.ones(H.shape[0], 3, device=H.device, dtype=H_f32.dtype)
+    D[:, -1] = d
+    R = torch.einsum("bij,bjk,blk->bil", U, torch.diag_embed(D), V)
+    R = R.to(true_coords.dtype)
+
+    # Apply rotation + translation
+    aligned = torch.einsum("bni,bji->bnj", true_centered, R) + pred_c
+    return aligned.detach()
+
+
+# ============================================================================
 # EDM Diffusion Loss (SPEC §11.1, Boltz-1 convention)
 # ============================================================================
 
@@ -73,34 +129,40 @@ def edm_diffusion_loss(
     """
     sigma_data = SIGMA_DATA
 
-    # Unbatched path
+    # Unbatched path → add batch dim, run batched, squeeze
     if x_pred.dim() == 2:
-        edm_weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
-        mse = ((x_pred - x_true) ** 2).sum(dim=-1)  # (N_atom,)
-        if resolved_mask is None:
-            resolved_mask = torch.ones(mse.shape[0], device=mse.device)
-        if atom_weights is None:
-            atom_weights = torch.ones(mse.shape[0], device=mse.device)
-        numerator = (mse * atom_weights * resolved_mask).sum()
-        denominator = (3.0 * atom_weights * resolved_mask).sum().clamp(min=1.0)
-        return edm_weight * numerator / denominator
+        return edm_diffusion_loss(
+            x_pred.unsqueeze(0), x_true.unsqueeze(0), sigma.unsqueeze(0),
+            resolved_mask=resolved_mask.unsqueeze(0) if resolved_mask is not None else None,
+            atom_weights=atom_weights.unsqueeze(0) if atom_weights is not None else None,
+        )
 
     # Batched path: (B, N_atom, 3)
     B = x_pred.shape[0]
     N_atom = x_pred.shape[1]
+
+    if resolved_mask is None:
+        resolved_mask = torch.ones(B, N_atom, device=x_pred.device)
+    if atom_weights is None:
+        atom_weights = torch.ones(B, N_atom, device=x_pred.device)
+
+    # Weighted Kabsch alignment: align ground truth to prediction (AF3 Alg 28)
+    # Under no_grad — gradients only flow through x_pred in the MSE.
+    with torch.no_grad(), torch.autocast("cuda", enabled=False):
+        x_true_aligned = weighted_rigid_align(
+            x_true.detach().float(),
+            x_pred.detach().float(),
+            atom_weights.detach().float(),
+            mask=resolved_mask.detach().float(),
+        ).to(x_pred.dtype)
 
     # sigma: scalar or (B,) -> edm_weight (B,)
     if sigma.dim() == 0:
         sigma = sigma.expand(B)
     edm_weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2  # (B,)
 
-    # Per-atom MSE: (B, N_atom)
-    mse = ((x_pred - x_true) ** 2).sum(dim=-1)
-
-    if resolved_mask is None:
-        resolved_mask = torch.ones(B, N_atom, device=mse.device)
-    if atom_weights is None:
-        atom_weights = torch.ones(B, N_atom, device=mse.device)
+    # Per-atom MSE against aligned ground truth: (B, N_atom)
+    mse = ((x_pred - x_true_aligned) ** 2).sum(dim=-1)
 
     # Per-sample loss: (B,)
     numerator = (mse * atom_weights * resolved_mask).sum(dim=1)  # (B,)
