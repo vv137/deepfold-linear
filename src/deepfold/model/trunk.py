@@ -64,7 +64,7 @@ class Trunk(nn.Module):
             [
                 checkpoint_wrapper(
                     TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i),
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    checkpoint_impl=CheckpointImpl.REENTRANT,
                 )
                 for i in range(n_uot_blocks)
             ]
