@@ -13,6 +13,13 @@ import torch.nn.functional as F
 from deepfold.model.primitives import SwiGLU, LNLinear, zero_init_linear
 from deepfold.model.position_encoding import PositionBias
 
+try:
+    from deepfold.model.kernels.coevol_kernel import triton_coevol
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 
 class MSABlock(nn.Module):
     """Single MSA block (SPEC §6.2)."""
@@ -166,34 +173,58 @@ class MSABlock(nn.Module):
 
         h_coevol = self.coevol_value(h_res)  # (B, N, d_model)
 
-        TILE = self.tile_size
+        # Triton path: inference only, CUDA only, fuses sigmoid+matmul
+        use_triton = (
+            _HAS_TRITON
+            and not training
+            and h_res.is_cuda
+        )
+
         h_agg = torch.zeros_like(h_res)  # (B, N, d_model)
         c_bar_accum = torch.zeros(B, N, self.coevol_rank, device=device, dtype=h_res.dtype)
 
-        for i0 in range(0, N_prot, TILE):
-            ie = min(i0 + TILE, N_prot)
-            U_i = U[:, :, i0:ie, :]  # (B, S, ti, r)
+        if use_triton:
+            # Triton kernel does not apply msa_pad_mask (assumes no padding at inference).
+            # Gather h_coevol to protein-only subset for the kernel.
+            h_coevol_prot = _gather_at_indices(h_coevol, prot_indices)  # (B, N_prot, D)
 
-            for j0 in range(0, N_prot, TILE):
-                je = min(j0 + TILE, N_prot)
-                V_j = V_[:, :, j0:je, :]  # (B, S, tj, r)
+            with torch.no_grad():
+                h_agg_prot, c_bar_prot = triton_coevol(
+                    U,       # (B, S, N_prot, R)
+                    V_,      # (B, S, N_prot, R)
+                    h_coevol_prot,  # (B, N_prot, D)
+                    self.coevol_weight.weight.squeeze(0),  # (R,) — Lin(R→1).weight is (1,R)
+                    self.coevol_weight.bias,                # (1,)
+                )
+            # Scatter protein results back to full token dimension
+            _scatter_add_at_indices(h_agg, h_agg_prot.to(h_agg.dtype), prot_indices)
+            _scatter_add_at_indices(c_bar_accum, c_bar_prot.to(c_bar_accum.dtype), prot_indices)
+        else:
+            TILE = self.tile_size
+            for i0 in range(0, N_prot, TILE):
+                ie = min(i0 + TILE, N_prot)
+                U_i = U[:, :, i0:ie, :]  # (B, S, ti, r)
 
-                c_tile = torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S  # (B, ti, tj, r)
+                for j0 in range(0, N_prot, TILE):
+                    je = min(j0 + TILE, N_prot)
+                    V_j = V_[:, :, j0:je, :]  # (B, S, tj, r)
 
-                w_tile = torch.sigmoid(
-                    self.coevol_weight(c_tile).squeeze(-1)
-                )  # (B, ti, tj)
+                    c_tile = torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S  # (B, ti, tj, r)
 
-                # Mask padded positions in j dimension
-                w_tile = w_tile * msa_pad_mask[:, j0:je].unsqueeze(1)
+                    w_tile = torch.sigmoid(
+                        self.coevol_weight(c_tile).squeeze(-1)
+                    )  # (B, ti, tj)
 
-                h_j = _gather_at_indices(h_coevol, prot_indices[:, j0:je])  # (B, tj, d_model)
-                tile_out = torch.bmm(w_tile, h_j)  # (B, ti, d_model)
-                _scatter_add_at_indices(h_agg, tile_out, prot_indices[:, i0:ie])
+                    # Mask padded positions in j dimension
+                    w_tile = w_tile * msa_pad_mask[:, j0:je].unsqueeze(1)
 
-                c_bar_tile = c_tile.sum(dim=2)  # (B, ti, r)
-                c_bar_tile = c_bar_tile * msa_pad_mask[:, i0:ie].unsqueeze(-1)
-                _scatter_add_at_indices(c_bar_accum, c_bar_tile, prot_indices[:, i0:ie])
+                    h_j = _gather_at_indices(h_coevol, prot_indices[:, j0:je])  # (B, tj, d_model)
+                    tile_out = torch.bmm(w_tile, h_j)  # (B, ti, d_model)
+                    _scatter_add_at_indices(h_agg, tile_out, prot_indices[:, i0:ie])
+
+                    c_bar_tile = c_tile.sum(dim=2)  # (B, ti, r)
+                    c_bar_tile = c_bar_tile * msa_pad_mask[:, i0:ie].unsqueeze(-1)
+                    _scatter_add_at_indices(c_bar_accum, c_bar_tile, prot_indices[:, i0:ie])
 
         h_res = h_res + self.coevol_out(h_agg)
         c_bar = c_bar_accum / max(N_prot, 1)  # (B, N, r)
