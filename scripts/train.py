@@ -172,8 +172,32 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         ema.load_state_dict(ckpt["ema"])
         start_step = ckpt["step"]
+        if scaler is not None and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        # Restore RNG state on rank 0; other ranks get fresh seeds offset by
+        # rank (same as initial setup) to maintain data diversity across GPUs.
+        if "rng_state" in ckpt and not use_ddp:
+            torch.set_rng_state(ckpt["rng_state"])
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+            np.random.set_state(ckpt["np_rng_state"])
+        elif use_ddp:
+            # DDP: seed deterministically from step + rank for reproducibility
+            resume_seed = args.seed + start_step * 1000 + local_rank
+            torch.manual_seed(resume_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(resume_seed)
+            np.random.seed(resume_seed % (2**31))
         if rank0:
-            logger.info("Resumed from %s at step %d", args.resume, start_step)
+            restored = ["model", "optimizer", "ema"]
+            if "scaler" in ckpt:
+                restored.append("scaler")
+            if "rng_state" in ckpt:
+                restored.append("rng" if not use_ddp else "rng(reseeded)")
+            logger.info(
+                "Resumed from %s at step %d (restored: %s)",
+                args.resume, start_step, ", ".join(restored),
+            )
 
     if use_ddp:
         model = DDP(model, device_ids=[local_rank])
@@ -393,16 +417,31 @@ def main():
                     val_metrics_sum["l_trunk_coord"] / n_val,
                 )
 
-        # Checkpointing
+        # Checkpointing (barrier ensures all ranks finished the step)
+        if step % args.save_every == 0:
+            if use_ddp:
+                dist.barrier()
         if rank0 and step % args.save_every == 0:
             raw_model = model.module if use_ddp else model
             path = os.path.join(checkpoint_dir, f"step_{step}.pt")
-            torch.save({
+            ckpt_data = {
                 "step": step,
                 "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "ema": ema.state_dict(),
-            }, path)
+                "rng_state": torch.get_rng_state(),
+                "np_rng_state": np.random.get_state(),
+            }
+            if scaler is not None:
+                ckpt_data["scaler"] = scaler.state_dict()
+            if torch.cuda.is_available():
+                ckpt_data["cuda_rng_state"] = torch.cuda.get_rng_state()
+            torch.save(ckpt_data, path)
+            # Symlink latest.pt for easy resume
+            latest = os.path.join(checkpoint_dir, "latest.pt")
+            tmp_link = latest + ".tmp"
+            os.symlink(os.path.basename(path), tmp_link)
+            os.replace(tmp_link, latest)
             logger.info("Saved checkpoint: %s", path)
 
     if rank0 and oom_count > 0:
