@@ -85,6 +85,7 @@ class FlashSinkhornAttn(torch.autograd.Function):
         r_0,
         log_u_init,
         log_v_init,
+        mask,  # (B, N) float, 1=real 0=pad. None means all valid.
     ):
         B, H, N, d_h = Q_ln.shape
 
@@ -99,6 +100,13 @@ class FlashSinkhornAttn(torch.autograd.Function):
         w_dist = w_dist.contiguous().float()
         log_mu = log_mu.contiguous().float()
         log_nu = log_nu.contiguous().float()
+
+        # Mask: (B, N) → column bias for Sinkhorn (-1e9 for padded)
+        if mask is None:
+            mask = Q_ln.new_ones(B, N)
+        mask = mask.contiguous().float()
+        # col_mask_bias: (B, 1, N) — broadcast over H, added to log_K columns
+        col_mask_bias = (1.0 - mask).unsqueeze(1) * (-1e9)  # (B, 1, N)
 
         # --- Sinkhorn iterations (use Triton if available, else Python) ---
         try:
@@ -140,12 +148,15 @@ class FlashSinkhornAttn(torch.autograd.Function):
                     else torch.zeros(H, N, device=Q_ln.device)
                 )
 
+                # Apply mask: add -1e9 to padded columns so they get zero transport
+                cmb = col_mask_bias[b]  # (1, N)
+
                 for _ in range(K_iter):
                     lu = kappa[:, None] * (
-                        log_mu[b] - torch.logsumexp(log_K + lv[:, None, :], dim=-1)
+                        log_mu[b] - torch.logsumexp(log_K + lv[:, None, :] + cmb, dim=-1)
                     )
                     lv = kappa[:, None] * (
-                        log_nu[b] - torch.logsumexp(log_K + lu[:, :, None], dim=-2)
+                        log_nu[b] - torch.logsumexp(log_K + lu[:, :, None] + cmb.unsqueeze(1), dim=-2)
                     )
 
                 log_score = lu[:, :, None] + log_K + lv[:, None, :]
@@ -168,11 +179,17 @@ class FlashSinkhornAttn(torch.autograd.Function):
         o_gated = sig_G * O_avg  # (B, H, N, d_h)
         o_flat = o_gated.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, H*d_h)
 
+        # Zero outputs at padded positions
+        mask_hn = mask.unsqueeze(1)  # (B, 1, N)
+        log_u = log_u * mask_hn
+        log_v = log_v * mask_hn
+        o_flat = o_flat * mask.unsqueeze(-1)  # (B, N, 1)
+
         # Save for backward — all O(N·d), no N×N
         ctx.save_for_backward(
             Q_ln, K_ln, V, G, x_res, pos_bias,
             eps, w_dist, log_mu, log_nu,
-            log_u, log_v, O_avg, x_centroid, sig_G,
+            log_u, log_v, O_avg, x_centroid, sig_G, mask,
         )
         ctx.K_iter = K_iter
         ctx.lam = lam
@@ -185,7 +202,7 @@ class FlashSinkhornAttn(torch.autograd.Function):
         (
             Q_ln, K_ln, V, G, x_res, pos_bias,
             eps, w_dist, log_mu, log_nu,
-            log_u, log_v, O_avg, x_centroid, sig_G,
+            log_u, log_v, O_avg, x_centroid, sig_G, mask,
         ) = ctx.saved_tensors
         K_back = ctx.K_iter
         lam = ctx.lam
@@ -500,6 +517,7 @@ class FlashSinkhornAttn(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # mask
         )
 
 
@@ -519,6 +537,7 @@ def flash_sinkhorn_attn(
     r_0: float = 10.0,
     log_u_init: torch.Tensor | None = None,
     log_v_init: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Flash-Sinkhorn attention with O(N) memory forward+backward.
@@ -530,6 +549,8 @@ def flash_sinkhorn_attn(
     Batched:
         Q_ln: (B, H, N, d_h), x_res: (B, N, 3), pos_bias: (B, H, N, N), etc.
         Returns: o_flat (B, N, H*d_h), x_centroid (B, H, N, 3), log_u (B, H, N), log_v (B, H, N)
+
+    mask: (B, N) or (N,) float, 1=real 0=pad. None means all valid.
     """
     unbatched = Q_ln.dim() == 3
     if unbatched:
@@ -545,6 +566,8 @@ def flash_sinkhorn_attn(
             log_u_init = log_u_init.unsqueeze(0)
         if log_v_init is not None:
             log_v_init = log_v_init.unsqueeze(0)
+        if mask is not None:
+            mask = mask.unsqueeze(0)
 
     result = FlashSinkhornAttn.apply(
         Q_ln, K_ln, V, G,
@@ -552,6 +575,7 @@ def flash_sinkhorn_attn(
         eps, w_dist, log_mu, log_nu,
         K_iter, lam, r_0,
         log_u_init, log_v_init,
+        mask,
     )
 
     if unbatched:

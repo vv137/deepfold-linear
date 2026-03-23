@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold.model.sinkhorn import sinkhorn_solve, compute_transport_output
 from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
 from deepfold.model.primitives import SwiGLU
 
@@ -138,7 +137,7 @@ class TokenUOTBlock(nn.Module):
         log_mu = torch.log(mu.clamp(min=1e-8))  # (B, H, N)
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # Batched flash_sinkhorn_attn — no per-sample loop needed
+        # Batched flash_sinkhorn_attn with mask — handles padding internally
         o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
             Q_ln,                 # (B, H, N, d_h)
             K_ln,                 # (B, H, N, d_h)
@@ -155,14 +154,10 @@ class TokenUOTBlock(nn.Module):
             r_0=self.r_0,
             log_u_init=log_u_prev,
             log_v_init=log_v_prev,
+            mask=mask,            # (B, N) — padded positions get zero transport
         )
         # o: (B, N, H*d_h), x_centroid: (B, H, N, 3)
         # log_u: (B, H, N), log_v: (B, H, N)
-
-        # Zero out padded positions (flash kernel is unbatched, doesn't know mask)
-        mask_hn = mask.unsqueeze(1)  # (B, 1, N) broadcast over H
-        log_u = log_u * mask_hn
-        log_v = log_v * mask_hn
 
         # h update (invariant)
         h_update = self.w_o(o.to(h.dtype))  # (B, N, d_model)
