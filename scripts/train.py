@@ -200,7 +200,7 @@ def main():
             )
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank], static_graph=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Checkpoint dir already created by rank 0 above; non-rank-0 needs the path
     if not rank0:
