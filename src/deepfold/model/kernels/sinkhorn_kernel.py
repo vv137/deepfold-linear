@@ -1449,27 +1449,57 @@ class FlashSinkhornFunction(torch.autograd.Function):
             *stride_args_bwd,
         )
 
-        # ---- Step 4: IFT adjoint iterations ----
-        z_u = g_u.clone()
-        z_v = g_v.clone()
-        z_u_new = torch.empty_like(z_u)
-        z_v_new = torch.empty_like(z_v)
+        # ---- Step 4: IFT adjoint via CG (Schur complement) ----
+        # The IFT system: z_u = g_u + κ·S_col·z_v, z_v = g_v + κ·S_row·z_u
+        # Eliminate z_u → Schur complement for z_v:
+        #   (I - κ²·S_row·S_col) z_v = g_v + κ·S_row·g_u
+        # CG solves this in ~10 iterations vs 20 fixed-point iterations.
+        from deepfold.utils.cg import conjugate_gradient
 
         common = (Q_ln, K_ln, x_res, pos_bias, eps, w_dist)
 
-        for _ in range(K_back):
+        def _apply_S_col(z_in):
+            """S_col·z: one step of z_u = κ·(g_u=0 + S_col·z_in)."""
+            out = torch.empty_like(z_in)
             _ift_z_u_update[grid](
-                *common, log_u, col_lse, g_u, z_v, z_u_new, kappa, mask_bias,
-                N, d_h, r_0, H,
-                *stride_args_bwd,
+                *common, log_u, col_lse,
+                torch.zeros_like(z_in),  # g_u = 0
+                z_in, out, kappa, mask_bias,
+                N, d_h, r_0, H, *stride_args_bwd,
             )
+            return out
+
+        def _apply_S_row(z_in):
+            """S_row·z: one step of z_v = κ·(g_v=0 + S_row·z_in)."""
+            out = torch.empty_like(z_in)
             _ift_z_v_update[grid](
-                *common, log_v, row_lse, g_v, z_u_new, z_v_new, kappa, mask_bias,
-                N, d_h, r_0, H,
-                *stride_args_bwd,
+                *common, log_v, row_lse,
+                torch.zeros_like(z_in),  # g_v = 0
+                z_in, out, kappa, mask_bias,
+                N, d_h, r_0, H, *stride_args_bwd,
             )
-            z_u, z_u_new = z_u_new, z_u
-            z_v, z_v_new = z_v_new, z_v
+            return out
+
+        # RHS: g_v + κ·S_row·g_u (but g_u = 0 for row-normalized transport)
+        rhs = g_v.clone()  # (B, H, N) flattened for CG
+
+        def schur_matvec(z_flat):
+            """(I - κ²·S_row·S_col) @ z"""
+            z = z_flat.view(B, H, N)
+            Sz = _apply_S_col(z)   # S_col @ z
+            SSz = _apply_S_row(Sz)  # S_row @ S_col @ z
+            return (z - SSz).view(-1)
+
+        z_v_flat, _ = conjugate_gradient(
+            schur_matvec, rhs.view(-1),
+            x0=g_v.view(-1),  # warm-start from g_v
+            max_iter=min(K_back, 50),
+            rtol=1e-5, atol=1e-6,
+        )
+        z_v = z_v_flat.view(B, H, N)
+
+        # Back-solve: z_u = g_u + κ·S_col·z_v (g_u = 0)
+        z_u = _apply_S_col(z_v)
 
         # ---- Step 5: Cost gradient propagation ----
         grad_Q_ln = torch.zeros_like(Q_ln)
