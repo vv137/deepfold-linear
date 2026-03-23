@@ -60,6 +60,17 @@
   * EMA warmup: copy params directly for first 1000 steps
   * Optimizer: 3 param groups (decay, no-decay, EGNN γ with decay)
   * ~229M → ~220M parameters (−9M from diffusion UOT removal)
+* Phase 12: SPEC v4.6 — Diffusion stability, AF3/Boltz-1 alignment ✅
+  * FourierEmbedding: random frozen projection cos(2π(t·w+b)) replaces deterministic sinusoidal (AF3 Alg 22)
+  * AdaLN: sigmoid(Lin(s))·LN(a,affine=False)+LinNoBias(s) replaces unbounded (1+γ)·LN(a)+β (AF3 Alg 26)
+  * AdaLN-Zero gates: sigmoid(Lin(cond,w=0,b=−2)) on attention + transition outputs (AF3 Alg 24)
+  * Removed cond_gate1/cond_gate2 (c_atom gating) — replaced by AdaLN-Zero conditioning gates
+  * Each atom block starts as near-identity at init (sigmoid(−2)≈0.12 gate factor)
+  * c_noise = log(σ/σ_data)·0.25 (was log(σ)/4) — matches AF3/Boltz-1
+  * Coordinate input scaling: c_in = 1/√(σ²+σ_data²) replaces 1/σ_data (AF3 Alg 20 line 2)
+  * LayerNorm on Fourier features before t_proj (AF3 Alg 21 line 9)
+  * LayerNorm on pair features before pair_bias_proj (AF3 Alg 24 line 8)
+  * t_proj and pair_bias_proj → bias=False (AF3 uses LinearNoBias)
 
 ## Known Boltz-1 Divergences
 

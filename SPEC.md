@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v4.5
+# Protein Complex Structure Prediction Model: Full Design Specification v4.6
 
 ---
 
@@ -876,12 +876,16 @@ def diffusion_step(h_res, c_atom, p_lm, x_atom_noisy, sigma, token_idx):
     token_idx:    (N_atom,)      maps atoms to tokens
     """
 
-    # 1. Timestep embedding + token conditioning
-    t_emb = timestep_fourier_embedding(log(sigma) / 4, d=128)   # (128,)
-    h_cond = h_res + Lin(128 → 512)(t_emb)                      # (N, 512) broadcast
+    # 1. Timestep embedding + token conditioning (AF3 Alg 21-22)
+    # FourierEmbedding: frozen random projection, cos(2π(c_noise·w + b))
+    # w, b ~ N(0, 1), requires_grad=False (sampled once, never updated)
+    c_noise = log(sigma / sigma_data) * 0.25                     # AF3/Boltz c_noise
+    t_emb = FourierEmbedding(d=128)(c_noise)                     # (128,)
+    h_cond = h_res + LinNoBias(128 → 512)(LN(t_emb))            # LN on Fourier features
 
-    # 2. Atom embedding: current noisy coordinates
-    q = c_atom + Lin(3 → 128)(x_atom_noisy / sigma_data)        # (N_atom, 128)
+    # 2. Atom embedding: scale by c_in (AF3 Alg 20 line 2)
+    c_in = 1 / sqrt(sigma² + sigma_data²)                       # EDM input scaling
+    q = c_atom + Lin(3 → 128)(x_atom_noisy * c_in)              # (N_atom, 128)
 
     # 3. Atom blocks × 10
     for block in atom_blocks:
@@ -903,48 +907,49 @@ def diffusion_step(h_res, c_atom, p_lm, x_atom_noisy, sigma, token_idx):
 ```python
 class AtomBlock(nn.Module):
     def __init__(self, d_atom=128, H_atom=4):
-        # AdaLN components
-        self.cond_proj1 = Lin(512, 128)         # h_res → atom dimension
-        self.adaln1     = Lin(128, 128 * 2)     # → gamma, beta
-        self.adaln2     = Lin(128, 128 * 2)     # for transition
+        # Conditioning projection
+        self.cond_proj = Lin(512, 128)          # h_cond → atom dimension
+
+        # AdaLN (AF3 Algorithm 26): sigmoid-bounded scale, LN on conditioning
+        # a = sigmoid(Lin(s)) * LayerNorm(a, affine=False) + LinNoBias(s)
+        # s is normalized by its own LayerNorm before producing scale/shift
+        self.adaln1 = AdaLN(128, 128)           # pre-attention
+        self.adaln2 = AdaLN(128, 128)           # pre-transition
 
         # Self-attention
-        self.ln_attn = LayerNorm(128)           # used inside AdaLN
-        self.W_Q = Lin(128, 128)                # → (N_atom, H_atom=4, 32)
-        self.W_K = Lin(128, 128)
-        self.W_V = Lin(128, 128)
-        self.W_G = Lin(128, 128)
-        self.W_O = Lin(128, 128)
+        self.W_Q = Lin(128, 128, bias=True)     # AF3: Q has bias
+        self.W_K = Lin(128, 128, bias=False)
+        self.W_V = Lin(128, 128, bias=False)
+        self.W_G = Lin(128, 128, bias=False)
+        self.W_O = Lin(128, 128, bias=False)
 
         # Atom pair bias projection
-        self.pair_bias = Lin(16, H_atom)        # p_lm → per-head bias
+        self.pair_bias_proj = Lin(16, H_atom)   # p_lm → per-head bias
 
-        # Conditioned gating
-        self.cond_gate = Lin(128, 128)          # from c_atom
+        # AdaLN-Zero output gates (AF3 Algorithm 24, lines 12-14)
+        # weight=0, bias=-2 → sigmoid(-2) ≈ 0.12 at init → near-identity block
+        self._attn_gate       = Lin(128, 128, w_init=0, b_init=-2)
+        self._transition_gate = Lin(128, 128, w_init=0, b_init=-2)
 
-        # Transition
-        self.ff_gate  = Lin(128, 512)
-        self.ff_value = Lin(128, 512)
-        self.ff_out   = Lin(512, 128)
-        self.cond_gate2 = Lin(128, 128)
+        # Transition (SwiGLU)
+        self.swiglu = SwiGLU(128, 512, 128)
 
-    def forward(self, q, c_atom, h_res, p_lm, sigma, residue_idx):
+    def forward(self, q, c_atom, h_cond, p_lm, t_emb, token_idx):
         """
         q:            (N_atom, 128)  atom representation
         c_atom:       (N_atom, 128)  frozen reference
-        h_res:        (N, 512)       from diffusion residue blocks
+        h_cond:       (N, 512)       timestep-conditioned token repr
         p_lm:         (local, 16)    frozen atom pair representation
-        sigma:        scalar         noise level
-        residue_idx:  (N_atom,)      maps atoms to residues
+        t_emb:        (128,)         Fourier timestep embedding
+        token_idx:    (N_atom,)      maps atoms to tokens
         """
 
-        # AdaLN conditioning: timestep + residue info
-        t_emb = timestep_fourier_embedding(log(sigma) / 4, d=128)   # (128,)
-        cond = t_emb[None, :] + self.cond_proj1(h_res[residue_idx]) # (N_atom, 128)
-        gamma1, beta1 = self.adaln1(cond).chunk(2, dim=-1)          # (N_atom, 128) each
+        # Conditioning signal: timestep + token info
+        cond = t_emb[None, :] + self.cond_proj(h_cond[token_idx])    # (N_atom, 128)
 
-        # AdaLN-normalized input
-        q_n = gamma1 * self.ln_attn(q) + beta1                      # (N_atom, 128)
+        # AdaLN-normalized input (AF3 Algorithm 26)
+        # sigmoid-bounded scale: a = sigmoid(Lin(s)) * LN(q, affine=False) + LinNoBias(s)
+        q_n = self.adaln1(q, cond)                                   # (N_atom, 128)
 
         # ---- Self-attention: sequence-local window ----
         Q = self.W_Q(q_n).view(N_atom, H_atom, 32)
@@ -952,12 +957,10 @@ class AtomBlock(nn.Module):
         V = self.W_V(q_n).view(N_atom, H_atom, 32)
         G = self.W_G(q_n).view(N_atom, H_atom, 32)
 
-        # Atom pair bias (intra-residue only, from frozen reference)
-        b_pair = self.pair_bias(p_lm)                                # (local, H_atom)
+        # Atom pair bias — LN on z_ij before projection (AF3 Alg 24 line 8)
+        b_pair = self.pair_bias_proj(LN(p_lm))                      # (local, H_atom)
 
         # Sequence-local attention, window size 32 (AF3 style)
-        # Atoms are ordered by residue, then by atom within residue
-        # Window of 32 atoms covers ~2-3 residues of context
         A = softmax(
             einsum('ihd,jhd->hij', Q, K) / sqrt(32) + b_pair,
             dim=-1,
@@ -965,17 +968,16 @@ class AtomBlock(nn.Module):
         )                                                            # sparse (N_atom, H, 32)
         att_out = sparse_einsum(A, V)                                # (N_atom, H, 32)
         att_out = rearrange(att_out, 'n h d -> n (h d)')             # (N_atom, 128)
-        q = q + sigmoid(rearrange(G, 'n h d -> n (h d)')) * self.W_O(att_out)
+        attn_update = sigmoid(rearrange(G, 'n h d -> n (h d)')) * self.W_O(att_out)
 
-        # ---- Conditioned gating (AF3 style) ----
-        q = q + sigmoid(self.cond_gate(c_atom)) * q
+        # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
+        # sigmoid(Lin(cond, w=0, b=-2)) ≈ 0.12 at init → near-identity block
+        q = q + sigmoid(self._attn_gate(cond)) * attn_update
 
-        # ---- SwiGLU transition with AdaLN ----
-        gamma2, beta2 = self.adaln2(cond).chunk(2, dim=-1)
-        q_n2 = gamma2 * LayerNorm(q) + beta2
-        gate  = self.ff_gate(q_n2)                                   # (N_atom, 512)
-        value = self.ff_value(q_n2)                                  # (N_atom, 512)
-        q = q + sigmoid(self.cond_gate2(c_atom)) * self.ff_out(SiLU(gate) * value)
+        # ---- SwiGLU transition with AdaLN + AdaLN-Zero gate ----
+        q_n2 = self.adaln2(q, cond)                                  # (N_atom, 128)
+        transition_update = self.swiglu(q_n2)
+        q = q + sigmoid(self._transition_gate(cond)) * transition_update
 
         return q
 ```
@@ -1475,6 +1477,9 @@ def init_model(model, num_blocks=48):
 | Atom encoder projections | Xavier | Standard; encoder output is O(1) at init |
 | Diffusion coord output Lin(128→3) | **all zeros** | Identity denoising at init (EDM preconditioning assumes this) |
 | Distogram head (W_u, W_v, W_bin) | Xavier | Random predictions at init → strong initial gradients to h_res |
+| FourierEmbedding w, b | N(0,1), **frozen** | Random Fourier features; never updated (AF3 Algorithm 22) |
+| AdaLN-Zero gates (_attn_gate, _transition_gate) | **w=0, b=−2** | sigmoid(−2)≈0.12 at init → atom blocks start as near-identity (AF3 Algorithm 24) |
+| AdaLN s_scale, s_bias | Xavier | Conditioning projections; sigmoid bounds scale to [0,1] |
 
 **Staged activation dynamics**: At the start of training:
 
@@ -1672,7 +1677,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 
 ## 17. Comparison with AF3
 
-| Aspect | AF3 | This Model (v4.5) |
+| Aspect | AF3 | This Model (v4.6) |
 |---|---|---|
 | Single representation | c_s = 384 | d = 512 |
 | Pair representation | c_z = 128, O(N²) stored | ❌ none |
@@ -1711,6 +1716,10 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 3. **Detailed training stages**: Learning rate schedule per stage, crop size ramp (Section 10.3).
 
 ### Engineering (Priority Order)
+
+0. ~~**Diffusion module stability (AF3/Boltz-1 alignment)**~~ ✅ v4.6
+   - FourierEmbedding (frozen random), AdaLN (sigmoid-bounded), AdaLN-Zero output gates
+   - c_in coordinate scaling, c_noise formula, LayerNorm on Fourier/pair features, LinearNoBias
 
 1. **Flash-Sinkhorn kernel — adapt from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
 
@@ -1762,6 +1771,19 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 ---
 
 ## Appendix A: Review Decisions Log
+
+### v4.5 → v4.6 Changes
+
+| Change | Section | Rationale |
+|---|---|---|
+| FourierEmbedding: frozen random projection replaces deterministic sinusoidal | §9.2 | AF3 Algorithm 22: `cos(2π(t·w + b))` with w,b~N(0,1) frozen. Incoherent basis uniformly represents all noise levels. Boltz-1 identical. |
+| AdaLN: sigmoid-bounded scale replaces unbounded (1+γ) | §9.3 | AF3 Algorithm 26: `sigmoid(Lin(s)) * LN(a, affine=False) + LinNoBias(s)`. Scale bounded [0,1], conditioning LN'd. Prevents scale explosion. |
+| AdaLN-Zero output gates on attention + transition | §9.3 | AF3 Algorithm 24: `sigmoid(Lin(s, w=0, b=-2)) ⊙ output`. Each block starts as near-identity (sigmoid(-2)≈0.12). Critical for training stability. |
+| c_noise = log(σ/σ_data)·0.25 (was log(σ)/4) | §9.2, §12 | Boltz-1 `c_noise`: `log(sigma/sigma_data) * 0.25`. Matches AF3 Algorithm 21 line 8. |
+| Coordinate input scaling: c_in = 1/√(σ²+σ_data²) (was 1/σ_data) | §9.2 | AF3 Algorithm 20 line 2: `r_noisy = x_noisy / √(t̂²+σ_data²)`. Normalizes to unit variance at all noise levels. Was leaving high-σ inputs unnormalized (std≈σ/σ_data≈10 at σ=160). |
+| LayerNorm on Fourier features before t_proj | §9.2 | AF3 Algorithm 21 line 9: `s += LinNoBias(LN(n))`. Boltz-1 `norm_fourier`. Stabilizes conditioning injection. |
+| LayerNorm on pair features before pair_bias_proj | §9.3 | AF3 Algorithm 24 line 8: `b_ij = LinNoBias(LN(z_ij))`. Normalizes frozen pair features. |
+| t_proj and pair_bias_proj → LinearNoBias | §9.2, §9.3 | AF3 uses LinearNoBias for Fourier-to-single and pair bias projections. |
 
 ### v4.4 → v4.5 Changes
 

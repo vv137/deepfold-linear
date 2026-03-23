@@ -52,20 +52,21 @@ def _make_sample(
 
 
 class TestCollateBatchSize1:
-    """batch_size=1 returns sample unchanged (no batch dim)."""
+    """batch_size=1 adds a batch dimension via unsqueeze(0)."""
 
-    def test_single_sample_passthrough(self):
+    def test_single_sample_batch_dim(self):
         sample = _make_sample(N=10, N_atom=50, n_pairs=20)
         result = collate_fn([sample])
-        # Should be the exact same dict (no batch dim added)
-        assert result is sample
+        # Should add batch dim (B=1) to all tensors
+        assert result["token_pad_mask"].shape == (1, 10)
+        assert result["atom_pad_mask"].shape == (1, 50)
+        assert result["bond_matrix"].shape == (1, 10, 10)
 
-    def test_single_sample_shapes(self):
+    def test_single_sample_values_preserved(self):
         sample = _make_sample(N=10, N_atom=50, n_pairs=20)
         result = collate_fn([sample])
-        assert result["token_pad_mask"].shape == (10,)
-        assert result["atom_pad_mask"].shape == (50,)
-        assert result["bond_matrix"].shape == (10, 10)
+        # Values should be identical (just unsqueezed)
+        torch.testing.assert_close(result["profile"][0], sample["profile"])
 
 
 class TestCollateBatch:

@@ -7,7 +7,7 @@ from deepfold.model.trunk_block import TokenUOTBlock
 from deepfold.model.position_encoding import compute_bins, PositionBias
 from deepfold.model.diffusion import (
     AtomBlock,
-    timestep_fourier_embedding,
+    FourierEmbedding,
     edm_preconditioning,
     karras_schedule,
 )
@@ -124,8 +124,9 @@ class TestTokenUOTBlock:
 
 class TestDiffusion:
     def test_timestep_embedding(self):
+        fourier = FourierEmbedding(128)
         t = torch.tensor(0.5)
-        emb = timestep_fourier_embedding(t, d=128)
+        emb = fourier(t)
         assert emb.shape == (128,)
 
     def test_edm_preconditioning(self):

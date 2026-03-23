@@ -121,4 +121,5 @@ class TestLayerNorm:
             if isinstance(module, nn.LayerNorm):
                 if module.elementwise_affine:
                     assert (module.weight == 1).all(), f"{name}.weight should be 1"
-                    assert (module.bias == 0).all(), f"{name}.bias should be 0"
+                    if module.bias is not None:
+                        assert (module.bias == 0).all(), f"{name}.bias should be 0"

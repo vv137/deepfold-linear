@@ -18,6 +18,11 @@ def _is_zero_init(name: str) -> bool:
     return any(tag in name for tag in ("gamma", "w_dist", "alpha_coevol"))
 
 
+def _is_adaln_zero_gate(name: str) -> bool:
+    """AdaLN-Zero gates: weight=0, bias=-2.0 (set in AtomBlock.__init__)."""
+    return "_attn_gate" in name or "_transition_gate" in name
+
+
 def _is_position_bias(name: str) -> bool:
     """PositionBias weights — zeros init, learned."""
     return "pos_bias.weight" in name
@@ -41,6 +46,14 @@ def init_model(model: nn.Module) -> None:
     # atom_encoder -> 1 block (no depth scaling needed)
 
     for name, param in model.named_parameters():
+        # Skip AdaLN-Zero gates — already initialized in AtomBlock.__init__
+        if _is_adaln_zero_gate(name):
+            continue
+
+        # Skip frozen Fourier embedding weights
+        if "fourier_embed" in name:
+            continue
+
         if param.dim() < 2:
             # Scalars and 1D params
             if _is_zero_init(name) or _is_position_bias(name):

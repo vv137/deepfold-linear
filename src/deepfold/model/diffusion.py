@@ -31,7 +31,7 @@ def edm_preconditioning(sigma: torch.Tensor):
     c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
     c_out = sigma * sigma_data / (sigma**2 + sigma_data**2).sqrt()
     c_in = 1.0 / (sigma**2 + sigma_data**2).sqrt()
-    c_noise = sigma.log() / 4.0
+    c_noise = (sigma / SIGMA_DATA).log() * 0.25
     return c_skip, c_out, c_in, c_noise
 
 
@@ -53,16 +53,31 @@ def karras_schedule(n_steps: int, device: torch.device) -> torch.Tensor:
     return sigmas
 
 
-def timestep_fourier_embedding(c_noise: torch.Tensor, d: int = 128) -> torch.Tensor:
-    """Fourier embedding for timestep conditioning."""
-    half_d = d // 2
-    freqs = torch.exp(
-        -math.log(10000.0)
-        * torch.arange(half_d, device=c_noise.device, dtype=c_noise.dtype)
-        / half_d
-    )
-    args = c_noise.unsqueeze(-1) * freqs
-    return torch.cat([args.sin(), args.cos()], dim=-1)  # (*, d)
+class FourierEmbedding(nn.Module):
+    """Random Fourier embedding with frozen weights (AF3 Algorithm 22).
+
+    Weights and biases are sampled from N(0, 1) once at init and frozen.
+    Output: cos(2π(t·w + b)), providing an incoherent basis that uniformly
+    represents all noise levels. This replaces the deterministic sinusoidal
+    encoding (Vaswani-style) which has geometric frequency spacing.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(1, dim)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1.0)
+        nn.init.normal_(self.proj.bias, mean=0.0, std=1.0)
+        self.proj.requires_grad_(False)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t: (*,) scalar or batch of scalars (c_noise values)
+        Returns:
+            (*,dim) Fourier features
+        """
+        t = t.unsqueeze(-1)  # (*, 1)
+        return torch.cos(2 * math.pi * self.proj(t))  # (*, dim)
 
 
 # ============================================================================
@@ -70,8 +85,36 @@ def timestep_fourier_embedding(c_noise: torch.Tensor, d: int = 128) -> torch.Ten
 # ============================================================================
 
 
+class AdaLN(nn.Module):
+    """Adaptive LayerNorm (AF3 Algorithm 26, Boltz-1).
+
+    a = sigmoid(Linear(s)) * LayerNorm(a, affine=False) + LinearNoBias(s)
+
+    Scale is bounded to [0,1] via sigmoid (not unbounded (1+gamma)).
+    Conditioning signal s is normalized before producing scale/shift.
+    """
+
+    def __init__(self, dim: int, dim_cond: int):
+        super().__init__()
+        self.a_norm = nn.LayerNorm(dim, elementwise_affine=False, bias=False)
+        self.s_norm = nn.LayerNorm(dim_cond, bias=False)
+        self.s_scale = nn.Linear(dim_cond, dim)  # bias=True (standalone proj)
+        self.s_bias = nn.Linear(dim_cond, dim, bias=False)
+
+    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        a = self.a_norm(a)
+        s = self.s_norm(s)
+        return torch.sigmoid(self.s_scale(s)) * a + self.s_bias(s)
+
+
 class AtomBlock(nn.Module):
-    """Single atom-level block with AdaLN conditioning (SPEC §9.3)."""
+    """Single atom-level block with AdaLN + AdaLN-Zero gating (SPEC §9.3).
+
+    Key stability features (AF3 Algorithm 24):
+    - AdaLN with sigmoid-bounded scale (not unbounded (1+gamma))
+    - AdaLN-Zero output projection: sigmoid(Linear(s, w=0, b=-2)) gates
+      attention and transition outputs so each block starts as near-identity
+    """
 
     def __init__(self, d_atom: int = 128, d_model: int = 512, n_heads: int = 4):
         super().__init__()
@@ -79,28 +122,37 @@ class AtomBlock(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_atom // n_heads  # 32
 
-        # AdaLN
+        # Conditioning projection: h_cond (d_model) -> d_atom
         self.cond_proj = nn.Linear(d_model, d_atom)
-        self.adaln1 = nn.Linear(d_atom, d_atom * 2)
-        self.adaln2 = nn.Linear(d_atom, d_atom * 2)
 
-        # Self-attention — after AdaLN (includes LN), so bias=False (SPEC §0)
-        self.ln_attn = nn.LayerNorm(d_atom)
-        self.w_q = nn.Linear(d_atom, d_atom, bias=False)
+        # AdaLN (AF3 Algorithm 26): sigmoid-bounded scale
+        self.adaln1 = AdaLN(d_atom, d_atom)
+        self.adaln2 = AdaLN(d_atom, d_atom)
+
+        # Self-attention — after AdaLN, so bias=False (SPEC §0)
+        self.w_q = nn.Linear(d_atom, d_atom, bias=True)  # AF3: Linear with bias for Q
         self.w_k = nn.Linear(d_atom, d_atom, bias=False)
         self.w_v = nn.Linear(d_atom, d_atom, bias=False)
         self.w_g = nn.Linear(d_atom, d_atom, bias=False)
         self.w_o = nn.Linear(d_atom, d_atom, bias=False)
 
-        # Pair bias
-        self.pair_bias = nn.Linear(16, n_heads)
+        # Pair bias — LayerNorm on z_ij before projection (AF3 Alg 24 line 8)
+        self.ln_pair = nn.LayerNorm(16)
+        self.pair_bias_proj = nn.Linear(16, n_heads, bias=False)  # AF3: LinearNoBias
 
-        # Conditioned gating
-        self.cond_gate1 = nn.Linear(d_atom, d_atom)
-        self.cond_gate2 = nn.Linear(d_atom, d_atom)
+        # AdaLN-Zero output gate for attention (AF3 Algorithm 24, lines 12-14)
+        # weight=0, bias=-2 → sigmoid(-2) ≈ 0.12 at init → near-identity block
+        self._attn_gate = nn.Linear(d_atom, d_atom)
+        nn.init.zeros_(self._attn_gate.weight)
+        nn.init.constant_(self._attn_gate.bias, -2.0)
 
-        # SwiGLU transition
+        # SwiGLU transition (ConditionedTransitionBlock, AF3 Algorithm 25)
         self.swiglu = SwiGLU(d_atom, d_atom * 4, d_atom)
+
+        # AdaLN-Zero output gate for transition
+        self._transition_gate = nn.Linear(d_atom, d_atom)
+        nn.init.zeros_(self._transition_gate.weight)
+        nn.init.constant_(self._transition_gate.bias, -2.0)
 
     def forward(
         self,
@@ -145,14 +197,13 @@ class AtomBlock(nn.Module):
             h_cond, 1, token_idx.unsqueeze(-1).expand(-1, -1, d_model)
         )  # (B, N_atom, d_model)
 
-        # AdaLN conditioning: timestep + token info
+        # Conditioning signal: timestep + token info
         if t_emb.dim() == 1:
             t_emb = t_emb.unsqueeze(0).expand(B, -1)  # (B, 128)
         cond = t_emb.unsqueeze(1) + self.cond_proj(h_cond_atoms)  # (B, N_atom, 128)
-        gamma1, beta1 = self.adaln1(cond).chunk(2, dim=-1)
 
-        # AdaLN-normalized input
-        q_n = (1 + gamma1) * self.ln_attn(q) + beta1  # (B, N_atom, 128)
+        # AdaLN-normalized input (AF3 Algorithm 26: sigmoid-bounded scale)
+        q_n = self.adaln1(q, cond)  # (B, N_atom, 128)
 
         # Self-attention
         Q = self.w_q(q_n).view(B, N_atom, H, d_h).permute(0, 2, 1, 3)  # (B,H,N,d_h)
@@ -164,7 +215,7 @@ class AtomBlock(nn.Module):
 
         # Pair bias for local atom pairs
         if p_lm.shape[-2] > 0:
-            bias = self.pair_bias(p_lm)  # (B, n_pairs, H)
+            bias = self.pair_bias_proj(self.ln_pair(p_lm))  # (B, n_pairs, H)
             pair_bias = torch.zeros(
                 B, H, N_atom, N_atom, device=q.device, dtype=bias.dtype
             )
@@ -194,15 +245,15 @@ class AtomBlock(nn.Module):
         att_out = torch.einsum("bhij,bhjd->bhid", attn, V)  # (B,H,N,d_h)
         att_out = att_out.permute(0, 2, 1, 3).reshape(B, N_atom, -1)  # (B,N,H*d_h)
         G_flat = G.permute(0, 2, 1, 3).reshape(B, N_atom, -1)
-        q = q + torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
 
-        # Conditioned gating (AF3 style)
-        q = q + torch.sigmoid(self.cond_gate1(c_atom)) * q
+        # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
+        q = q + torch.sigmoid(self._attn_gate(cond)) * attn_update
 
-        # SwiGLU + AdaLN
-        gamma2, beta2 = self.adaln2(cond).chunk(2, dim=-1)
-        q_n2 = (1 + gamma2) * F.layer_norm(q, [self.d_atom]) + beta2
-        q = q + torch.sigmoid(self.cond_gate2(c_atom)) * self.swiglu(q_n2)
+        # SwiGLU transition with AdaLN + AdaLN-Zero gate
+        q_n2 = self.adaln2(q, cond)
+        transition_update = self.swiglu(q_n2)
+        q = q + torch.sigmoid(self._transition_gate(cond)) * transition_update
 
         # Zero out padded positions
         q = q * atom_pad_mask.unsqueeze(-1)
@@ -224,12 +275,11 @@ class AtomBlock(nn.Module):
         H = self.n_heads
         d_h = self.d_head
 
-        # AdaLN conditioning: timestep + token info
+        # Conditioning signal: timestep + token info
         cond = t_emb.unsqueeze(0) + self.cond_proj(h_cond[token_idx])  # (N_atom, 128)
-        gamma1, beta1 = self.adaln1(cond).chunk(2, dim=-1)
 
-        # AdaLN-normalized input
-        q_n = (1 + gamma1) * self.ln_attn(q) + beta1  # (N_atom, 128)
+        # AdaLN-normalized input (AF3 Algorithm 26)
+        q_n = self.adaln1(q, cond)  # (N_atom, 128)
 
         # Self-attention (local window via token masking)
         Q = self.w_q(q_n).view(N_atom, H, d_h)
@@ -241,7 +291,7 @@ class AtomBlock(nn.Module):
 
         # Pair bias for local atom pairs
         if p_lm.shape[0] > 0:
-            bias = self.pair_bias(p_lm)  # (n_pairs, H)
+            bias = self.pair_bias_proj(self.ln_pair(p_lm))  # (n_pairs, H)
             pair_bias = torch.zeros(
                 H, N_atom, N_atom, device=q.device, dtype=bias.dtype
             )
@@ -257,15 +307,15 @@ class AtomBlock(nn.Module):
         att_out = torch.einsum("hij,jhd->ihd", attn, V)  # (H, N_atom, d_h)
         att_out = att_out.permute(1, 0, 2).reshape(N_atom, -1)  # (N_atom, H*d_h)
         G_flat = G.reshape(N_atom, -1)  # G is (N_atom, H, d_h)
-        q = q + torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
 
-        # Conditioned gating (AF3 style)
-        q = q + torch.sigmoid(self.cond_gate1(c_atom)) * q
+        # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
+        q = q + torch.sigmoid(self._attn_gate(cond)) * attn_update
 
-        # SwiGLU + AdaLN
-        gamma2, beta2 = self.adaln2(cond).chunk(2, dim=-1)
-        q_n2 = (1 + gamma2) * F.layer_norm(q, [self.d_atom]) + beta2
-        q = q + torch.sigmoid(self.cond_gate2(c_atom)) * self.swiglu(q_n2)
+        # SwiGLU transition with AdaLN + AdaLN-Zero gate
+        q_n2 = self.adaln2(q, cond)
+        transition_update = self.swiglu(q_n2)
+        q = q + torch.sigmoid(self._transition_gate(cond)) * transition_update
 
         return q
 
@@ -295,8 +345,12 @@ class DiffusionModule(nn.Module):
         self.d_atom = d_atom
         self.sigma_data = sigma_data
 
+        # Fourier embedding: frozen random projection (AF3 Algorithm 22)
+        self.fourier_embed = FourierEmbedding(d_atom)
+        self.ln_fourier = nn.LayerNorm(d_atom)  # AF3 Alg 21 line 9
+
         # Timestep -> token-level conditioning (SPEC §9.2)
-        self.t_proj = nn.Linear(d_atom, d_model)
+        self.t_proj = nn.Linear(d_atom, d_model, bias=False)  # AF3: LinearNoBias
 
         # Atom coordinate embedding
         self.atom_coord_proj = nn.Linear(3, d_atom)
@@ -356,16 +410,17 @@ class DiffusionModule(nn.Module):
         # Ensure sigma is (B,)
         if sigma.dim() == 0:
             sigma = sigma.expand(B)
-        _, c_out, _, c_noise = edm_preconditioning(sigma)  # each (B,)
-        t_emb = timestep_fourier_embedding(c_noise, d=self.d_atom)  # (B, d_atom)
+        _, c_out, c_in, c_noise = edm_preconditioning(sigma)  # each (B,)
+        t_emb = self.fourier_embed(c_noise)  # (B, d_atom)
 
         # 2. Token-level timestep conditioning (SPEC §9.2 v4.5)
-        # t_proj(t_emb): (B, d_model) -> broadcast to (B, 1, d_model)
-        h_cond = h_res + self.t_proj(t_emb).unsqueeze(1)  # (B, N, 512)
+        # LayerNorm on Fourier features before projection (AF3 Algorithm 21 line 9)
+        t_emb_normed = self.ln_fourier(t_emb)
+        h_cond = h_res + self.t_proj(t_emb_normed).unsqueeze(1)  # (B, N, 512)
 
-        # 3. Atom embedding
+        # 3. Atom embedding — scale by c_in = 1/sqrt(σ²+σ_data²) (AF3 Alg 20 line 2)
         q = c_atom + self.atom_coord_proj(
-            x_atom_noisy / self.sigma_data
+            x_atom_noisy * c_in[:, None, None]
         )  # (B, N_atom, 128)
 
         # 4. Atom blocks
@@ -405,15 +460,16 @@ class DiffusionModule(nn.Module):
     ) -> torch.Tensor:
         """Original unbatched forward for backward compatibility."""
         # 1. Timestep embedding
-        _, c_out, _, c_noise = edm_preconditioning(sigma)
-        t_emb = timestep_fourier_embedding(c_noise, d=self.d_atom)  # (d_atom,)
+        _, c_out, c_in, c_noise = edm_preconditioning(sigma)
+        t_emb = self.fourier_embed(c_noise)  # (d_atom,)
 
         # 2. Token-level timestep conditioning (SPEC §9.2 v4.5)
-        h_cond = h_res + self.t_proj(t_emb)  # (N, 512) broadcast
+        t_emb_normed = self.ln_fourier(t_emb)
+        h_cond = h_res + self.t_proj(t_emb_normed)  # (N, 512) broadcast
 
-        # 3. Atom embedding
+        # 3. Atom embedding — scale by c_in = 1/sqrt(σ²+σ_data²) (AF3 Alg 20 line 2)
         q = c_atom + self.atom_coord_proj(
-            x_atom_noisy / self.sigma_data
+            x_atom_noisy * c_in
         )  # (N_atom, 128)
 
         # 4. Atom blocks
