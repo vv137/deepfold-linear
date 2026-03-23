@@ -228,7 +228,10 @@ class Trunk(nn.Module):
 
             for block in self.uot_blocks:
                 if is_last:
+                    def _run_block(_block, _h, _x, _mu, _nu, _lu, _lv, _pb, _wd, _bins, _mask):
+                        return _block(_h, _x, _mu, _nu, _lu, _lv, _pb, _wd, _bins, mask=_mask)
                     h_res, x_res, log_u_prev, log_v_prev = checkpoint(
+                        _run_block,
                         block,
                         h_res,
                         x_res,
@@ -239,8 +242,7 @@ class Trunk(nn.Module):
                         uot_pos_bias,
                         self.w_dist,
                         pos_bins,
-                        None,  # geo_gate
-                        token_pad_mask,  # mask
+                        token_pad_mask,
                         use_reentrant=False,
                     )
                 else:
