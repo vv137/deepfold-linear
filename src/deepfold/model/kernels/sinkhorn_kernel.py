@@ -1,9 +1,9 @@
 """
 Flash-Sinkhorn Triton kernel (SPEC §18 item 1).
 
-Optimized two-pass architecture:
+Optimized two-pass architecture with batch dimension support:
   Forward:
-    Sinkhorn iterations via separate row/col update kernels (parallel across H×N_tiles)
+    Sinkhorn iterations via separate row/col update kernels (parallel across B*H×N_tiles)
     Transport output: T_norm @ V and T_norm @ x (EGNN centroid) with online softmax
   Backward (IFT):
     Adjoint iterations with same tiling structure (SPEC §7.5)
@@ -11,9 +11,13 @@ Optimized two-pass architecture:
 
 Key optimizations over naive version:
   - tl.dot for QK^T (tensor cores)
-  - Grid=(H, N_tiles) for full parallelism across heads and tiles
+  - Grid=(B*H, N_tiles) for full parallelism across batch, heads, and tiles
   - Distances computed on-the-fly per tile (no O(N²) storage)
   - Separate row/col update kernels (avoid serial bottleneck)
+
+All per-batch tensors (Q_ln, K_ln, V, x_res, pos_bias, log_u, log_v, etc.)
+have shape (B, H, N, ...) or (B, N, ...). Shared tensors (eps, w_dist) remain (H,).
+grad_x_transport and grad_x_cost are (B, N, 3) to avoid cross-batch atomic contention.
 """
 
 import torch
@@ -49,7 +53,10 @@ def _compute_cost_tile(
     BLOCK_I: tl.constexpr,
     BLOCK_J: tl.constexpr,
 ):
-    """Compute cost tile C[i, j] = content + pos + geo. Returns (BLOCK_I, BLOCK_J)."""
+    """Compute cost tile C[i, j] = content + pos + geo. Returns (BLOCK_I, BLOCK_J).
+
+    Pointers must already be batch-offset by the caller.
+    """
     # Load Q tile: (BLOCK_I, D_H)
     q_ptrs = (
         Q_ptr
@@ -103,32 +110,6 @@ def _load_x_components(X_ptr, idx, mask, stride_xn, BLOCK: tl.constexpr):
     return x0, x1, x2
 
 
-@triton.jit
-def _compute_dist_tile(
-    X_ptr,
-    i_idx,
-    j_idx,
-    i_mask,
-    j_mask,
-    stride_xn,
-    r_0,
-    BLOCK_I: tl.constexpr,
-    BLOCK_J: tl.constexpr,
-):
-    """Compute pairwise distances and displacement components for a tile.
-
-    Returns: dist (BI,BJ), dx (BI,BJ), dy (BI,BJ), dz (BI,BJ), f_dist (BI,BJ).
-    """
-    xi_0, xi_1, xi_2 = _load_x_components(X_ptr, i_idx, i_mask, stride_xn, BLOCK_I)
-    xj_0, xj_1, xj_2 = _load_x_components(X_ptr, j_idx, j_mask, stride_xn, BLOCK_J)
-    dx = xi_0[:, None] - xj_0[None, :]
-    dy = xi_1[:, None] - xj_1[None, :]
-    dz = xi_2[:, None] - xj_2[None, :]
-    dist = tl.sqrt(dx * dx + dy * dy + dz * dz + 1e-8)
-    f_dist = dist / (r_0 + dist)
-    return dist, dx, dy, dz, f_dist
-
-
 # ============================================================================
 # Backward Step 1: Compute log_Z, D, g_v, grad_V, grad_x_transport
 # ============================================================================
@@ -144,28 +125,42 @@ def _compute_log_Z(
     W_DIST_ptr,
     LOG_U_ptr,
     LOG_V_ptr,
-    LOG_Z_ptr,  # output (H, N)
+    LOG_Z_ptr,  # output (B, H, N)
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,  # stride for log_u/log_v/log_Z batch dim
     BLOCK: tl.constexpr,
 ):
-    """log_Z[h,i] = LSE_j(log_u[h,i] + log_K[h,i,j] + log_v[h,j])."""
-    pid_h = tl.program_id(0)
+    """log_Z[b,h,i] = LSE_j(log_u[b,h,i] + log_K[b,h,i,j] + log_v[b,h,j])."""
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
+
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
-    log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+    log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
 
     max_val = tl.full([BLOCK], value=-1e30, dtype=tl.float32)
     sum_exp = tl.zeros([BLOCK], dtype=tl.float32)
@@ -173,29 +168,13 @@ def _compute_log_Z(
     for j0 in range(0, N, BLOCK):
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
-        log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+        log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         score = log_u_i[:, None] + (-C_tile * inv_eps_h) + log_v_j[None, :]
         score = tl.where(j_mask[None, :], score, -1e30)
@@ -208,7 +187,9 @@ def _compute_log_Z(
         max_val = new_max
 
     tl.store(
-        LOG_Z_ptr + pid_h * N + i_idx, max_val + tl.log(sum_exp + 1e-30), mask=i_mask
+        LOG_Z_ptr + uv_off + pid_h * N + i_idx,
+        max_val + tl.log(sum_exp + 1e-30),
+        mask=i_mask,
     )
 
 
@@ -225,40 +206,53 @@ def _backward_gv_grad_V_kernel(
     LOG_V_ptr,
     LOG_Z_ptr,
     GRAD_O_ptr,
-    GRAD_XC_ptr,  # upstream: (H, N, d_h), (H, N, 3)
-    D_ptr,  # D[h,i] = grad_O·O_avg + grad_xc·xc (precomputed)
-    G_V_ptr,  # output: g_v (H, N)
-    GRAD_V_ptr,  # output: grad_V (H, N, d_h) — atomic add
-    GRAD_X_TRANSPORT_ptr,  # output: grad_x_transport (N, 3) — atomic add
+    GRAD_XC_ptr,
+    D_ptr,
+    G_V_ptr,              # output: g_v (B, H, N)
+    GRAD_V_ptr,            # output: grad_V (B, H, N, d_h) — atomic add
+    GRAD_X_TRANSPORT_ptr,  # output: grad_x_transport (B, N, 3) — atomic add
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_vb,
     stride_vh,
     stride_vn,
+    stride_uvb,
+    stride_gxt_b,  # batch stride for grad_x_transport (B, N, 3)
     BLOCK: tl.constexpr,
 ):
-    """Backward through T_norm: compute g_v, accumulate grad_V and grad_x_transport.
-
-    For each j-tile, reduces over all i-tiles:
-      g_v[j] = sum_i T_norm_ij * (dT_ij - D_i)
-      grad_V[j] += sum_i T_norm_ij * grad_O_avg[i]
-      grad_x_transport[j] += sum_i T_norm_ij * grad_xc[i]
-    """
-    pid_h = tl.program_id(0)
+    """Backward through T_norm: compute g_v, accumulate grad_V and grad_x_transport."""
+    pid_bh = tl.program_id(0)
     pid_j = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    V_b = V_ptr + pid_b * stride_vb
+    GRAD_O_b = GRAD_O_ptr + pid_b * stride_vb
+    GRAD_XC_b = GRAD_XC_ptr + pid_b * H * N * 3
+    uv_off = pid_b * stride_uvb
+
     j_idx = pid_j * BLOCK + tl.arange(0, BLOCK)
     j_mask = j_idx < N
-    log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+    log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
     # Accumulators
     acc_gv = tl.zeros([BLOCK], dtype=tl.float32)
@@ -268,41 +262,25 @@ def _backward_gv_grad_V_kernel(
     acc_gx_1 = tl.zeros([BLOCK], dtype=tl.float32)
     acc_gx_2 = tl.zeros([BLOCK], dtype=tl.float32)
 
-    # Load V[j]: (BLOCK, D_H) — needed for dT computation
-    v_ptrs = V_ptr + pid_h * stride_vh + j_idx[:, None] * stride_vn + d_idx[None, :]
+    # Load V[j]: (BLOCK, D_H)
+    v_ptrs = V_b + pid_h * stride_vh + j_idx[:, None] * stride_vn + d_idx[None, :]
     V_j = tl.load(v_ptrs, mask=j_mask[:, None], other=0.0)
 
     # Load x_res[j]: (BLOCK, 3)
-    xj_0, xj_1, xj_2 = _load_x_components(X_ptr, j_idx, j_mask, stride_xn, BLOCK)
+    xj_0, xj_1, xj_2 = _load_x_components(X_b, j_idx, j_mask, stride_xn, BLOCK)
 
     for i0 in range(0, N, BLOCK):
         i_idx = i0 + tl.arange(0, BLOCK)
         i_mask = i_idx < N
-        log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
-        log_Z_i = tl.load(LOG_Z_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-        D_i = tl.load(D_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
+        log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+        log_Z_i = tl.load(LOG_Z_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+        D_i = tl.load(D_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         log_K_tile = -C_tile * inv_eps_h
         log_score = log_u_i[:, None] + log_K_tile + log_v_j[None, :]
@@ -311,18 +289,18 @@ def _backward_gv_grad_V_kernel(
 
         # Load grad_O_avg[i]: (BLOCK_I, D_H)
         go_ptrs = (
-            GRAD_O_ptr + pid_h * stride_vh + i_idx[:, None] * stride_vn + d_idx[None, :]
+            GRAD_O_b + pid_h * stride_vh + i_idx[:, None] * stride_vn + d_idx[None, :]
         )
         grad_O_i = tl.load(go_ptrs, mask=i_mask[:, None], other=0.0)
 
         # Load grad_xc[i]: (BLOCK_I, 3)
-        gxc_base = GRAD_XC_ptr + pid_h * N * 3
+        gxc_base = GRAD_XC_b + pid_h * N * 3
         gxc_i0 = tl.load(gxc_base + i_idx * 3 + 0, mask=i_mask, other=0.0)
         gxc_i1 = tl.load(gxc_base + i_idx * 3 + 1, mask=i_mask, other=0.0)
         gxc_i2 = tl.load(gxc_base + i_idx * 3 + 2, mask=i_mask, other=0.0)
 
         # dT_ij = grad_O_avg[i] · V[j]^T + grad_xc[i] · x_res[j]^T
-        dT_attn = tl.dot(grad_O_i, tl.trans(V_j))  # (BLOCK_I, BLOCK_J)
+        dT_attn = tl.dot(grad_O_i, tl.trans(V_j))
         dT_xc = (
             gxc_i0[:, None] * xj_0[None, :]
             + gxc_i1[:, None] * xj_1[None, :]
@@ -330,16 +308,10 @@ def _backward_gv_grad_V_kernel(
         )
         dT = dT_attn + dT_xc
 
-        # grad_log_score = T_norm * (dT - D_i)
         grad_ls = T_norm_tile * (dT - D_i[:, None])
-
-        # g_v[j] = sum_i grad_ls[i, j]
         acc_gv += tl.sum(grad_ls, axis=0)
-
-        # grad_V[j] += T_norm^T @ grad_O_avg[i]  (reduce over i)
         acc_grad_V += tl.dot(tl.trans(T_norm_tile), grad_O_i)
 
-        # grad_x_transport[j] += T_norm^T @ grad_xc[i]
         T_t_gxc_0 = tl.sum(T_norm_tile * gxc_i0[:, None], axis=0)
         T_t_gxc_1 = tl.sum(T_norm_tile * gxc_i1[:, None], axis=0)
         T_t_gxc_2 = tl.sum(T_norm_tile * gxc_i2[:, None], axis=0)
@@ -348,18 +320,20 @@ def _backward_gv_grad_V_kernel(
         acc_gx_2 += T_t_gxc_2
 
     # Store g_v
-    tl.store(G_V_ptr + pid_h * N + j_idx, acc_gv, mask=j_mask)
+    tl.store(G_V_ptr + uv_off + pid_h * N + j_idx, acc_gv, mask=j_mask)
 
     # Atomic add grad_V
     gv_ptrs = (
-        GRAD_V_ptr + pid_h * stride_vh + j_idx[:, None] * stride_vn + d_idx[None, :]
+        GRAD_V_ptr + pid_b * stride_vb + pid_h * stride_vh
+        + j_idx[:, None] * stride_vn + d_idx[None, :]
     )
     tl.atomic_add(gv_ptrs, acc_grad_V, mask=j_mask[:, None])
 
-    # Atomic add grad_x_transport (sum over heads, hence atomic)
-    tl.atomic_add(GRAD_X_TRANSPORT_ptr + j_idx * 3 + 0, acc_gx_0, mask=j_mask)
-    tl.atomic_add(GRAD_X_TRANSPORT_ptr + j_idx * 3 + 1, acc_gx_1, mask=j_mask)
-    tl.atomic_add(GRAD_X_TRANSPORT_ptr + j_idx * 3 + 2, acc_gx_2, mask=j_mask)
+    # Atomic add grad_x_transport — per-batch buffer, sum over heads
+    gxt_base = GRAD_X_TRANSPORT_ptr + pid_b * stride_gxt_b
+    tl.atomic_add(gxt_base + j_idx * 3 + 0, acc_gx_0, mask=j_mask)
+    tl.atomic_add(gxt_base + j_idx * 3 + 1, acc_gx_1, mask=j_mask)
+    tl.atomic_add(gxt_base + j_idx * 3 + 2, acc_gx_2, mask=j_mask)
 
 
 # ============================================================================
@@ -390,28 +364,33 @@ def _cost_gradient_kernel(
     # Outputs (atomic add)
     GRAD_Q_ptr,
     GRAD_K_ptr,
-    GRAD_X_COST_ptr,  # (N, 3)
-    GRAD_W_DIST_ptr,  # (H,)
-    GRAD_POS_BIAS_ptr,  # (H, N, N) — direct store
+    GRAD_X_COST_ptr,     # (B, N, 3)
+    GRAD_W_DIST_ptr,     # (H,)
+    GRAD_POS_BIAS_ptr,   # (B, H, N, N) — direct store
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_vb,
     stride_vh,
     stride_vn,
+    stride_uvb,
+    stride_gxc_b,  # batch stride for grad_x_cost (B, N, 3)
     BLOCK: tl.constexpr,
 ):
-    """Fused cost gradient: direct (through T_norm) + IFT (through z_u, z_v).
-
-    Propagates grad_C to Q_ln, K_ln, x_res, w_dist, pos_bias.
-    Each program handles one (h, i-tile) and iterates over all j-tiles.
-    """
-    pid_h = tl.program_id(0)
+    """Fused cost gradient: direct (through T_norm) + IFT (through z_u, z_v)."""
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
@@ -419,30 +398,40 @@ def _cost_gradient_kernel(
     kappa_h = tl.load(KAPPA_ptr + pid_h)
     inv_sqrt_dh = 1.0 / tl.sqrt(D_H * 1.0)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    V_b = V_ptr + pid_b * stride_vb
+    GRAD_O_b = GRAD_O_ptr + pid_b * stride_vb
+    GRAD_XC_b = GRAD_XC_ptr + pid_b * H * N * 3
+    uv_off = pid_b * stride_uvb
+
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
 
-    log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-    log_Z_i = tl.load(LOG_Z_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-    row_lse_i = tl.load(ROW_LSE_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-    D_i = tl.load(D_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-    z_u_i = tl.load(Z_U_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    log_Z_i = tl.load(LOG_Z_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    row_lse_i = tl.load(ROW_LSE_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    D_i = tl.load(D_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    z_u_i = tl.load(Z_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
 
-    # Load grad_O_avg[i]: (BLOCK, D_H) for dT computation
+    # Load grad_O_avg[i]: (BLOCK, D_H)
     d_idx = tl.arange(0, D_H)
     go_ptrs = (
-        GRAD_O_ptr + pid_h * stride_vh + i_idx[:, None] * stride_vn + d_idx[None, :]
+        GRAD_O_b + pid_h * stride_vh + i_idx[:, None] * stride_vn + d_idx[None, :]
     )
     grad_O_i = tl.load(go_ptrs, mask=i_mask[:, None], other=0.0)
 
     # Load grad_xc[i]: 3 components
-    gxc_base = GRAD_XC_ptr + pid_h * N * 3
+    gxc_base = GRAD_XC_b + pid_h * N * 3
     gxc_i0 = tl.load(gxc_base + i_idx * 3 + 0, mask=i_mask, other=0.0)
     gxc_i1 = tl.load(gxc_base + i_idx * 3 + 1, mask=i_mask, other=0.0)
     gxc_i2 = tl.load(gxc_base + i_idx * 3 + 2, mask=i_mask, other=0.0)
 
     # Load Q_ln[i]: (BLOCK, D_H)
-    q_ptrs = Q_ptr + pid_h * stride_qh + i_idx[:, None] * stride_qn + d_idx[None, :]
+    q_ptrs = Q_b + pid_h * stride_qh + i_idx[:, None] * stride_qn + d_idx[None, :]
     Q_i = tl.load(q_ptrs, mask=i_mask[:, None], other=0.0)
 
     # Accumulators
@@ -456,41 +445,25 @@ def _cost_gradient_kernel(
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
 
-        log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
-        col_lse_j = tl.load(COL_LSE_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
-        z_v_j = tl.load(Z_V_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
+        log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
+        col_lse_j = tl.load(COL_LSE_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
+        z_v_j = tl.load(Z_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
 
         # Load K_ln[j], V[j], x[j]
-        k_ptrs = K_ptr + pid_h * stride_qh + j_idx[:, None] * stride_qn + d_idx[None, :]
+        k_ptrs = K_b + pid_h * stride_qh + j_idx[:, None] * stride_qn + d_idx[None, :]
         K_j = tl.load(k_ptrs, mask=j_mask[:, None], other=0.0)
 
-        v_ptrs = V_ptr + pid_h * stride_vh + j_idx[:, None] * stride_vn + d_idx[None, :]
+        v_ptrs = V_b + pid_h * stride_vh + j_idx[:, None] * stride_vn + d_idx[None, :]
         V_j = tl.load(v_ptrs, mask=j_mask[:, None], other=0.0)
 
-        xj_0, xj_1, xj_2 = _load_x_components(X_ptr, j_idx, j_mask, stride_xn, BLOCK)
+        xj_0, xj_1, xj_2 = _load_x_components(X_b, j_idx, j_mask, stride_xn, BLOCK)
 
         # Recompute cost tile
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         log_K_tile = -C_tile * inv_eps_h
 
@@ -520,51 +493,49 @@ def _cost_gradient_kernel(
             z_u_i[:, None] * s_row_tile + z_v_j[None, :] * s_col_tile
         )
 
-        grad_C_total = grad_C_direct + grad_C_ift  # (BLOCK, BLOCK)
+        grad_C_total = grad_C_direct + grad_C_ift
 
         # --- Propagate to Q_ln ---
-        # content = -(Q @ K^T) / sqrt(d_h)
-        # grad_Q += grad_C @ (-K / sqrt(d_h))
         acc_grad_Q += tl.dot(grad_C_total, K_j) * (-inv_sqrt_dh)
 
         # --- Propagate to K_ln (atomic add since j varies) ---
         grad_K_tile = tl.dot(tl.trans(grad_C_total), Q_i) * (-inv_sqrt_dh)
         gk_ptrs = (
-            GRAD_K_ptr + pid_h * stride_qh + j_idx[:, None] * stride_qn + d_idx[None, :]
+            GRAD_K_ptr + pid_b * stride_qb + pid_h * stride_qh
+            + j_idx[:, None] * stride_qn + d_idx[None, :]
         )
         tl.atomic_add(gk_ptrs, grad_K_tile, mask=j_mask[:, None])
 
         # --- Propagate to x_res through geometry ---
-        # geo = w_dist * d/(r_0+d), d(d/(r_0+d))/dd = r_0/(r_0+d)^2
-        # dd/dx_i = (x_i-x_j)/d
-        xi_0, xi_1, xi_2 = _load_x_components(X_ptr, i_idx, i_mask, stride_xn, BLOCK)
+        xi_0, xi_1, xi_2 = _load_x_components(X_b, i_idx, i_mask, stride_xn, BLOCK)
         dx = xi_0[:, None] - xj_0[None, :]
         dy = xi_1[:, None] - xj_1[None, :]
         dz = xi_2[:, None] - xj_2[None, :]
         dist = tl.sqrt(dx * dx + dy * dy + dz * dz + 1e-8)
 
         geo_grad_coeff = w_dist_h * R_0 / ((R_0 + dist) * (R_0 + dist))
-        weighted = grad_C_total * geo_grad_coeff / dist  # (BLOCK, BLOCK)
+        weighted = grad_C_total * geo_grad_coeff / dist
 
         acc_gx_i_0 += tl.sum(weighted * dx, axis=1)
         acc_gx_i_1 += tl.sum(weighted * dy, axis=1)
         acc_gx_i_2 += tl.sum(weighted * dz, axis=1)
 
-        # grad_x[j] -= weighted * diff (negative sign from x_j)
+        # grad_x[j] -= weighted * diff
         gx_j_0 = -tl.sum(weighted * dx, axis=0)
         gx_j_1 = -tl.sum(weighted * dy, axis=0)
         gx_j_2 = -tl.sum(weighted * dz, axis=0)
-        tl.atomic_add(GRAD_X_COST_ptr + j_idx * 3 + 0, gx_j_0, mask=j_mask)
-        tl.atomic_add(GRAD_X_COST_ptr + j_idx * 3 + 1, gx_j_1, mask=j_mask)
-        tl.atomic_add(GRAD_X_COST_ptr + j_idx * 3 + 2, gx_j_2, mask=j_mask)
+        gxc_base_j = GRAD_X_COST_ptr + pid_b * stride_gxc_b
+        tl.atomic_add(gxc_base_j + j_idx * 3 + 0, gx_j_0, mask=j_mask)
+        tl.atomic_add(gxc_base_j + j_idx * 3 + 1, gx_j_1, mask=j_mask)
+        tl.atomic_add(gxc_base_j + j_idx * 3 + 2, gx_j_2, mask=j_mask)
 
         # --- Propagate to w_dist ---
         f_dist_tile = dist / (R_0 + dist)
         acc_grad_w_dist += tl.sum(grad_C_total * f_dist_tile)
 
-        # --- Store grad_pos_bias directly (unique i,j per program) ---
+        # --- Store grad_pos_bias directly ---
         gp_ptrs = (
-            GRAD_POS_BIAS_ptr
+            GRAD_POS_BIAS_ptr + pid_b * stride_pb
             + pid_h * stride_ph
             + i_idx[:, None] * stride_pn
             + j_idx[None, :]
@@ -573,16 +544,18 @@ def _cost_gradient_kernel(
 
     # Store accumulated gradients
     gq_ptrs = (
-        GRAD_Q_ptr + pid_h * stride_qh + i_idx[:, None] * stride_qn + d_idx[None, :]
+        GRAD_Q_ptr + pid_b * stride_qb + pid_h * stride_qh
+        + i_idx[:, None] * stride_qn + d_idx[None, :]
     )
     tl.store(gq_ptrs, acc_grad_Q, mask=i_mask[:, None])
 
     # Atomic add grad_x_cost for i
-    tl.atomic_add(GRAD_X_COST_ptr + i_idx * 3 + 0, acc_gx_i_0, mask=i_mask)
-    tl.atomic_add(GRAD_X_COST_ptr + i_idx * 3 + 1, acc_gx_i_1, mask=i_mask)
-    tl.atomic_add(GRAD_X_COST_ptr + i_idx * 3 + 2, acc_gx_i_2, mask=i_mask)
+    gxc_base_i = GRAD_X_COST_ptr + pid_b * stride_gxc_b
+    tl.atomic_add(gxc_base_i + i_idx * 3 + 0, acc_gx_i_0, mask=i_mask)
+    tl.atomic_add(gxc_base_i + i_idx * 3 + 1, acc_gx_i_1, mask=i_mask)
+    tl.atomic_add(gxc_base_i + i_idx * 3 + 2, acc_gx_i_2, mask=i_mask)
 
-    # Atomic add grad_w_dist (one scalar per head)
+    # Atomic add grad_w_dist (one scalar per head, summed across batch)
     tl.atomic_add(GRAD_W_DIST_ptr + pid_h, acc_grad_w_dist)
 
 
@@ -606,24 +579,38 @@ def _sinkhorn_row_update(
     D_H: tl.constexpr,
     LAM: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    pid_h = tl.program_id(0)
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     kappa_h = LAM / (LAM + eps_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
+
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
-    log_mu_i = tl.load(LOG_MU_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+    log_mu_i = tl.load(LOG_MU_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
 
     # Online LSE over j tiles
     max_val = tl.full([BLOCK], value=-1e30, dtype=tl.float32)
@@ -632,30 +619,13 @@ def _sinkhorn_row_update(
     for j0 in range(0, N, BLOCK):
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
-
-        log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+        log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         log_K_tile = -C_tile * inv_eps_h
 
@@ -671,7 +641,7 @@ def _sinkhorn_row_update(
 
     lse = max_val + tl.log(sum_exp + 1e-30)
     log_u_new = kappa_h * (log_mu_i - lse)
-    tl.store(LOG_U_ptr + pid_h * N + i_idx, log_u_new, mask=i_mask)
+    tl.store(LOG_U_ptr + uv_off + pid_h * N + i_idx, log_u_new, mask=i_mask)
 
 
 # ============================================================================
@@ -694,24 +664,38 @@ def _sinkhorn_col_update(
     D_H: tl.constexpr,
     LAM: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    pid_h = tl.program_id(0)
+    pid_bh = tl.program_id(0)
     pid_j = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     kappa_h = LAM / (LAM + eps_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
+
     j_idx = pid_j * BLOCK + tl.arange(0, BLOCK)
     j_mask = j_idx < N
-    log_nu_j = tl.load(LOG_NU_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+    log_nu_j = tl.load(LOG_NU_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
     max_val = tl.full([BLOCK], value=-1e30, dtype=tl.float32)
     sum_exp = tl.zeros([BLOCK], dtype=tl.float32)
@@ -719,39 +703,20 @@ def _sinkhorn_col_update(
     for i0 in range(0, N, BLOCK):
         i_idx = i0 + tl.arange(0, BLOCK)
         i_mask = i_idx < N
-
-        log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+        log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         log_K_tile = -C_tile * inv_eps_h
 
-        # score[i, j] = log_K[i,j] + log_u[i], reduce over i for each j
         score = log_K_tile + log_u_i[:, None]
         score = tl.where(i_mask[:, None], score, -1e30)
-
-        # Transpose to get (BLOCK_J, BLOCK_I) for per-j reduction
         score_t = tl.trans(score)
+
         tile_max = tl.max(score_t, axis=1)
         new_max = tl.maximum(max_val, tile_max)
         sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(
@@ -761,7 +726,7 @@ def _sinkhorn_col_update(
 
     lse = max_val + tl.log(sum_exp + 1e-30)
     log_v_new = kappa_h * (log_nu_j - lse)
-    tl.store(LOG_V_ptr + pid_h * N + j_idx, log_v_new, mask=j_mask)
+    tl.store(LOG_V_ptr + uv_off + pid_h * N + j_idx, log_v_new, mask=j_mask)
 
 
 # ============================================================================
@@ -786,29 +751,47 @@ def _transport_output_kernel(
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_vb,
     stride_vh,
     stride_vn,
+    stride_ob,
     stride_oh,
     stride_on,
+    stride_xcb,
     stride_xch,
     stride_xcn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    pid_h = tl.program_id(0)
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
 
+    # Batch-offset pointers
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    V_b = V_ptr + pid_b * stride_vb
+    uv_off = pid_b * stride_uvb
+
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
-    log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+    log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
 
     # Accumulators (online softmax style)
     row_max = tl.full([BLOCK], value=-1e30, dtype=tl.float32)
@@ -821,30 +804,13 @@ def _transport_output_kernel(
     for j0 in range(0, N, BLOCK):
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
-
-        log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+        log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         log_K_tile = -C_tile * inv_eps_h
 
@@ -867,10 +833,9 @@ def _transport_output_kernel(
         xc_1 = xc_1 * scale
         xc_2 = xc_2 * scale
 
-        # T_tile @ V_j: (BLOCK_I, BLOCK_J) @ (BLOCK_J, D_H) → (BLOCK_I, D_H)
+        # T_tile @ V_j
         v_ptrs = (
-            V_ptr
-            + pid_h * stride_vh
+            V_b + pid_h * stride_vh
             + j_idx[:, None] * stride_vn
             + tl.arange(0, D_H)[None, :]
         )
@@ -878,9 +843,9 @@ def _transport_output_kernel(
         o_acc += tl.dot(T_tile.to(V_tile.dtype), V_tile)
 
         # T_tile @ x_j for EGNN centroid
-        xj_0 = tl.load(X_ptr + j_idx * stride_xn + 0, mask=j_mask, other=0.0)
-        xj_1 = tl.load(X_ptr + j_idx * stride_xn + 1, mask=j_mask, other=0.0)
-        xj_2 = tl.load(X_ptr + j_idx * stride_xn + 2, mask=j_mask, other=0.0)
+        xj_0 = tl.load(X_b + j_idx * stride_xn + 0, mask=j_mask, other=0.0)
+        xj_1 = tl.load(X_b + j_idx * stride_xn + 1, mask=j_mask, other=0.0)
+        xj_2 = tl.load(X_b + j_idx * stride_xn + 2, mask=j_mask, other=0.0)
         xc_0 += tl.sum(T_tile * xj_0[None, :], axis=1)
         xc_1 += tl.sum(T_tile * xj_1[None, :], axis=1)
         xc_2 += tl.sum(T_tile * xj_2[None, :], axis=1)
@@ -893,7 +858,7 @@ def _transport_output_kernel(
 
     # Store O_avg
     o_ptrs = (
-        O_ptr
+        O_ptr + pid_b * stride_ob
         + pid_h * stride_oh
         + i_idx[:, None] * stride_on
         + tl.arange(0, D_H)[None, :]
@@ -901,22 +866,11 @@ def _transport_output_kernel(
     tl.store(o_ptrs, o_acc, mask=i_mask[:, None])
 
     # Store x_centroid
-    tl.store(
-        X_CENT_ptr + pid_h * stride_xch + i_idx * stride_xcn + 0,
-        xc_0 * inv_sum,
-        mask=i_mask,
-    )
-    tl.store(
-        X_CENT_ptr + pid_h * stride_xch + i_idx * stride_xcn + 1,
-        xc_1 * inv_sum,
-        mask=i_mask,
-    )
-    tl.store(
-        X_CENT_ptr + pid_h * stride_xch + i_idx * stride_xcn + 2,
-        xc_2 * inv_sum,
-        mask=i_mask,
-    )
-    tl.store(ROW_SUM_ptr + pid_h * N + i_idx, row_sum, mask=i_mask)
+    xc_base = X_CENT_ptr + pid_b * stride_xcb + pid_h * stride_xch
+    tl.store(xc_base + i_idx * stride_xcn + 0, xc_0 * inv_sum, mask=i_mask)
+    tl.store(xc_base + i_idx * stride_xcn + 1, xc_1 * inv_sum, mask=i_mask)
+    tl.store(xc_base + i_idx * stride_xcn + 2, xc_2 * inv_sum, mask=i_mask)
+    tl.store(ROW_SUM_ptr + uv_off + pid_h * N + i_idx, row_sum, mask=i_mask)
 
 
 # ============================================================================
@@ -933,24 +887,37 @@ def _compute_row_lse(
     EPS_ptr,
     W_DIST_ptr,
     LOG_V_ptr,
-    ROW_LSE_ptr,  # output (H, N)
+    ROW_LSE_ptr,  # output (B, H, N)
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    """row_lse[h,i] = LSE_j(log_K[h,i,j] + log_v[h,j])."""
-    pid_h = tl.program_id(0)
+    """row_lse[b,h,i] = LSE_j(log_K[b,h,i,j] + log_v[b,h,j])."""
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
+
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
 
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
@@ -961,29 +928,13 @@ def _compute_row_lse(
     for j0 in range(0, N, BLOCK):
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
-        log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=-1e30)
+        log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         score = -C_tile * inv_eps_h + log_v_j[None, :]
         score = tl.where(j_mask[None, :], score, -1e30)
@@ -996,7 +947,9 @@ def _compute_row_lse(
         max_val = new_max
 
     tl.store(
-        ROW_LSE_ptr + pid_h * N + i_idx, max_val + tl.log(sum_exp + 1e-30), mask=i_mask
+        ROW_LSE_ptr + uv_off + pid_h * N + i_idx,
+        max_val + tl.log(sum_exp + 1e-30),
+        mask=i_mask,
     )
 
 
@@ -1009,24 +962,37 @@ def _compute_col_lse(
     EPS_ptr,
     W_DIST_ptr,
     LOG_U_ptr,
-    COL_LSE_ptr,  # output (H, N)
+    COL_LSE_ptr,  # output (B, H, N)
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    """col_lse[h,j] = LSE_i(log_K[h,i,j] + log_u[h,i])."""
-    pid_h = tl.program_id(0)
+    """col_lse[b,h,j] = LSE_i(log_K[b,h,i,j] + log_u[b,h,i])."""
+    pid_bh = tl.program_id(0)
     pid_j = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
+
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
 
     j_idx = pid_j * BLOCK + tl.arange(0, BLOCK)
     j_mask = j_idx < N
@@ -1037,29 +1003,13 @@ def _compute_col_lse(
     for i0 in range(0, N, BLOCK):
         i_idx = i0 + tl.arange(0, BLOCK)
         i_mask = i_idx < N
-        log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=-1e30)
+        log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=-1e30)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
         score = -C_tile * inv_eps_h + log_u_i[:, None]
         score = tl.where(i_mask[:, None], score, -1e30)
@@ -1073,7 +1023,9 @@ def _compute_col_lse(
         max_val = new_max
 
     tl.store(
-        COL_LSE_ptr + pid_h * N + j_idx, max_val + tl.log(sum_exp + 1e-30), mask=j_mask
+        COL_LSE_ptr + uv_off + pid_h * N + j_idx,
+        max_val + tl.log(sum_exp + 1e-30),
+        mask=j_mask,
     )
 
 
@@ -1094,32 +1046,45 @@ def _ift_z_u_update(
     COL_LSE_ptr,
     G_U_ptr,
     Z_V_ptr,
-    Z_U_ptr,  # g_u, z_v (input), z_u (output)
+    Z_U_ptr,  # output
     KAPPA_ptr,
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    """z_u[i] = g_u[i] + kappa * sum_j S_col[i,j] * z_v[j]."""
-    pid_h = tl.program_id(0)
+    """z_u[b,h,i] = g_u[b,h,i] + kappa * sum_j S_col[b,h,i,j] * z_v[b,h,j]."""
+    pid_bh = tl.program_id(0)
     pid_i = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
     kappa_h = tl.load(KAPPA_ptr + pid_h)
 
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
+
     i_idx = pid_i * BLOCK + tl.arange(0, BLOCK)
     i_mask = i_idx < N
 
-    log_u_i = tl.load(LOG_U_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-    g_u_i = tl.load(G_U_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    log_u_i = tl.load(LOG_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+    g_u_i = tl.load(G_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
 
     acc = tl.zeros([BLOCK], dtype=tl.float32)
 
@@ -1127,32 +1092,15 @@ def _ift_z_u_update(
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
 
-        z_v_j = tl.load(Z_V_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
-        col_lse_j = tl.load(COL_LSE_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
+        z_v_j = tl.load(Z_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
+        col_lse_j = tl.load(COL_LSE_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
-        # S_col[i,j] = exp(log_K[i,j] + log_u[i] - col_lse[j])
         log_s = -C_tile * inv_eps_h + log_u_i[:, None] - col_lse_j[None, :]
         s_col_tile = tl.exp(log_s)
         s_col_tile = tl.where(j_mask[None, :], s_col_tile, 0.0)
@@ -1160,7 +1108,7 @@ def _ift_z_u_update(
         acc += tl.sum(s_col_tile * z_v_j[None, :], axis=1)
 
     z_u_new = g_u_i + kappa_h * acc
-    tl.store(Z_U_ptr + pid_h * N + i_idx, z_u_new, mask=i_mask)
+    tl.store(Z_U_ptr + uv_off + pid_h * N + i_idx, z_u_new, mask=i_mask)
 
 
 @triton.jit
@@ -1175,32 +1123,45 @@ def _ift_z_v_update(
     ROW_LSE_ptr,
     G_V_ptr,
     Z_U_ptr,
-    Z_V_ptr,  # g_v, z_u (input), z_v (output)
+    Z_V_ptr,  # output
     KAPPA_ptr,
     N: tl.constexpr,
     D_H: tl.constexpr,
     R_0: tl.constexpr,
+    H: tl.constexpr,
+    stride_qb,
     stride_qh,
     stride_qn,
+    stride_xb,
     stride_xn,
+    stride_pb,
     stride_ph,
     stride_pn,
+    stride_uvb,
     BLOCK: tl.constexpr,
 ):
-    """z_v[j] = g_v[j] + kappa * sum_i S_row[i,j] * z_u[i]."""
-    pid_h = tl.program_id(0)
+    """z_v[b,h,j] = g_v[b,h,j] + kappa * sum_i S_row[b,h,i,j] * z_u[b,h,i]."""
+    pid_bh = tl.program_id(0)
     pid_j = tl.program_id(1)
+    pid_b = pid_bh // H
+    pid_h = pid_bh % H
 
     eps_h = tl.load(EPS_ptr + pid_h)
     inv_eps_h = 1.0 / eps_h
     w_dist_h = tl.load(W_DIST_ptr + pid_h)
     kappa_h = tl.load(KAPPA_ptr + pid_h)
 
+    Q_b = Q_ptr + pid_b * stride_qb
+    K_b = K_ptr + pid_b * stride_qb
+    X_b = X_ptr + pid_b * stride_xb
+    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    uv_off = pid_b * stride_uvb
+
     j_idx = pid_j * BLOCK + tl.arange(0, BLOCK)
     j_mask = j_idx < N
 
-    log_v_j = tl.load(LOG_V_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
-    g_v_j = tl.load(G_V_ptr + pid_h * N + j_idx, mask=j_mask, other=0.0)
+    log_v_j = tl.load(LOG_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
+    g_v_j = tl.load(G_V_ptr + uv_off + pid_h * N + j_idx, mask=j_mask, other=0.0)
 
     acc = tl.zeros([BLOCK], dtype=tl.float32)
 
@@ -1208,66 +1169,28 @@ def _ift_z_v_update(
         i_idx = i0 + tl.arange(0, BLOCK)
         i_mask = i_idx < N
 
-        z_u_i = tl.load(Z_U_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
-        row_lse_i = tl.load(ROW_LSE_ptr + pid_h * N + i_idx, mask=i_mask, other=0.0)
+        z_u_i = tl.load(Z_U_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
+        row_lse_i = tl.load(ROW_LSE_ptr + uv_off + pid_h * N + i_idx, mask=i_mask, other=0.0)
 
         C_tile = _compute_cost_tile(
-            Q_ptr,
-            K_ptr,
-            X_ptr,
-            POS_BIAS_ptr,
-            w_dist_h,
-            R_0,
-            i_idx,
-            j_idx,
-            i_mask,
-            j_mask,
-            pid_h,
-            N,
-            D_H,
-            stride_qh,
-            stride_qn,
-            stride_xn,
-            stride_ph,
-            stride_pn,
-            BLOCK,
-            BLOCK,
+            Q_b, K_b, X_b, POS_b,
+            w_dist_h, R_0, i_idx, j_idx, i_mask, j_mask, pid_h,
+            N, D_H, stride_qh, stride_qn, stride_xn, stride_ph, stride_pn,
+            BLOCK, BLOCK,
         )
-        # S_row[i,j] = exp(log_K[i,j] + log_v[j] - row_lse[i])
         log_s = -C_tile * inv_eps_h + log_v_j[None, :] - row_lse_i[:, None]
         s_row_tile = tl.exp(log_s)
         s_row_tile = tl.where(i_mask[:, None], s_row_tile, 0.0)
 
-        # sum over i: (BLOCK_J,)
         acc += tl.sum(s_row_tile * z_u_i[:, None], axis=0)
 
     z_v_new = g_v_j + kappa_h * acc
-    tl.store(Z_V_ptr + pid_h * N + j_idx, z_v_new, mask=j_mask)
+    tl.store(Z_V_ptr + uv_off + pid_h * N + j_idx, z_v_new, mask=j_mask)
 
 
 # ============================================================================
 # Python wrapper + autograd Function
 # ============================================================================
-
-
-def _launch_common_args(Q_ln, K_ln, x_res, pos_bias, eps, w_dist, N, D_H):
-    return (
-        Q_ln,
-        K_ln,
-        x_res,
-        pos_bias,
-        eps,
-        w_dist,
-        N,
-        D_H,
-        1.0,  # LAM
-        10.0,  # R_0
-        Q_ln.stride(0),
-        Q_ln.stride(1),
-        x_res.stride(0),
-        pos_bias.stride(0),
-        pos_bias.stride(1),
-    )
 
 
 class FlashSinkhornFunction(torch.autograd.Function):
@@ -1290,7 +1213,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
         log_v_init,
         BLOCK,
     ):
-        H, N, d_h = Q_ln.shape
+        B, H, N, d_h = Q_ln.shape
         device = Q_ln.device
 
         # Ensure FP32 contiguous
@@ -1304,8 +1227,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
         log_mu = log_mu.contiguous().float()
         log_nu = log_nu.contiguous().float()
 
-        log_u = torch.zeros(H, N, device=device, dtype=torch.float32)
-        log_v = torch.zeros(H, N, device=device, dtype=torch.float32)
+        log_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+        log_v = torch.zeros(B, H, N, device=device, dtype=torch.float32)
 
         if log_u_init is not None:
             log_u.copy_(log_u_init.float())
@@ -1313,93 +1236,52 @@ class FlashSinkhornFunction(torch.autograd.Function):
             log_v.copy_(log_v_init.float())
 
         n_tiles = (N + BLOCK - 1) // BLOCK
-        grid = (H, n_tiles)
+        grid = (B * H, n_tiles)
 
-        common = (
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-        )
-        dim_args = (N, d_h, lam, r_0)
+        common = (Q_ln, K_ln, x_res, pos_bias, eps, w_dist)
+        dim_args = (N, d_h, lam, r_0, H)
         stride_args = (
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            log_mu.stride(0),  # stride_uvb = H * N
             BLOCK,
         )
 
         # Sinkhorn iterations: 2K kernel launches, each fully parallel
         for _ in range(K_iter):
             _sinkhorn_row_update[grid](
-                *common,
-                log_mu,
-                log_v,
-                log_u,
-                *dim_args,
-                *stride_args,
+                *common, log_mu, log_v, log_u,
+                *dim_args, *stride_args,
             )
             _sinkhorn_col_update[grid](
-                *common,
-                log_nu,
-                log_u,
-                log_v,
-                *dim_args,
-                *stride_args,
+                *common, log_nu, log_u, log_v,
+                *dim_args, *stride_args,
             )
 
         # Transport output
-        O_avg = torch.zeros(H, N, d_h, device=device, dtype=torch.float32)
-        x_centroid = torch.zeros(H, N, 3, device=device, dtype=torch.float32)
-        row_sum = torch.zeros(H, N, device=device, dtype=torch.float32)
+        O_avg = torch.zeros(B, H, N, d_h, device=device, dtype=torch.float32)
+        x_centroid = torch.zeros(B, H, N, 3, device=device, dtype=torch.float32)
+        row_sum = torch.zeros(B, H, N, device=device, dtype=torch.float32)
 
         _transport_output_kernel[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            V,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            O_avg,
-            x_centroid,
-            row_sum,
-            N,
-            d_h,
-            r_0,
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            V.stride(0),
-            V.stride(1),
-            O_avg.stride(0),
-            O_avg.stride(1),
-            x_centroid.stride(0),
-            x_centroid.stride(1),
+            Q_ln, K_ln, x_res, pos_bias, V, eps, w_dist,
+            log_u, log_v,
+            O_avg, x_centroid, row_sum,
+            N, d_h, r_0, H,
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O_avg.stride(0), O_avg.stride(1), O_avg.stride(2),
+            x_centroid.stride(0), x_centroid.stride(1), x_centroid.stride(2),
+            log_u.stride(0),  # stride_uvb
             BLOCK,
         )
 
         ctx.save_for_backward(
-            Q_ln,
-            K_ln,
-            V,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            log_mu,
-            log_nu,
-            row_sum,
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
+            log_u, log_v, log_mu, log_nu, row_sum,
         )
         ctx.K_iter = K_iter
         ctx.BLOCK = BLOCK
@@ -1411,186 +1293,112 @@ class FlashSinkhornFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_O, grad_xc, grad_lu, grad_lv):
         (
-            Q_ln,
-            K_ln,
-            V,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            log_mu,
-            log_nu,
-            row_sum,
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
+            log_u, log_v, log_mu, log_nu, row_sum,
         ) = ctx.saved_tensors
         K_back = ctx.K_iter
         BLOCK = ctx.BLOCK
         lam = ctx.lam
         r_0 = ctx.r_0
 
-        H, N, d_h = Q_ln.shape
+        B, H, N, d_h = Q_ln.shape
         device = Q_ln.device
         kappa = (lam / (lam + eps)).contiguous()
 
-        # Cap BLOCK at 32 for backward — SRAM-heavy kernels need smaller tiles
+        # Cap BLOCK at 32 for backward
         BLOCK_BWD = min(BLOCK, 32)
         n_tiles = (N + BLOCK_BWD - 1) // BLOCK_BWD
-        grid = (H, n_tiles)
+        grid = (B * H, n_tiles)
 
-        stride_args = (
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
+        stride_uvb = log_u.stride(0)  # H * N
+
+        stride_args_bwd = (
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            stride_uvb,
             BLOCK_BWD,
         )
 
         if grad_O is None:
-            grad_O = torch.zeros(H, N, d_h, device=device, dtype=torch.float32)
+            grad_O = torch.zeros(B, H, N, d_h, device=device, dtype=torch.float32)
         else:
             grad_O = grad_O.contiguous().float()
         if grad_xc is None:
-            grad_xc = torch.zeros(H, N, 3, device=device, dtype=torch.float32)
+            grad_xc = torch.zeros(B, H, N, 3, device=device, dtype=torch.float32)
         else:
             grad_xc = grad_xc.contiguous().float()
 
-        # ---- Step 1: Compute log_Z and D ----
-        log_Z = torch.empty(H, N, device=device, dtype=torch.float32)
+        # ---- Step 1: Compute log_Z ----
+        log_Z = torch.empty(B, H, N, device=device, dtype=torch.float32)
         _compute_log_Z[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            log_Z,
-            N,
-            d_h,
-            r_0,
-            *stride_args,
+            Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
+            log_u, log_v, log_Z,
+            N, d_h, r_0, H,
+            *stride_args_bwd,
         )
 
-        # D[h,i] = sum_d grad_O[h,i,d]*O_avg[h,i,d] + sum_c grad_xc[h,i,c]*xc[h,i,c]
-        # Recompute O_avg, x_centroid from row_sum is not easily available.
-        # Instead, recompute from forward saved tensors.
-        # O_avg = T_norm @ V was not saved, but we saved row_sum.
-        # Actually we need to recompute O_avg and x_centroid — or save them.
-        # The forward already ran the transport output kernel which computed them.
-        # But they weren't saved. We need to recompute via another tiled pass.
-        # More efficient: save O_avg and x_centroid in forward (small: O(N*d)).
-        # For now, recompute D in the _backward_gv_grad_V_kernel alongside g_v.
-        # Wait — D = grad_O · O_avg + grad_xc · xc requires O_avg and xc.
-        # Let's recompute them with a second transport output kernel call.
-        O_avg_recomp = torch.zeros(H, N, d_h, device=device, dtype=torch.float32)
-        x_cent_recomp = torch.zeros(H, N, 3, device=device, dtype=torch.float32)
-        row_sum_recomp = torch.zeros(H, N, device=device, dtype=torch.float32)
+        # Recompute O_avg and x_centroid for D computation
+        O_avg_recomp = torch.zeros(B, H, N, d_h, device=device, dtype=torch.float32)
+        x_cent_recomp = torch.zeros(B, H, N, 3, device=device, dtype=torch.float32)
+        row_sum_recomp = torch.zeros(B, H, N, device=device, dtype=torch.float32)
         _transport_output_kernel[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            V,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            O_avg_recomp,
-            x_cent_recomp,
-            row_sum_recomp,
-            N,
-            d_h,
-            r_0,
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            V.stride(0),
-            V.stride(1),
-            O_avg_recomp.stride(0),
-            O_avg_recomp.stride(1),
-            x_cent_recomp.stride(0),
-            x_cent_recomp.stride(1),
+            Q_ln, K_ln, x_res, pos_bias, V, eps, w_dist,
+            log_u, log_v,
+            O_avg_recomp, x_cent_recomp, row_sum_recomp,
+            N, d_h, r_0, H,
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O_avg_recomp.stride(0), O_avg_recomp.stride(1), O_avg_recomp.stride(2),
+            x_cent_recomp.stride(0), x_cent_recomp.stride(1), x_cent_recomp.stride(2),
+            stride_uvb,
             BLOCK_BWD,
         )
 
         D = (grad_O * O_avg_recomp).sum(dim=-1) + (grad_xc * x_cent_recomp).sum(
             dim=-1
-        )  # (H, N)
+        )  # (B, H, N)
 
         # ---- Step 2: Compute g_v, grad_V, grad_x_transport ----
-        g_v = torch.zeros(H, N, device=device, dtype=torch.float32)
+        g_v = torch.zeros(B, H, N, device=device, dtype=torch.float32)
         grad_V = torch.zeros_like(V)
-        grad_x_transport = torch.zeros(N, 3, device=device, dtype=torch.float32)
+        grad_x_transport = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
 
         _backward_gv_grad_V_kernel[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            V,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            log_Z,
-            grad_O,
-            grad_xc,
-            D,
-            g_v,
-            grad_V,
-            grad_x_transport,
-            N,
-            d_h,
-            r_0,
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            V.stride(0),
-            V.stride(1),
+            Q_ln, K_ln, x_res, pos_bias, V, eps, w_dist,
+            log_u, log_v, log_Z,
+            grad_O, grad_xc, D,
+            g_v, grad_V, grad_x_transport,
+            N, d_h, r_0, H,
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            stride_uvb,
+            grad_x_transport.stride(0),  # stride_gxt_b = N * 3
             BLOCK,
         )
 
-        # g_u = 0 (row-normalization cancels log_u effect)
-        g_u = torch.zeros(H, N, device=device, dtype=torch.float32)
+        # g_u = 0
+        g_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
 
         # ---- Step 3: Precompute row_lse, col_lse for IFT ----
-        row_lse = torch.empty(H, N, device=device, dtype=torch.float32)
-        col_lse = torch.empty(H, N, device=device, dtype=torch.float32)
+        row_lse = torch.empty(B, H, N, device=device, dtype=torch.float32)
+        col_lse = torch.empty(B, H, N, device=device, dtype=torch.float32)
 
         _compute_row_lse[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-            log_v,
-            row_lse,
-            N,
-            d_h,
-            r_0,
-            *stride_args,
+            Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
+            log_v, row_lse,
+            N, d_h, r_0, H,
+            *stride_args_bwd,
         )
         _compute_col_lse[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            eps,
-            w_dist,
-            log_u,
-            col_lse,
-            N,
-            d_h,
-            r_0,
-            *stride_args,
+            Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
+            log_u, col_lse,
+            N, d_h, r_0, H,
+            *stride_args_bwd,
         )
 
         # ---- Step 4: IFT adjoint iterations ----
@@ -1603,30 +1411,14 @@ class FlashSinkhornFunction(torch.autograd.Function):
 
         for _ in range(K_back):
             _ift_z_u_update[grid](
-                *common,
-                log_u,
-                col_lse,
-                g_u,
-                z_v,
-                z_u_new,
-                kappa,
-                N,
-                d_h,
-                r_0,
-                *stride_args,
+                *common, log_u, col_lse, g_u, z_v, z_u_new, kappa,
+                N, d_h, r_0, H,
+                *stride_args_bwd,
             )
             _ift_z_v_update[grid](
-                *common,
-                log_v,
-                row_lse,
-                g_v,
-                z_u_new,
-                z_v_new,
-                kappa,
-                N,
-                d_h,
-                r_0,
-                *stride_args,
+                *common, log_v, row_lse, g_v, z_u_new, z_v_new, kappa,
+                N, d_h, r_0, H,
+                *stride_args_bwd,
             )
             z_u, z_u_new = z_u_new, z_u
             z_v, z_v_new = z_v_new, z_v
@@ -1634,44 +1426,23 @@ class FlashSinkhornFunction(torch.autograd.Function):
         # ---- Step 5: Cost gradient propagation ----
         grad_Q_ln = torch.zeros_like(Q_ln)
         grad_K_ln = torch.zeros_like(K_ln)
-        grad_x_cost = torch.zeros(N, 3, device=device, dtype=torch.float32)
+        grad_x_cost = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
         grad_w_dist = torch.zeros(H, device=device, dtype=torch.float32)
         grad_pos_bias = torch.zeros_like(pos_bias)
 
         _cost_gradient_kernel[grid](
-            Q_ln,
-            K_ln,
-            x_res,
-            pos_bias,
-            V,
-            eps,
-            w_dist,
-            log_u,
-            log_v,
-            log_Z,
-            row_lse,
-            col_lse,
-            grad_O,
-            grad_xc,
-            D,
-            z_u,
-            z_v,
-            kappa,
-            grad_Q_ln,
-            grad_K_ln,
-            grad_x_cost,
-            grad_w_dist,
-            grad_pos_bias,
-            N,
-            d_h,
-            r_0,
-            Q_ln.stride(0),
-            Q_ln.stride(1),
-            x_res.stride(0),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            V.stride(0),
-            V.stride(1),
+            Q_ln, K_ln, x_res, pos_bias, V, eps, w_dist,
+            log_u, log_v, log_Z, row_lse, col_lse,
+            grad_O, grad_xc, D, z_u, z_v, kappa,
+            grad_Q_ln, grad_K_ln, grad_x_cost,
+            grad_w_dist, grad_pos_bias,
+            N, d_h, r_0, H,
+            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
+            x_res.stride(0), x_res.stride(1),
+            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            stride_uvb,
+            grad_x_cost.stride(0),  # stride_gxc_b = N * 3
             BLOCK_BWD,
         )
 
@@ -1679,8 +1450,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
         grad_x_res = grad_x_transport + grad_x_cost
 
         # Marginal gradients from IFT
-        grad_log_mu = kappa[:, None] * z_u
-        grad_log_nu = kappa[:, None] * z_v
+        grad_log_mu = kappa[None, :, None] * z_u  # (B, H, N)
+        grad_log_nu = kappa[None, :, None] * z_v
 
         # Return gradients for: Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
         #   log_mu, log_nu, K_iter, lam, r_0, log_u_init, log_v_init, BLOCK
@@ -1723,26 +1494,39 @@ def flash_sinkhorn(
     """
     Flash-Sinkhorn with IFT backward.
 
+    Accepts both unbatched (H, N, d_h) and batched (B, H, N, d_h) inputs.
+
     Returns:
-        O_avg:      (H, N, d_h) transport-weighted value output
-        x_centroid: (H, N, 3)   EGNN centroid
-        log_u:      (H, N)      converged row duals
-        log_v:      (H, N)      converged column duals
+        O_avg:      (B, H, N, d_h) transport-weighted value output
+        x_centroid: (B, H, N, 3)   EGNN centroid
+        log_u:      (B, H, N)      converged row duals
+        log_v:      (B, H, N)      converged column duals
+
+    When called with unbatched inputs, B=1 is added internally and results
+    are returned with B dimension.
     """
-    return FlashSinkhornFunction.apply(
-        Q_ln,
-        K_ln,
-        V,
-        x_res,
-        pos_bias,
-        eps,
-        w_dist,
-        log_mu,
-        log_nu,
-        K_iter,
-        lam,
-        r_0,
-        log_u_init,
-        log_v_init,
-        BLOCK_N,
+    # Handle unbatched inputs: add B=1
+    unbatched = Q_ln.dim() == 3
+    if unbatched:
+        Q_ln = Q_ln.unsqueeze(0)
+        K_ln = K_ln.unsqueeze(0)
+        V = V.unsqueeze(0)
+        x_res = x_res.unsqueeze(0)
+        pos_bias = pos_bias.unsqueeze(0)
+        log_mu = log_mu.unsqueeze(0)
+        log_nu = log_nu.unsqueeze(0)
+        if log_u_init is not None:
+            log_u_init = log_u_init.unsqueeze(0)
+        if log_v_init is not None:
+            log_v_init = log_v_init.unsqueeze(0)
+
+    result = FlashSinkhornFunction.apply(
+        Q_ln, K_ln, V, x_res, pos_bias,
+        eps, w_dist, log_mu, log_nu,
+        K_iter, lam, r_0,
+        log_u_init, log_v_init, BLOCK_N,
     )
+
+    if unbatched:
+        return tuple(t.squeeze(0) for t in result)
+    return result

@@ -138,35 +138,26 @@ class TokenUOTBlock(nn.Module):
         log_mu = torch.log(mu.clamp(min=1e-8))  # (B, H, N)
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # Per-sample flash_sinkhorn_attn (unbatched kernel, O(N) memory)
-        o_list, xc_list, lu_list, lv_list = [], [], [], []
-        for b in range(B):
-            o_b, xc_b, lu_b, lv_b = flash_sinkhorn_attn(
-                Q_ln[b],              # (H, N, d_h)
-                K_ln[b],
-                V[b],
-                G[b],
-                x_res[b],             # (N, 3)
-                pos_bias[b],          # (H, N, N)
-                self.eps,             # (H,)
-                effective_w_dist,     # (H,)
-                log_mu[b],            # (H, N)
-                log_nu[b],
-                K_iter=K_ITER,
-                lam=1.0,
-                r_0=self.r_0,
-                log_u_init=log_u_prev[b] if log_u_prev is not None else None,
-                log_v_init=log_v_prev[b] if log_v_prev is not None else None,
-            )
-            o_list.append(o_b)        # (N, H*d_h)
-            xc_list.append(xc_b)      # (H, N, 3)
-            lu_list.append(lu_b)      # (H, N)
-            lv_list.append(lv_b)      # (H, N)
-
-        o = torch.stack(o_list, dim=0)              # (B, N, H*d_h)
-        x_centroid = torch.stack(xc_list, dim=0)    # (B, H, N, 3)
-        log_u = torch.stack(lu_list, dim=0)          # (B, H, N)
-        log_v = torch.stack(lv_list, dim=0)          # (B, H, N)
+        # Batched flash_sinkhorn_attn — no per-sample loop needed
+        o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
+            Q_ln,                 # (B, H, N, d_h)
+            K_ln,                 # (B, H, N, d_h)
+            V,                    # (B, H, N, d_h)
+            G,                    # (B, H, N, d_h)
+            x_res,                # (B, N, 3)
+            pos_bias,             # (B, H, N, N)
+            self.eps,             # (H,)
+            effective_w_dist,     # (H,)
+            log_mu,               # (B, H, N)
+            log_nu,               # (B, H, N)
+            K_iter=K_ITER,
+            lam=1.0,
+            r_0=self.r_0,
+            log_u_init=log_u_prev,
+            log_v_init=log_v_prev,
+        )
+        # o: (B, N, H*d_h), x_centroid: (B, H, N, 3)
+        # log_u: (B, H, N), log_v: (B, H, N)
 
         # Zero out padded positions (flash kernel is unbatched, doesn't know mask)
         mask_hn = mask.unsqueeze(1)  # (B, 1, N) broadcast over H
