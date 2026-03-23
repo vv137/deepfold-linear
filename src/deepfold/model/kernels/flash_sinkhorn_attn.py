@@ -119,6 +119,7 @@ class FlashSinkhornAttn(torch.autograd.Function):
                 eps, w_dist, log_mu, log_nu,
                 K_iter, lam, r_0,
                 log_u_init, log_v_init,
+                mask=mask,
             )
         except Exception:
             # Fallback: materialized forward per sample (for CPU / debugging)
