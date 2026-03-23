@@ -7,7 +7,6 @@ diffusion. ~220M parameters.
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from deepfold.model.trunk import Trunk
 from deepfold.model.init import init_model
@@ -175,9 +174,9 @@ class DeepFoldLinear(nn.Module):
             sigmas = sample_training_sigma(M, device)  # (M,)
 
             # Run M diffusion forwards, accumulate losses.
-            # Checkpoint each diffusion call so only inputs/outputs are kept
-            # alive across M iterations; intermediate activations (10 atom
-            # blocks) are recomputed during backward → peak memory ~O(1).
+            # Each diffusion call is checkpointed individually to bound peak
+            # memory. No DDP issue: the loop runs in forward, checkpoint
+            # replays inside backward but DDP hooks are already resolved.
             l_diff_parts = []
             l_lddt_parts = []
 
@@ -188,8 +187,7 @@ class DeepFoldLinear(nn.Module):
                 noise = torch.randn_like(x_true_i)
                 x_noisy_i = x_true_i + sigma_i * noise
 
-                x_pred_i = checkpoint(
-                    self.diffusion,
+                x_pred_i = self.diffusion(
                     h_res,
                     c_atom,
                     p_lm,
@@ -200,7 +198,6 @@ class DeepFoldLinear(nn.Module):
                     token_pad_mask,
                     atom_pad_mask,
                     pair_valid_mask,
-                    use_reentrant=False,
                 )
 
                 l_diff_parts.append(edm_diffusion_loss(
