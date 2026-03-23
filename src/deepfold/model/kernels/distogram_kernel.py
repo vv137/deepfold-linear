@@ -12,7 +12,7 @@ then compute logits = z_row @ W_bin^T via tl.dot (BLOCK_J, PAD_BINS).
 Cross-entropy is fused in the same kernel with max-subtraction for
 numerical stability.
 
-num_bins is padded to PAD_BINS (next multiple of 16) for tl.dot
+num_bins is padded to PAD_BINS (next power of 2) for tl.dot
 compatibility. Padded bins get bias = -1e30 so they contribute
 negligibly to logsumexp.
 """
@@ -32,15 +32,15 @@ def _next_power_of_2(x: int) -> int:
 
 @triton.jit
 def _distogram_fwd_kernel(
-    # U: (N, D_LOW), V: (N, D_LOW)
+    # U: (B, N, D_LOW), V: (B, N, D_LOW)
     U_ptr,
     V_ptr,
     # W_bin_padded: (PAD_BINS, D_LOW), bias_padded: (PAD_BINS,)
     W_BIN_ptr,
     BIAS_ptr,
-    # Target bins: (N, N) int
+    # Target bins: (B, N, N) int
     TARGET_ptr,
-    # Output: loss_sum (scalar), count (scalar)
+    # Output: loss_sum (B,), count (B,)
     LOSS_ptr,
     COUNT_ptr,
     # Dims
@@ -48,11 +48,15 @@ def _distogram_fwd_kernel(
     D_LOW: tl.constexpr,
     NUM_BINS: tl.constexpr,
     PAD_BINS: tl.constexpr,
-    # Strides
+    # Strides for U/V: (B, N, D_LOW)
+    stride_ub: tl.constexpr,
     stride_un: tl.constexpr,
     stride_ud: tl.constexpr,
+    # Strides for W_bin: (PAD_BINS, D_LOW)
     stride_wb: tl.constexpr,
     stride_wd: tl.constexpr,
+    # Strides for target: (B, N, N)
+    stride_tb: tl.constexpr,
     stride_tn: tl.constexpr,
     stride_tm: tl.constexpr,
     # Tile
@@ -60,8 +64,9 @@ def _distogram_fwd_kernel(
     BLOCK_J: tl.constexpr,
 ):
     """Tiled distogram loss: Hadamard interaction + tl.dot matmul + cross-entropy."""
-    pid_i = tl.program_id(0)
-    pid_j = tl.program_id(1)
+    pid_b = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    pid_j = tl.program_id(2)
 
     i_start = pid_i * BLOCK_I
     j_start = pid_j * BLOCK_J
@@ -72,9 +77,13 @@ def _distogram_fwd_kernel(
     d_idx = tl.arange(0, D_LOW)  # (D_LOW,)
     b_idx = tl.arange(0, PAD_BINS)  # (PAD_BINS,)
 
+    # Base offset for this batch element
+    uv_batch_offset = pid_b * stride_ub
+    target_batch_offset = pid_b * stride_tb
+
     # Load V_tile: (BLOCK_J, D_LOW)
     v_tile = tl.load(
-        V_ptr + j_idx[:, None] * stride_un + d_idx[None, :] * stride_ud,
+        V_ptr + uv_batch_offset + j_idx[:, None] * stride_un + d_idx[None, :] * stride_ud,
         mask=j_mask[:, None],
         other=0.0,
     )
@@ -96,9 +105,9 @@ def _distogram_fwd_kernel(
         i = i_start + i_off
         i_valid = i < N
 
-        # Load U[i, :]: (D_LOW,)
+        # Load U[b, i, :]: (D_LOW,)
         u_row = tl.load(
-            U_ptr + i * stride_un + d_idx * stride_ud,
+            U_ptr + uv_batch_offset + i * stride_un + d_idx * stride_ud,
             mask=i_valid,
             other=0.0,
         )  # (D_LOW,)
@@ -112,7 +121,7 @@ def _distogram_fwd_kernel(
 
         # Load targets for row i: (BLOCK_J,)
         targets = tl.load(
-            TARGET_ptr + i * stride_tn + j_idx * stride_tm,
+            TARGET_ptr + target_batch_offset + i * stride_tn + j_idx * stride_tm,
             mask=j_mask & i_valid,
             other=0,
         )  # (BLOCK_J,) int
@@ -145,25 +154,34 @@ def _distogram_fwd_kernel(
         tile_loss += tl.sum(ce)
         tile_count += tl.sum(valid.to(tl.float32))
 
-    # Atomic add to global accumulators
-    tl.atomic_add(LOSS_ptr, tile_loss)
-    tl.atomic_add(COUNT_ptr, tile_count)
+    # Atomic add to per-batch accumulators
+    tl.atomic_add(LOSS_ptr + pid_b, tile_loss)
+    tl.atomic_add(COUNT_ptr + pid_b, tile_count)
 
 
 def triton_distogram_loss(
-    U: torch.Tensor,  # (N, d_low)
-    V: torch.Tensor,  # (N, d_low)
+    U: torch.Tensor,  # (B, N, d_low) or (N, d_low)
+    V: torch.Tensor,  # (B, N, d_low) or (N, d_low)
     w_bin: torch.Tensor,  # (num_bins, d_low)
     bias: torch.Tensor,  # (num_bins,)
-    target_bins: torch.Tensor,  # (N, N) int
+    target_bins: torch.Tensor,  # (B, N, N) or (N, N) int
     BLOCK_I: int = 16,
     BLOCK_J: int = 16,
 ) -> torch.Tensor:
     """
     Triton-fused distogram loss.
     Returns scalar loss (mean cross-entropy over all pairs).
+
+    Supports both batched (B, N, d_low) and unbatched (N, d_low) inputs.
     """
-    N, d_low = U.shape
+    # Handle unbatched inputs by adding batch dim
+    unbatched = U.dim() == 2
+    if unbatched:
+        U = U.unsqueeze(0)
+        V = V.unsqueeze(0)
+        target_bins = target_bins.unsqueeze(0)
+
+    B, N, d_low = U.shape
     num_bins = w_bin.shape[0]
     pad_bins = _next_power_of_2(num_bins)
 
@@ -173,15 +191,13 @@ def triton_distogram_loss(
     bias = bias.contiguous().float()
     target_bins = target_bins.contiguous().long()
 
-    # Pad W_bin and bias to PAD_BINS (next multiple of 16).
+    # Pad W_bin and bias to PAD_BINS (next power of 2).
     # Extra bins get bias = -1e30 so exp(logit) ≈ 0 in logsumexp.
     if pad_bins > num_bins:
         w_bin_padded = torch.zeros(
             pad_bins, d_low, device=w_bin.device, dtype=w_bin.dtype
         )
         w_bin_padded[:num_bins] = w_bin
-        # Extra rows of W stay zero; with bias=-1e30, logits for
-        # padded bins are ≈ -1e30 regardless of input.
         bias_padded = torch.full(
             (pad_bins,), -1e30, device=bias.device, dtype=bias.dtype
         )
@@ -190,10 +206,11 @@ def triton_distogram_loss(
         w_bin_padded = w_bin
         bias_padded = bias
 
-    loss_sum = torch.zeros(1, device=U.device, dtype=torch.float32)
-    count = torch.zeros(1, device=U.device, dtype=torch.float32)
+    loss_sum = torch.zeros(B, device=U.device, dtype=torch.float32)
+    count = torch.zeros(B, device=U.device, dtype=torch.float32)
 
     grid = (
+        B,
         (N + BLOCK_I - 1) // BLOCK_I,
         (N + BLOCK_J - 1) // BLOCK_J,
     )
@@ -211,12 +228,16 @@ def triton_distogram_loss(
         pad_bins,
         U.stride(0),
         U.stride(1),
+        U.stride(2),
         w_bin_padded.stride(0),
         w_bin_padded.stride(1),
         target_bins.stride(0),
         target_bins.stride(1),
+        target_bins.stride(2),
         BLOCK_I=BLOCK_I,
         BLOCK_J=BLOCK_J,
     )
 
-    return loss_sum / count.clamp(min=1)
+    # Per-sample mean, then average across batch
+    per_sample = loss_sum / count.clamp(min=1)
+    return per_sample.mean()

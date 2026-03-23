@@ -10,6 +10,13 @@ from scipy.optimize import linear_sum_assignment
 from deepfold.data import const
 from deepfold.model.diffusion import SIGMA_DATA
 
+try:
+    from deepfold.model.kernels.distogram_kernel import triton_distogram_loss
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 # Per-atom-type loss weights (Boltz-1 convention)
 _NUCLEOTIDE_LOSS_WEIGHT = 5.0
 _LIGAND_LOSS_WEIGHT = 10.0
@@ -338,6 +345,22 @@ class DistogramLoss(nn.Module):
         h = self.ln(h_res.float()).to(h_res.dtype)
         U = self.w_u(h)  # (B, N, d_low)
         V = self.w_v(h)  # (B, N, d_low)
+
+        # Triton fast path: eval/inference only (kernel fuses atomic_add,
+        # which breaks autograd for w_u/w_v/to_bins gradients).
+        # Only used when no valid_mask (no padding) for simplicity.
+        if (
+            not self.training
+            and _HAS_TRITON
+            and h_res.is_cuda
+            and valid_mask is None
+        ):
+            return triton_distogram_loss(
+                U, V,
+                self.to_bins.weight,
+                self.to_bins.bias,
+                target_bins,
+            )
 
         # Accumulate per-sample losses
         total_loss = torch.zeros(1, device=h_res.device, dtype=torch.float32)

@@ -315,3 +315,78 @@ class TestAtomTypeWeightsBatched:
         token_type = torch.zeros(N, dtype=torch.long)
         w = _atom_type_weights(token_idx, token_type)
         assert w.shape == (N_atom,)
+
+
+@torch.no_grad()
+class TestTritonDistogramLoss:
+    """Test Triton distogram kernel matches Python reference."""
+
+    def _python_distogram_loss(self, U, V, w_bin, bias, target_bins):
+        """Python reference: compute mean CE over all (i,j) pairs per sample."""
+        import torch.nn.functional as F
+
+        if U.dim() == 2:
+            U = U.unsqueeze(0)
+            V = V.unsqueeze(0)
+            target_bins = target_bins.unsqueeze(0)
+
+        B, N, d_low = U.shape
+        losses = []
+        for b in range(B):
+            Z = U[b, :, None, :] * V[b, None, :, :]  # (N, N, d_low)
+            logits = Z @ w_bin.t() + bias  # (N, N, num_bins)
+            logits_flat = logits.reshape(-1, w_bin.shape[0]).float()
+            targets_flat = target_bins[b].reshape(-1)
+            ce = F.cross_entropy(logits_flat, targets_flat, reduction="mean")
+            losses.append(ce)
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def test_triton_b1_matches_python(self):
+        """B=1: Triton kernel matches Python reference."""
+        pytest = __import__("pytest")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        from deepfold.model.kernels.distogram_kernel import triton_distogram_loss
+
+        torch.manual_seed(42)
+        B, N, d_low, num_bins = 1, 20, 16, 39
+        U = torch.randn(B, N, d_low, device="cuda")
+        V = torch.randn(B, N, d_low, device="cuda")
+        w_bin = torch.randn(num_bins, d_low, device="cuda")
+        bias = torch.randn(num_bins, device="cuda")
+        target_bins = torch.randint(0, num_bins, (B, N, N), device="cuda")
+
+        triton_loss = triton_distogram_loss(U, V, w_bin, bias, target_bins)
+        python_loss = self._python_distogram_loss(
+            U.float(), V.float(), w_bin.float(), bias.float(), target_bins
+        )
+
+        assert triton_loss.dim() == 0
+        torch.testing.assert_close(triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3)
+
+    @torch.no_grad()
+    def test_triton_b2_matches_python(self):
+        """B=2: per-sample Triton loss matches Python reference."""
+        pytest = __import__("pytest")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        from deepfold.model.kernels.distogram_kernel import triton_distogram_loss
+
+        torch.manual_seed(123)
+        B, N, d_low, num_bins = 2, 24, 16, 39
+        U = torch.randn(B, N, d_low, device="cuda")
+        V = torch.randn(B, N, d_low, device="cuda")
+        w_bin = torch.randn(num_bins, d_low, device="cuda")
+        bias = torch.randn(num_bins, device="cuda")
+        target_bins = torch.randint(0, num_bins, (B, N, N), device="cuda")
+
+        triton_loss = triton_distogram_loss(U, V, w_bin, bias, target_bins)
+        python_loss = self._python_distogram_loss(
+            U.float(), V.float(), w_bin.float(), bias.float(), target_bins
+        )
+
+        assert triton_loss.dim() == 0
+        torch.testing.assert_close(triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3)
