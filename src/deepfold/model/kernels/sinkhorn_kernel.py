@@ -25,6 +25,23 @@ import triton
 import triton.language as tl
 
 
+def _compute_cost_tile_py(Q_ln, K_ln, x_res, pos_bias, w_dist_h, r_0, i_slice, j_slice, eps_h):
+    """Python cost tile computation for backward. Returns (C, log_K, dist, diff)."""
+    Q_i = Q_ln[i_slice]
+    K_j = K_ln[j_slice]
+    d_h = Q_i.shape[-1]
+    content = -(Q_i @ K_j.T) / (d_h**0.5)
+    xi = x_res[i_slice]
+    xj = x_res[j_slice]
+    diff = xi[:, None, :] - xj[None, :, :]
+    dist = (diff**2).sum(-1).sqrt().clamp(min=1e-8)
+    geo = w_dist_h * dist / (r_0 + dist)
+    pos = pos_bias[i_slice, :][:, j_slice]
+    C_tile = content + pos + geo
+    log_K_tile = -C_tile / eps_h
+    return C_tile, log_K_tile, dist, diff
+
+
 # ============================================================================
 # Helper: compute cost tile on-the-fly
 # ============================================================================
@@ -1291,8 +1308,13 @@ class FlashSinkhornFunction(torch.autograd.Function):
             BLOCK,
         )
 
-        # Sinkhorn iterations: 2K kernel launches, each fully parallel
+        # Sinkhorn iterations: save all intermediate states for unrolled backward.
+        # Memory: K × 2 × (B, H, N) ≈ 1MB at K=20, H=16, N=384. Negligible.
+        log_u_history = []
+        log_v_history = []
         for _ in range(K_iter):
+            log_u_history.append(log_u.clone())
+            log_v_history.append(log_v.clone())
             _sinkhorn_row_update[grid](
                 *common, log_mu, log_v, log_u, mask_bias,
                 *dim_args, *stride_args,
@@ -1326,21 +1348,25 @@ class FlashSinkhornFunction(torch.autograd.Function):
         ctx.save_for_backward(
             Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
             log_u, log_v, log_mu, log_nu, row_sum, mask_bias,
+            *log_u_history, *log_v_history,
         )
         ctx.K_iter = K_iter
         ctx.BLOCK = BLOCK
         ctx.lam = lam
         ctx.r_0 = r_0
+        ctx.N_saved_base = 13  # number of tensors before history
 
         return O_avg, x_centroid, log_u, log_v
 
     @staticmethod
-    def backward(ctx, grad_O, grad_xc, grad_lu, grad_lv):
-        (
-            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
-            log_u, log_v, log_mu, log_nu, row_sum, mask_bias,
-        ) = ctx.saved_tensors
+    def backward(ctx, grad_O, grad_xc, _grad_lu, _grad_lv):
+        saved = ctx.saved_tensors
+        N_base = ctx.N_saved_base
+        Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist = saved[:7]
+        log_u, log_v, log_mu, log_nu, row_sum, mask_bias = saved[7:N_base]
         K_back = ctx.K_iter
+        log_u_hist = list(saved[N_base:N_base + K_back])
+        log_v_hist = list(saved[N_base + K_back:N_base + 2 * K_back])
         BLOCK = ctx.BLOCK
         lam = ctx.lam
         r_0 = ctx.r_0
@@ -1408,7 +1434,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             dim=-1
         )  # (B, H, N)
 
-        # ---- Step 2: Compute g_v, grad_V, grad_x_transport ----
+        # ---- Step 2: Compute grad_V, grad_x_transport, and marginal sums r, c ----
+        # Also compute g_v (gradient w.r.t. log_v from transport output)
         g_v = torch.zeros(B, H, N, device=device, dtype=torch.float32)
         grad_V = torch.zeros_like(V)
         grad_x_transport = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
@@ -1424,113 +1451,173 @@ class FlashSinkhornFunction(torch.autograd.Function):
             pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
             V.stride(0), V.stride(1), V.stride(2),
             stride_uvb,
-            grad_x_transport.stride(0),  # stride_gxt_b = N * 3
+            grad_x_transport.stride(0),
             stride_mb,
             BLOCK,
         )
 
-        # g_u = 0
-        g_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+        # ---- Step 3: Unrolled backward through K Sinkhorn iterations ----
+        #
+        # Each iteration: log_u = κ(log_a - LSE_j(log_K_ij + log_v_j))
+        #                 log_v = κ(log_b - LSE_i(log_K_ij + log_u_i))
+        #
+        # Backward per iteration (tiled, O(N) memory):
+        #   s_ij = softmax_j(-C_ij/ε + log_v_j)     [recomputed per tile]
+        #   grad_log_v_j += -κ · Σ_i grad_log_u_i · s_ij
+        #   grad_log_mu_i += κ · grad_log_u_i
+        #   grad_C_ij += (κ/ε) · grad_log_u_i · s_ij
+        #   (similarly for col update)
+        #
+        # Memory: O(K·N) saved states + O(tile²) working = O(N)
 
-        # ---- Step 3: Precompute row_lse, col_lse for IFT ----
-        row_lse = torch.empty(B, H, N, device=device, dtype=torch.float32)
-        col_lse = torch.empty(B, H, N, device=device, dtype=torch.float32)
-
-        _compute_row_lse[grid](
-            Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
-            log_v, row_lse, mask_bias,
-            N, d_h, r_0, H,
-            *stride_args_bwd,
-        )
-        _compute_col_lse[grid](
-            Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
-            log_u, col_lse, mask_bias,
-            N, d_h, r_0, H,
-            *stride_args_bwd,
-        )
-
-        # ---- Step 4: IFT adjoint via CG (Schur complement) ----
-        # The IFT system: z_u = g_u + κ·S_col·z_v, z_v = g_v + κ·S_row·z_u
-        # Eliminate z_u → Schur complement for z_v:
-        #   (I - κ²·S_row·S_col) z_v = g_v + κ·S_row·g_u
-        # CG solves this in ~10 iterations vs 20 fixed-point iterations.
-        from deepfold.utils.cg import conjugate_gradient
-
-        common = (Q_ln, K_ln, x_res, pos_bias, eps, w_dist)
-
-        def _apply_S_col(z_in):
-            """S_col·z: one step of z_u = κ·(g_u=0 + S_col·z_in)."""
-            out = torch.empty_like(z_in)
-            _ift_z_u_update[grid](
-                *common, log_u, col_lse,
-                torch.zeros_like(z_in),  # g_u = 0
-                z_in, out, kappa, mask_bias,
-                N, d_h, r_0, H, *stride_args_bwd,
-            )
-            return out
-
-        def _apply_S_row(z_in):
-            """S_row·z: one step of z_v = κ·(g_v=0 + S_row·z_in)."""
-            out = torch.empty_like(z_in)
-            _ift_z_v_update[grid](
-                *common, log_v, row_lse,
-                torch.zeros_like(z_in),  # g_v = 0
-                z_in, out, kappa, mask_bias,
-                N, d_h, r_0, H, *stride_args_bwd,
-            )
-            return out
-
-        # RHS: g_v + κ·S_row·g_u (but g_u = 0 for row-normalized transport)
-        rhs = g_v.clone()  # (B, H, N) flattened for CG
-
-        def schur_matvec(z_flat):
-            """(I - κ²·S_row·S_col) @ z"""
-            z = z_flat.view(B, H, N)
-            Sz = _apply_S_col(z)   # S_col @ z
-            SSz = _apply_S_row(Sz)  # S_row @ S_col @ z
-            return (z - SSz).view(-1)
-
-        z_v_flat, _ = conjugate_gradient(
-            schur_matvec, rhs.view(-1),
-            x0=g_v.view(-1),  # warm-start from g_v
-            max_iter=min(K_back, 50),
-            rtol=1e-5, atol=1e-6,
-        )
-        z_v = z_v_flat.view(B, H, N)
-
-        # Back-solve: z_u = g_u + κ·S_col·z_v (g_u = 0)
-        z_u = _apply_S_col(z_v)
-
-        # ---- Step 5: Cost gradient propagation ----
+        TILE = BLOCK_BWD
+        grad_log_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+        grad_log_v = g_v.clone()  # from transport output backward
+        grad_log_mu = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+        grad_log_nu = torch.zeros(B, H, N, device=device, dtype=torch.float32)
         grad_Q_ln = torch.zeros_like(Q_ln)
         grad_K_ln = torch.zeros_like(K_ln)
         grad_x_cost = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
         grad_w_dist = torch.zeros(H, device=device, dtype=torch.float32)
         grad_pos_bias = torch.zeros_like(pos_bias)
 
-        _cost_gradient_kernel[grid](
-            Q_ln, K_ln, x_res, pos_bias, V, eps, w_dist,
-            log_u, log_v, log_Z, row_lse, col_lse,
-            grad_O, grad_xc, D, z_u, z_v, kappa,
-            grad_Q_ln, grad_K_ln, grad_x_cost,
-            grad_w_dist, grad_pos_bias, mask_bias,
-            N, d_h, r_0, H,
-            Q_ln.stride(0), Q_ln.stride(1), Q_ln.stride(2),
-            x_res.stride(0), x_res.stride(1),
-            pos_bias.stride(0), pos_bias.stride(1), pos_bias.stride(2),
-            V.stride(0), V.stride(1), V.stride(2),
-            stride_uvb,
-            grad_x_cost.stride(0),  # stride_gxc_b = N * 3
-            stride_mb,
-            BLOCK_BWD,
-        )
+        for k in reversed(range(K_back)):
+            # Saved states: log_u_hist[k], log_v_hist[k] = states BEFORE iteration k
+            log_v_before = log_v_hist[k]  # log_v input to row update
+            # After row update: log_u_after = κ(log_mu - LSE_j(-C/ε + log_v_before))
+            # After col update: log_v_after = κ(log_nu - LSE_i(-C/ε + log_u_after))
+            # log_u_after is recomputed below; log_v_after = log_v_hist[k+1] if k<K-1 else log_v
 
+            # Recompute log_u_after for this iteration (needed for col update backward)
+            log_u_after = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            _sinkhorn_row_update[(B * H, n_tiles)](
+                Q_ln, K_ln, x_res, pos_bias, eps, w_dist,
+                log_mu, log_v_before, log_u_after, mask_bias,
+                N, d_h, lam, r_0, H,
+                *stride_args_bwd[:8], stride_uvb, stride_mb, BLOCK_BWD,
+            )
+
+            # -- Col update backward: log_v_after = κ(log_nu - LSE_i(-C/ε + log_u_after)) --
+            # grad_log_v_after is the incoming gradient (from next iteration or transport output)
+            for b_idx in range(B):
+                for h_idx in range(H):
+                    eps_h = eps[h_idx].item()
+                    kappa_h = kappa[h_idx].item()
+                    w_h = w_dist[h_idx].item()
+                    for j0 in range(0, N, TILE):
+                        je = min(j0 + TILE, N)
+                        # s'_ji = softmax_i(-C_ij/ε + log_u_after_i) over i
+                        max_val = torch.full((je - j0,), -1e30, device=device)
+                        sum_exp = torch.zeros(je - j0, device=device)
+                        # First pass: compute LSE for normalization
+                        for i0 in range(0, N, TILE):
+                            ie = min(i0 + TILE, N)
+                            _, log_K_t, _, _ = _compute_cost_tile_py(
+                                Q_ln[b_idx, h_idx], K_ln[b_idx, h_idx], x_res[b_idx],
+                                pos_bias[b_idx, h_idx], w_h, r_0,
+                                slice(i0, ie), slice(j0, je), eps_h,
+                            )
+                            score = (log_K_t + log_u_after[b_idx, h_idx, i0:ie, None]
+                                     + mask_bias[b_idx, None, i0:ie]).T  # (tj, ti)
+                            tile_max = score.max(dim=-1).values
+                            new_max = torch.maximum(max_val, tile_max)
+                            sum_exp = sum_exp * torch.exp(max_val - new_max) + \
+                                      torch.exp(score - new_max[:, None]).sum(dim=-1)
+                            max_val = new_max
+                        lse_j = max_val + torch.log(sum_exp + 1e-30)
+
+                        # Second pass: accumulate gradients
+                        gl_v = grad_log_v[b_idx, h_idx, j0:je]
+                        for i0 in range(0, N, TILE):
+                            ie = min(i0 + TILE, N)
+                            C_t, log_K_t, dist_t, diff_t = _compute_cost_tile_py(
+                                Q_ln[b_idx, h_idx], K_ln[b_idx, h_idx], x_res[b_idx],
+                                pos_bias[b_idx, h_idx], w_h, r_0,
+                                slice(i0, ie), slice(j0, je), eps_h,
+                            )
+                            score = (log_K_t + log_u_after[b_idx, h_idx, i0:ie, None]
+                                     + mask_bias[b_idx, None, i0:ie]).T
+                            s_tile = torch.exp(score - lse_j[:, None])  # (tj, ti)
+
+                            # grad_log_u_after_i += -κ · Σ_j grad_log_v_j · s'_ji
+                            grad_log_u[b_idx, h_idx, i0:ie] += -kappa_h * (s_tile.T @ gl_v)
+                            # grad_C from col update
+                            gc = (kappa_h / eps_h) * torch.outer(gl_v, torch.ones(ie-i0, device=device)) * s_tile
+                            inv_sqrt_dh = 1.0 / (d_h ** 0.5)
+                            grad_Q_ln[b_idx, h_idx, i0:ie] += (-inv_sqrt_dh) * (gc.T @ K_ln[b_idx, h_idx, j0:je])
+                            grad_K_ln[b_idx, h_idx, j0:je] += (-inv_sqrt_dh) * (gc @ Q_ln[b_idx, h_idx, i0:ie])
+                            if dist_t is not None:
+                                geo_gc = w_h * r_0 / (r_0 + dist_t) ** 2
+                                wt = gc.T * geo_gc / dist_t.clamp(min=1e-8)
+                                grad_x_cost[b_idx, i0:ie] += (wt.unsqueeze(-1) * diff_t).sum(dim=1)
+                                grad_x_cost[b_idx, j0:je] -= (wt.unsqueeze(-1) * diff_t).sum(dim=0)
+                                grad_w_dist[h_idx] += (gc.T * dist_t / (r_0 + dist_t)).sum()
+                            grad_pos_bias[b_idx, h_idx, i0:ie, j0:je] += gc.T
+
+                        grad_log_nu[b_idx, h_idx, j0:je] += kappa_h * gl_v
+
+            # -- Row update backward: log_u_after = κ(log_mu - LSE_j(-C/ε + log_v_before)) --
+            # grad_log_u now has contributions from col update backward above
+            grad_log_v_new = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            for b_idx in range(B):
+                for h_idx in range(H):
+                    eps_h = eps[h_idx].item()
+                    kappa_h = kappa[h_idx].item()
+                    w_h = w_dist[h_idx].item()
+                    for i0 in range(0, N, TILE):
+                        ie = min(i0 + TILE, N)
+                        max_val = torch.full((ie - i0,), -1e30, device=device)
+                        sum_exp = torch.zeros(ie - i0, device=device)
+                        for j0 in range(0, N, TILE):
+                            je = min(j0 + TILE, N)
+                            _, log_K_t, _, _ = _compute_cost_tile_py(
+                                Q_ln[b_idx, h_idx], K_ln[b_idx, h_idx], x_res[b_idx],
+                                pos_bias[b_idx, h_idx], w_h, r_0,
+                                slice(i0, ie), slice(j0, je), eps_h,
+                            )
+                            score = log_K_t + log_v_before[b_idx, h_idx, None, j0:je] + mask_bias[b_idx, None, j0:je]
+                            tile_max = score.max(dim=-1).values
+                            new_max = torch.maximum(max_val, tile_max)
+                            sum_exp = sum_exp * torch.exp(max_val - new_max) + \
+                                      torch.exp(score - new_max[:, None]).sum(dim=-1)
+                            max_val = new_max
+                        lse_i = max_val + torch.log(sum_exp + 1e-30)
+
+                        gl_u = grad_log_u[b_idx, h_idx, i0:ie]
+                        for j0 in range(0, N, TILE):
+                            je = min(j0 + TILE, N)
+                            C_t, log_K_t, dist_t, diff_t = _compute_cost_tile_py(
+                                Q_ln[b_idx, h_idx], K_ln[b_idx, h_idx], x_res[b_idx],
+                                pos_bias[b_idx, h_idx], w_h, r_0,
+                                slice(i0, ie), slice(j0, je), eps_h,
+                            )
+                            score = log_K_t + log_v_before[b_idx, h_idx, None, j0:je] + mask_bias[b_idx, None, j0:je]
+                            s_tile = torch.exp(score - lse_i[:, None])  # (ti, tj)
+
+                            grad_log_v_new[b_idx, h_idx, j0:je] += -kappa_h * (s_tile.T @ gl_u)
+                            gc = (kappa_h / eps_h) * torch.outer(gl_u, torch.ones(je-j0, device=device)) * s_tile
+                            inv_sqrt_dh = 1.0 / (d_h ** 0.5)
+                            grad_Q_ln[b_idx, h_idx, i0:ie] += (-inv_sqrt_dh) * (gc @ K_ln[b_idx, h_idx, j0:je])
+                            grad_K_ln[b_idx, h_idx, j0:je] += (-inv_sqrt_dh) * (gc.T @ Q_ln[b_idx, h_idx, i0:ie])
+                            if dist_t is not None:
+                                geo_gc = w_h * r_0 / (r_0 + dist_t) ** 2
+                                wt = gc * geo_gc / dist_t.clamp(min=1e-8)
+                                grad_x_cost[b_idx, i0:ie] += (wt.unsqueeze(-1) * diff_t).sum(dim=1)
+                                grad_x_cost[b_idx, j0:je] -= (wt.unsqueeze(-1) * diff_t).sum(dim=0)
+                                grad_w_dist[h_idx] += (gc * dist_t / (r_0 + dist_t)).sum()
+                            grad_pos_bias[b_idx, h_idx, i0:ie, j0:je] += gc
+
+                        grad_log_mu[b_idx, h_idx, i0:ie] += kappa_h * gl_u
+
+            # Prepare for next iteration (going backward)
+            grad_log_v = grad_log_v_new
+            grad_log_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+
+        # ---- Step 4: Cost gradient from transport output (already in _backward_gv_grad_V_kernel) ----
+        # The cost gradient from the transport output was computed in Step 2 via g_v.
+        # The unrolled backward above adds the cost gradient from the Sinkhorn iterations.
         # Combine x_res gradients
         grad_x_res = grad_x_transport + grad_x_cost
-
-        # Marginal gradients from IFT
-        grad_log_mu = kappa[None, :, None] * z_u  # (B, H, N)
-        grad_log_nu = kappa[None, :, None] * z_v
 
         # Return gradients for: Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
         #   log_mu, log_nu, K_iter, lam, r_0, log_u_init, log_v_init, BLOCK, mask_bias

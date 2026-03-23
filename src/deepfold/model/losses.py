@@ -93,16 +93,17 @@ def weighted_rigid_align(
     # Weighted cross-covariance: H = P^T W X
     H = torch.einsum("bni,bnj->bij", w * pred_centered, true_centered)
 
-    # SVD in float32 for numerical stability
-    H_f32 = H.float()
-    U, S, Vh = torch.linalg.svd(H_f32)
-    V = Vh.mH  # (B, 3, 3)
+    # SVD in float32 — disable autocast to prevent BF16 matmuls in det/einsum
+    with torch.amp.autocast(H.device.type, enabled=False):
+        H_f32 = H.float()
+        U, S, Vh = torch.linalg.svd(H_f32)
+        V = Vh.mH  # (B, 3, 3)
 
-    # Ensure proper rotation (det=+1)
-    d = torch.det(U @ Vh).sign()  # (B,)
-    D = torch.ones(H.shape[0], 3, device=H.device, dtype=H_f32.dtype)
-    D[:, -1] = d
-    R = torch.einsum("bij,bjk,blk->bil", U, torch.diag_embed(D), V)
+        # Ensure proper rotation (det=+1)
+        d = torch.det(U @ Vh).sign()  # (B,)
+        D = torch.ones(H.shape[0], 3, device=H.device, dtype=H_f32.dtype)
+        D[:, -1] = d
+        R = torch.einsum("bij,bjk,blk->bil", U, torch.diag_embed(D), V)
     R = R.to(true_coords.dtype)
 
     # Apply rotation + translation

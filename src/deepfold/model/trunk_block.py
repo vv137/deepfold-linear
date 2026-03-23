@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
+from deepfold.model.sinkhorn import sinkhorn_solve, compute_transport_output
 from deepfold.model.primitives import SwiGLU
 
 K_ITER = 20
@@ -134,17 +135,43 @@ class TokenUOTBlock(nn.Module):
         if geo_gate is not None:
             effective_w_dist = geo_gate * w_dist
 
-        log_mu = torch.log(mu.clamp(min=1e-8))  # (B, H, N)
-        log_nu = torch.log(nu.clamp(min=1e-8))
+        # FP32 for log marginals — BF16 underflows the softmax Jacobian
+        # in the backward, killing gradient to mu_proj/nu_proj.
+        log_mu = torch.log(mu.float().clamp(min=1e-8))  # (B, H, N)
+        log_nu = torch.log(nu.float().clamp(min=1e-8))
 
-        # Flash Sinkhorn: O(N) memory, Triton forward + CG-based IFT backward
-        o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            self.eps, effective_w_dist, log_mu, log_nu,
-            K_iter=K_ITER, lam=1.0, r_0=self.r_0,
-            log_u_init=log_u_prev, log_v_init=log_v_prev,
-            mask=mask,
-        )
+        if self.training:
+            # Training: dense unrolled Sinkhorn. Autograd through K iterations
+            # gives correct gradients for mu_proj, nu_proj, coevol params.
+            # IFT backward for UOT is still under development (Schur complement
+            # CG with 1/κ diagonal correction — correct direction but wrong magnitude).
+            content = -torch.einsum("bhid,bhjd->bhij", Q_ln, K_ln) / (d_h**0.5)
+            dist = torch.cdist(x_res, x_res)
+            f_dist = dist / (self.r_0 + dist)
+            geo_bias = effective_w_dist[None, :, None, None] * f_dist[:, None, :, :]
+            C = content + pos_bias + geo_bias
+
+            eps_fp32 = self.eps.float()
+            init_u = log_u_prev.float() if log_u_prev is not None else None
+            init_v = log_v_prev.float() if log_v_prev is not None else None
+            log_u, log_v = sinkhorn_solve(
+                C.float(), log_mu.float(), log_nu.float(),
+                eps=eps_fp32, lam=1.0, K=K_ITER,
+                log_u_init=init_u, log_v_init=init_v, mask=mask,
+            )
+            o, _, x_centroid = compute_transport_output(
+                V.float(), G.float(), log_u, log_v, C.float(), eps_fp32,
+                x_res.float(), mask=mask,
+            )
+        else:
+            # Inference: flash Sinkhorn (O(N) memory, Triton forward)
+            o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
+                Q_ln, K_ln, V, G, x_res, pos_bias,
+                self.eps, effective_w_dist, log_mu, log_nu,
+                K_iter=K_ITER, lam=1.0, r_0=self.r_0,
+                log_u_init=log_u_prev, log_v_init=log_v_prev,
+                mask=mask,
+            )
         # o: (B, N, H*d_h), x_centroid: (B, H, N, 3)
         # log_u: (B, H, N), log_v: (B, H, N)
 

@@ -135,7 +135,7 @@ def compute_transport_output(
 
     Returns:
         o:       (N, H*d_h) or (B, N, H*d_h) gated output
-        T_norm:  (H, N, N) or (B, H, N, N) row-normalized transport (for EGNN)
+        T_norm:  (H, N, N) or (B, H, N, N) normalized transport (for EGNN)
         x_centroid: (H, N, 3) or (B, H, N, 3) or None if x_res is None
     """
     unbatched = C.dim() == 3
@@ -164,6 +164,10 @@ def compute_transport_output(
     T = torch.exp(log_score - row_max)  # (B, H, N, N) safe: <= 1
     T_sum = T.sum(dim=-1, keepdim=True)  # (B, H, N, 1)
     T_norm = T / (T_sum + 1e-6)  # (B, H, N, N) row-stochastic
+
+    # Note: ∂T_norm/∂log_u = 0 (log_u cancels in T/row_sum). The gradient
+    # to log_mu flows through g_v → Sinkhorn iterations → log_mu, NOT
+    # through T_norm directly. This is correct with unrolled autograd.
 
     # Zero out padded rows
     if mask is not None:

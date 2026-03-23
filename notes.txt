@@ -1,0 +1,3 @@
+
+uv run torchrun --nproc_per_node=8 scripts/train.py --config configs/kakao.yaml --data-dir /home/jovyan/train/rcsb_processed_targets/structures --manifest /home/jovyan/train/rcsb_processed_targets/manifest.json --release-cutoff 2021-09-30 --save-every 125 --log-every 1 --seed 42 --num-workers 8
+claude --resume "batch-triton-kernels-wire"
