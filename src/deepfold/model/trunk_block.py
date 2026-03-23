@@ -183,7 +183,7 @@ class TokenUOTBlock(nn.Module):
 
         # ---- EGNN x_res update (equivariant, SPEC §8) ----
         delta = x_res.unsqueeze(1).float() - x_centroid  # (B, H, N, 3)
-        x_update = torch.einsum("h,bhnc->bnc", self.gamma, delta)  # (B, N, 3)
+        x_update = torch.einsum("h,bhnc->bnc", self.gamma.tanh(), delta)  # (B, N, 3)
         x_update = x_update * mask.unsqueeze(-1)
         x_res = x_res + x_update.to(x_res.dtype)
 

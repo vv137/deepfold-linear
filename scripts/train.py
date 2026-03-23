@@ -1,6 +1,7 @@
 """Training script for DeepFold-Linear."""
 
 import argparse
+import gc
 import logging
 import multiprocessing
 import os
@@ -241,20 +242,30 @@ def main():
         raise FileNotFoundError(f"No NPZ files found in {data_dir}")
 
     # Filter by release date cutoff if manifest + cutoff provided
+    # Structures <= cutoff → train, structures > cutoff → auto val (if no --val-data-dir)
+    val_paths_from_cutoff = []
     if args.release_cutoff and args.manifest:
         import json
         with open(args.manifest) as f:
             manifest = json.load(f)
-        valid_ids = {
-            r["id"] for r in manifest
-            if r.get("structure", {}).get("released", "9999") <= args.release_cutoff
+        release_by_id = {
+            r["id"]: r.get("structure", {}).get("released", "9999")
+            for r in manifest
         }
         before = len(train_paths)
-        train_paths = [p for p in train_paths if p.stem in valid_ids]
+        val_paths_from_cutoff = [
+            p for p in train_paths
+            if p.stem in release_by_id and release_by_id[p.stem] > args.release_cutoff
+        ]
+        train_paths = [
+            p for p in train_paths
+            if p.stem in release_by_id and release_by_id[p.stem] <= args.release_cutoff
+        ]
         if rank0:
             logger.info(
-                "Release cutoff %s: %d → %d structures (%.1f%%)",
+                "Release cutoff %s: %d → %d train, %d val (%.1f%% train)",
                 args.release_cutoff, before, len(train_paths),
+                len(val_paths_from_cutoff),
                 100 * len(train_paths) / before,
             )
         if not train_paths:
@@ -327,22 +338,25 @@ def main():
 
     val_loader = None
     if args.val_data_dir:
-        val_dir = Path(args.val_data_dir)
-        val_paths = sorted(val_dir.glob("*.npz"))
-        if val_paths:
-            val_dataset = DeepFoldDataset(
-                data_paths=val_paths, max_tokens=get_crop_size(start_step), training=True
-            )
-            val_sampler = DistributedSampler(val_dataset, shuffle=False) if use_ddp else None
-            val_loader = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                sampler=val_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                collate_fn=collate_fn,
-            )
+        val_paths = sorted(Path(args.val_data_dir).glob("*.npz"))
+    elif val_paths_from_cutoff:
+        val_paths = val_paths_from_cutoff
+    else:
+        val_paths = []
+    if val_paths:
+        val_dataset = DeepFoldDataset(
+            data_paths=val_paths, max_tokens=get_crop_size(start_step), training=True
+        )
+        val_sampler = DistributedSampler(val_dataset, shuffle=True) if use_ddp else None
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=(val_sampler is None),
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
 
     if rank0:
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -399,6 +413,7 @@ def main():
                 is_accumulating=not is_last_micro,
             )
 
+            del batch
             if result is None:
                 step_oom = True
                 break
@@ -445,6 +460,8 @@ def main():
 
         # Validation
         if val_loader and step % args.val_every == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
             raw_model = model.module if use_ddp else model
             ema.apply(raw_model)
             val_metrics_sum = {k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")}
@@ -455,7 +472,11 @@ def main():
                 for k in val_metrics_sum:
                     val_metrics_sum[k] += vm[k]
                 n_val += 1
+                del val_batch, vm
             ema.restore(raw_model)
+            del raw_model
+            gc.collect()
+            torch.cuda.empty_cache()
             if rank0 and n_val > 0:
                 val_avg = {k: v / n_val for k, v in val_metrics_sum.items()}
                 logger.info(
