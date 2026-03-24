@@ -77,7 +77,7 @@ def main():
     )
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--val-every", type=int, default=5_000)
+    parser.add_argument("--val-every", type=int, default=1_000)
     parser.add_argument("--val-batches", type=int, default=50,
                         help="Max batches per validation run (0=all)")
     parser.add_argument("--num-workers", type=int, default=4)

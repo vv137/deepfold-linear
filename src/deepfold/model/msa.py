@@ -241,7 +241,7 @@ class MSABlock(nn.Module):
                         c_bar_accum, c_bar_tile, prot_indices[:, i0:ie]
                     )
 
-        h_res = h_res + self.coevol_out(h_agg)
+        h_res = h_res + self.coevol_out(h_agg / max(N_prot, 1))
         c_bar = c_bar_accum / max(N_prot, 1)  # (B, N, r)
 
         # ---- 5. Marginal update ----
