@@ -21,7 +21,7 @@ SIGMA_DATA = 16.0
 SIGMA_MAX = 160.0
 SIGMA_MIN = 0.002
 P_MEAN = -1.2
-P_STD = 1.2
+P_STD = 1.5
 RHO = 7.0
 
 
@@ -36,9 +36,9 @@ def edm_preconditioning(sigma: torch.Tensor):
 
 
 def sample_training_sigma(batch_size: int, device: torch.device) -> torch.Tensor:
-    """Sample training noise levels: ln(sigma) ~ N(P_mean, P_std^2) (SPEC §12)."""
+    """Sample training noise levels: σ = σ_data · exp(N(P_mean, P_std²)) (Boltz-1)."""
     ln_sigma = torch.randn(batch_size, device=device) * P_STD + P_MEAN
-    return ln_sigma.exp()
+    return SIGMA_DATA * ln_sigma.exp()
 
 
 def karras_schedule(n_steps: int, device: torch.device) -> torch.Tensor:
