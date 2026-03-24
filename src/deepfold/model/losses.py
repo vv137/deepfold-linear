@@ -140,9 +140,15 @@ def edm_diffusion_loss(
     # Unbatched path → add batch dim, run batched, squeeze
     if x_pred.dim() == 2:
         return edm_diffusion_loss(
-            x_pred.unsqueeze(0), x_true.unsqueeze(0), sigma.unsqueeze(0),
-            resolved_mask=resolved_mask.unsqueeze(0) if resolved_mask is not None else None,
-            atom_weights=atom_weights.unsqueeze(0) if atom_weights is not None else None,
+            x_pred.unsqueeze(0),
+            x_true.unsqueeze(0),
+            sigma.unsqueeze(0),
+            resolved_mask=resolved_mask.unsqueeze(0)
+            if resolved_mask is not None
+            else None,
+            atom_weights=atom_weights.unsqueeze(0)
+            if atom_weights is not None
+            else None,
         )
 
     # Batched path: (B, N_atom, 3)
@@ -209,7 +215,9 @@ def smooth_lddt(
     """
     # Unbatched path
     if x_pred.dim() == 2:
-        return _smooth_lddt_single(x_pred, x_true, cutoff, thresholds, slope, resolved_mask)
+        return _smooth_lddt_single(
+            x_pred, x_true, cutoff, thresholds, slope, resolved_mask
+        )
 
     # Batched path: (B, M, 3)
     B, M, _ = x_pred.shape
@@ -350,14 +358,10 @@ class DistogramLoss(nn.Module):
         # Triton fast path: eval/inference only (kernel fuses atomic_add,
         # which breaks autograd for w_u/w_v/to_bins gradients).
         # Only used when no valid_mask (no padding) for simplicity.
-        if (
-            not self.training
-            and _HAS_TRITON
-            and h_res.is_cuda
-            and valid_mask is None
-        ):
+        if not self.training and _HAS_TRITON and h_res.is_cuda and valid_mask is None:
             return triton_distogram_loss(
-                U, V,
+                U,
+                V,
                 self.to_bins.weight,
                 self.to_bins.bias,
                 target_bins,
@@ -388,17 +392,25 @@ class DistogramLoss(nn.Module):
                         m = valid_mask[b, i0:ie, j0:je] > 0
                         if m.any():
                             tile_n = m.sum().item()
-                            sample_loss = sample_loss + F.cross_entropy(
-                                logits[m].float(), targets[m], reduction="mean"
-                            ) * tile_n
+                            sample_loss = (
+                                sample_loss
+                                + F.cross_entropy(
+                                    logits[m].float(), targets[m], reduction="mean"
+                                )
+                                * tile_n
+                            )
                             sample_count += tile_n
                     else:
                         tile_n = (ie - i0) * (je - j0)
-                        sample_loss = sample_loss + F.cross_entropy(
-                            logits.reshape(-1, self.num_bins).float(),
-                            targets.reshape(-1),
-                            reduction="mean",
-                        ) * tile_n
+                        sample_loss = (
+                            sample_loss
+                            + F.cross_entropy(
+                                logits.reshape(-1, self.num_bins).float(),
+                                targets.reshape(-1),
+                                reduction="mean",
+                            )
+                            * tile_n
+                        )
                         sample_count += tile_n
 
             if sample_count > 0:
@@ -445,17 +457,25 @@ class DistogramLoss(nn.Module):
                     m = valid_mask[i0:ie, j0:je] > 0
                     if m.any():
                         tile_n = m.sum().item()
-                        total_loss = total_loss + F.cross_entropy(
-                            logits[m].float(), targets[m], reduction="mean"
-                        ) * tile_n
+                        total_loss = (
+                            total_loss
+                            + F.cross_entropy(
+                                logits[m].float(), targets[m], reduction="mean"
+                            )
+                            * tile_n
+                        )
                         count += tile_n
                 else:
                     tile_n = (ie - i0) * (je - j0)
-                    total_loss = total_loss + F.cross_entropy(
-                        logits.reshape(-1, self.num_bins).float(),
-                        targets.reshape(-1),
-                        reduction="mean",
-                    ) * tile_n
+                    total_loss = (
+                        total_loss
+                        + F.cross_entropy(
+                            logits.reshape(-1, self.num_bins).float(),
+                            targets.reshape(-1),
+                            reduction="mean",
+                        )
+                        * tile_n
+                    )
                     count += tile_n
 
         return (total_loss / max(count, 1)).squeeze()
@@ -539,4 +559,9 @@ def total_loss(
     Default weights: L_diff + L_lddt + 0.2*L_disto + 0.5*L_trunk_coord.
     Configurable via loss_weights in model.yaml.
     """
-    return w_diff * l_diff + w_lddt * l_lddt + w_disto * l_disto + w_trunk_coord * l_trunk_coord
+    return (
+        w_diff * l_diff
+        + w_lddt * l_lddt
+        + w_disto * l_disto
+        + w_trunk_coord * l_trunk_coord
+    )

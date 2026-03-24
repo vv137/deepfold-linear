@@ -17,11 +17,25 @@ DEVICE = torch.device("cuda")
 # 1. Sinkhorn: PyTorch (materialized N×N) vs Triton (tiled, no N×N storage)
 # ============================================================================
 
-def pytorch_sinkhorn_full(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter, lam=1.0, r_0=10.0):
+
+def pytorch_sinkhorn_full(
+    Q_ln,
+    K_ln,
+    V,
+    x_res,
+    pos_bias,
+    eps,
+    w_dist,
+    log_mu,
+    log_nu,
+    K_iter,
+    lam=1.0,
+    r_0=10.0,
+):
     """Reference PyTorch: full N×N cost matrix + Sinkhorn + transport output."""
     H, N, d_h = Q_ln.shape
 
-    content = -torch.einsum("hid,hjd->hij", Q_ln, K_ln) / (d_h ** 0.5)
+    content = -torch.einsum("hid,hjd->hij", Q_ln, K_ln) / (d_h**0.5)
     dist = torch.cdist(x_res, x_res)
     geo = w_dist[:, None, None] * dist / (r_0 + dist)
     C = content + pos_bias + geo
@@ -32,8 +46,12 @@ def pytorch_sinkhorn_full(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, l
     log_v = torch.zeros(H, N, device=C.device, dtype=torch.float32)
 
     for _ in range(K_iter):
-        log_u = kappa[:, None] * (log_mu - torch.logsumexp(log_K + log_v[:, None, :], dim=-1))
-        log_v = kappa[:, None] * (log_nu - torch.logsumexp(log_K + log_u[:, :, None], dim=-2))
+        log_u = kappa[:, None] * (
+            log_mu - torch.logsumexp(log_K + log_v[:, None, :], dim=-1)
+        )
+        log_v = kappa[:, None] * (
+            log_nu - torch.logsumexp(log_K + log_u[:, :, None], dim=-2)
+        )
 
     log_score = log_u[:, :, None] + log_K + log_v[:, None, :]
     row_max = log_score.max(dim=-1, keepdim=True).values
@@ -55,7 +73,11 @@ def bench_sinkhorn(N, H=16, d_h=32, K_iter=7, n_warmup=5, n_iter=20):
     V = torch.randn(H, N, d_h, device=DEVICE, dtype=torch.float32)
     x_res = torch.randn(N, 3, device=DEVICE, dtype=torch.float32) * 10
     pos_bias = torch.randn(H, N, N, device=DEVICE, dtype=torch.float32) * 0.1
-    eps = torch.tensor([0.5]*4 + [1.0]*4 + [2.0]*4 + [4.0]*4, device=DEVICE, dtype=torch.float32)
+    eps = torch.tensor(
+        [0.5] * 4 + [1.0] * 4 + [2.0] * 4 + [4.0] * 4,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
     w_dist = torch.randn(H, device=DEVICE, dtype=torch.float32) * 0.1
     log_mu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
     log_nu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
@@ -75,39 +97,53 @@ def bench_sinkhorn(N, H=16, d_h=32, K_iter=7, n_warmup=5, n_iter=20):
     # PyTorch timing
     torch.cuda.synchronize()
     for _ in range(n_warmup):
-        pytorch_sinkhorn_full(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter)
+        pytorch_sinkhorn_full(
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(n_iter):
-        pytorch_sinkhorn_full(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter)
+        pytorch_sinkhorn_full(
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter
+        )
     torch.cuda.synchronize()
     t_pytorch = (time.perf_counter() - t0) / n_iter * 1000
 
     # Triton timing
     torch.cuda.synchronize()
     for _ in range(n_warmup):
-        flash_sinkhorn(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter)
+        flash_sinkhorn(
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(n_iter):
-        flash_sinkhorn(Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter)
+        flash_sinkhorn(
+            Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu, K_iter
+        )
     torch.cuda.synchronize()
     t_triton = (time.perf_counter() - t0) / n_iter * 1000
 
     mem_pytorch_MB = H * N * N * 4 / 1e6  # N×N cost matrix
-    mem_triton_MB = H * N * 4 * 2 / 1e6   # only log_u, log_v
+    mem_triton_MB = H * N * 4 * 2 / 1e6  # only log_u, log_v
 
     return {
-        "N": N, "pytorch_ms": t_pytorch, "triton_ms": t_triton,
+        "N": N,
+        "pytorch_ms": t_pytorch,
+        "triton_ms": t_triton,
         "speedup": t_pytorch / max(t_triton, 1e-6),
-        "log_u_err": lu_err, "O_err": o_err, "xc_err": xc_err,
-        "mem_pytorch_MB": mem_pytorch_MB, "mem_triton_MB": mem_triton_MB,
+        "log_u_err": lu_err,
+        "O_err": o_err,
+        "xc_err": xc_err,
+        "mem_pytorch_MB": mem_pytorch_MB,
+        "mem_triton_MB": mem_triton_MB,
     }
 
 
 # ============================================================================
 # 2. Co-evolution: Python tiling vs torch.compile
 # ============================================================================
+
 
 def pytorch_coevol_tiled(U, V, h_coevol, w_weight, b_weight, tile_size=64):
     """Reference: Python-level tiling (current implementation)."""
@@ -123,7 +159,9 @@ def pytorch_coevol_tiled(U, V, h_coevol, w_weight, b_weight, tile_size=64):
             je = min(j0 + tile_size, N)
             V_j = V[:, j0:je, :]
             c_tile = torch.einsum("sir,sjr->ijr", U_i, V_j) / S
-            w_tile = torch.sigmoid(F.linear(c_tile, w_weight.unsqueeze(0), b_weight).squeeze(-1))
+            w_tile = torch.sigmoid(
+                F.linear(c_tile, w_weight.unsqueeze(0), b_weight).squeeze(-1)
+            )
             h_agg[i0:ie] += w_tile @ h_coevol[j0:je]
             c_bar[i0:ie] += c_tile.sum(dim=1)
 
@@ -133,14 +171,18 @@ def pytorch_coevol_tiled(U, V, h_coevol, w_weight, b_weight, tile_size=64):
 def pytorch_coevol_full(U, V, h_coevol, w_weight, b_weight):
     """Vectorized (no tiling) — uses O(N²·R) memory but faster for moderate N."""
     S, N, R = U.shape
-    c = torch.einsum("sir,sjr->ijr", U, V) / S          # (N, N, R)
-    w = torch.sigmoid(F.linear(c, w_weight.unsqueeze(0), b_weight).squeeze(-1))  # (N, N)
-    h_agg = w @ h_coevol                                  # (N, D)
-    c_bar = c.sum(dim=1)                                   # (N, R)
+    c = torch.einsum("sir,sjr->ijr", U, V) / S  # (N, N, R)
+    w = torch.sigmoid(
+        F.linear(c, w_weight.unsqueeze(0), b_weight).squeeze(-1)
+    )  # (N, N)
+    h_agg = w @ h_coevol  # (N, D)
+    c_bar = c.sum(dim=1)  # (N, R)
     return h_agg, c_bar
 
 
 _compiled_coevol = None
+
+
 def compiled_coevol(U, V, h_coevol, w_weight, b_weight):
     global _compiled_coevol
     if _compiled_coevol is None:
@@ -198,16 +240,20 @@ def bench_coevol(N, S=128, R=16, D=512, n_warmup=10, n_iter=20):
 
     return {
         "N": N,
-        "tiled_ms": t_tiled, "vectorized_ms": t_full, "compiled_ms": t_compiled,
+        "tiled_ms": t_tiled,
+        "vectorized_ms": t_full,
+        "compiled_ms": t_compiled,
         "speedup_vec": t_tiled / max(t_full, 1e-6),
         "speedup_comp": t_tiled / max(t_compiled, 1e-6),
-        "err_vec": h_err_full, "err_comp": h_err_comp,
+        "err_vec": h_err_full,
+        "err_comp": h_err_comp,
     }
 
 
 # ============================================================================
 # 3. Distogram: Python tiling vs torch.compile
 # ============================================================================
+
 
 def pytorch_distogram_tiled(U, V, w_bin, bias, target_bins, tile_size=64):
     """Reference: Python-level tiling."""
@@ -231,14 +277,16 @@ def pytorch_distogram_tiled(U, V, w_bin, bias, target_bins, tile_size=64):
 
 def pytorch_distogram_full(U, V, w_bin, bias, target_bins):
     """Vectorized: single pass, O(N²·d_low) memory."""
-    N = U.shape[0]
+    U.shape[0]
     num_bins = w_bin.shape[0]
-    Z = U[:, None, :] * V[None, :, :]             # (N, N, d_low)
-    logits = F.linear(Z, w_bin, bias)               # (N, N, num_bins)
+    Z = U[:, None, :] * V[None, :, :]  # (N, N, d_low)
+    logits = F.linear(Z, w_bin, bias)  # (N, N, num_bins)
     return F.cross_entropy(logits.reshape(-1, num_bins), target_bins.reshape(-1))
 
 
 _compiled_disto = None
+
+
 def compiled_distogram(U, V, w_bin, bias, target_bins):
     global _compiled_disto
     if _compiled_disto is None:
@@ -296,10 +344,13 @@ def bench_distogram(N, d_low=64, num_bins=39, n_warmup=10, n_iter=20):
 
     return {
         "N": N,
-        "tiled_ms": t_tiled, "vectorized_ms": t_full, "compiled_ms": t_compiled,
+        "tiled_ms": t_tiled,
+        "vectorized_ms": t_full,
+        "compiled_ms": t_compiled,
         "speedup_vec": t_tiled / max(t_full, 1e-6),
         "speedup_comp": t_tiled / max(t_compiled, 1e-6),
-        "err_full": err_full, "err_comp": err_comp,
+        "err_full": err_full,
+        "err_comp": err_comp,
     }
 
 
@@ -307,41 +358,66 @@ def bench_distogram(N, d_low=64, num_bins=39, n_warmup=10, n_iter=20):
 # Main
 # ============================================================================
 
+
 def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"{'='*100}")
+    print(f"{'=' * 100}")
 
     # 1. Sinkhorn
-    print("\n## 1. Flash-Sinkhorn: PyTorch (N×N materialized) vs Triton (tiled, no N×N)")
-    print(f"{'N':>6} | {'PyTorch ms':>11} | {'Triton ms':>10} | {'Speedup':>8} | {'log_u err':>10} | {'O_avg err':>10} | {'Mem PT':>8} | {'Mem Tri':>8}")
+    print(
+        "\n## 1. Flash-Sinkhorn: PyTorch (N×N materialized) vs Triton (tiled, no N×N)"
+    )
+    print(
+        f"{'N':>6} | {'PyTorch ms':>11} | {'Triton ms':>10} | {'Speedup':>8} | {'log_u err':>10} | {'O_avg err':>10} | {'Mem PT':>8} | {'Mem Tri':>8}"
+    )
     print("-" * 95)
     for N in [64, 128, 256, 512, 768, 1024]:
         try:
             r = bench_sinkhorn(N, K_iter=7)
-            print(f"{r['N']:>6} | {r['pytorch_ms']:>11.2f} | {r['triton_ms']:>10.2f} | {r['speedup']:>7.2f}x | {r['log_u_err']:>10.2e} | {r['O_err']:>10.2e} | {r['mem_pytorch_MB']:>6.1f}MB | {r['mem_triton_MB']:>6.3f}MB")
+            print(
+                f"{r['N']:>6} | {r['pytorch_ms']:>11.2f} | {r['triton_ms']:>10.2f} | {r['speedup']:>7.2f}x | {r['log_u_err']:>10.2e} | {r['O_err']:>10.2e} | {r['mem_pytorch_MB']:>6.1f}MB | {r['mem_triton_MB']:>6.3f}MB"
+            )
         except Exception as e:
-            print(f"{N:>6} | {'OOM/ERR':>11} | {'---':>10} | {'---':>8} | --- | --- | --- | ---  [{e.__class__.__name__}]")
+            print(
+                f"{N:>6} | {'OOM/ERR':>11} | {'---':>10} | {'---':>8} | --- | --- | --- | ---  [{e.__class__.__name__}]"
+            )
 
     # 2. Co-evolution
-    print(f"\n## 2. Co-evolution (S=128, R=16, D=512): Python tiling vs vectorized vs torch.compile")
-    print(f"{'N':>6} | {'Tiled ms':>10} | {'Vector ms':>10} | {'Compile ms':>11} | {'Vec spdup':>10} | {'Comp spdup':>11} | {'err':>10}")
+    print(
+        "\n## 2. Co-evolution (S=128, R=16, D=512): Python tiling vs vectorized vs torch.compile"
+    )
+    print(
+        f"{'N':>6} | {'Tiled ms':>10} | {'Vector ms':>10} | {'Compile ms':>11} | {'Vec spdup':>10} | {'Comp spdup':>11} | {'err':>10}"
+    )
     print("-" * 90)
     for N in [64, 128, 256, 512]:
         r = bench_coevol(N)
-        print(f"{r['N']:>6} | {r['tiled_ms']:>10.2f} | {r['vectorized_ms']:>10.2f} | {r['compiled_ms']:>11.2f} | {r['speedup_vec']:>9.2f}x | {r['speedup_comp']:>10.2f}x | {r['err_vec']:>10.2e}")
+        print(
+            f"{r['N']:>6} | {r['tiled_ms']:>10.2f} | {r['vectorized_ms']:>10.2f} | {r['compiled_ms']:>11.2f} | {r['speedup_vec']:>9.2f}x | {r['speedup_comp']:>10.2f}x | {r['err_vec']:>10.2e}"
+        )
 
     # 3. Distogram
-    print(f"\n## 3. Distogram Loss (d_low=64, 39 bins): Python tiling vs vectorized vs torch.compile")
-    print(f"{'N':>6} | {'Tiled ms':>10} | {'Vector ms':>10} | {'Compile ms':>11} | {'Vec spdup':>10} | {'Comp spdup':>11} | {'err':>10}")
+    print(
+        "\n## 3. Distogram Loss (d_low=64, 39 bins): Python tiling vs vectorized vs torch.compile"
+    )
+    print(
+        f"{'N':>6} | {'Tiled ms':>10} | {'Vector ms':>10} | {'Compile ms':>11} | {'Vec spdup':>10} | {'Comp spdup':>11} | {'err':>10}"
+    )
     print("-" * 90)
     for N in [64, 128, 256, 512]:
         r = bench_distogram(N)
-        print(f"{r['N']:>6} | {r['tiled_ms']:>10.2f} | {r['vectorized_ms']:>10.2f} | {r['compiled_ms']:>11.2f} | {r['speedup_vec']:>9.2f}x | {r['speedup_comp']:>10.2f}x | {r['err_full']:>10.2e}")
+        print(
+            f"{r['N']:>6} | {r['tiled_ms']:>10.2f} | {r['vectorized_ms']:>10.2f} | {r['compiled_ms']:>11.2f} | {r['speedup_vec']:>9.2f}x | {r['speedup_comp']:>10.2f}x | {r['err_full']:>10.2e}"
+        )
 
-    print(f"\n{'='*100}")
+    print(f"\n{'=' * 100}")
     print("Notes:")
-    print("- Sinkhorn Triton: eliminates O(N²) cost matrix storage, computes distances on-the-fly per tile")
-    print("- Co-evolution/Distogram: torch.compile fuses the Python tile loops automatically")
+    print(
+        "- Sinkhorn Triton: eliminates O(N²) cost matrix storage, computes distances on-the-fly per tile"
+    )
+    print(
+        "- Co-evolution/Distogram: torch.compile fuses the Python tile loops automatically"
+    )
     print("- Memory savings are the primary goal; speed follows at larger N")
 
 

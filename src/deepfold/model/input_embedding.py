@@ -42,7 +42,9 @@ class TokenSingleEmbedding(nn.Module):
             has_msa = has_msa.unsqueeze(0)
 
         token_onehot = F.one_hot(token_type.long(), 4).float()  # (B, N, 4)
-        feat = torch.cat([token_onehot, profile, del_mean, has_msa], dim=-1)  # (B, N, 38)
+        feat = torch.cat(
+            [token_onehot, profile, del_mean, has_msa], dim=-1
+        )  # (B, N, 38)
         out = self.proj(feat)  # (B, N, 512)
 
         if unbatched:

@@ -129,7 +129,7 @@ class Trunk(nn.Module):
 
         device = token_type.device
         B, N = token_type.shape
-        N_atom = token_idx.shape[1]
+        token_idx.shape[1]
 
         if token_pad_mask is None:
             token_pad_mask = token_type.new_ones(B, N).float()
@@ -145,8 +145,10 @@ class Trunk(nn.Module):
         # Atom-to-token encoder (runs once, SPEC §3.5)
         # Per-sample loop: atom encoder uses scatter_mean with sample-specific indices
         atom_agg = torch.stack(
-            [self.atom_encoder(c_atom[b], p_lm[b], p_lm_idx[b], token_idx[b], N)
-             for b in range(B)],
+            [
+                self.atom_encoder(c_atom[b], p_lm[b], p_lm_idx[b], token_idx[b], N)
+                for b in range(B)
+            ],
             dim=0,
         )  # (B, N, d_model)
         h_res = h_res + atom_agg
@@ -158,7 +160,9 @@ class Trunk(nn.Module):
 
         # Initial coordinates: randn * sigma_data, centered per sample (SPEC §5.2)
         x_res = torch.randn(B, N, 3, device=device) * self.sigma_data * mask_3d
-        x_res = x_res - (x_res * mask_3d).sum(dim=1, keepdim=True) / mask_sum.unsqueeze(-1)
+        x_res = x_res - (x_res * mask_3d).sum(dim=1, keepdim=True) / mask_sum.unsqueeze(
+            -1
+        )
         x_res = x_res * mask_3d
 
         # Precompute position bins
@@ -196,14 +200,26 @@ class Trunk(nn.Module):
             # ---- MSA blocks x4 (SPEC §6) ----
             if is_last:
                 m, h_res, mu_new, nu_new = self.msa_module(
-                    m, h_res, mu, nu, protein_mask, msa_bins,
-                    msa_pad_mask=msa_pad_mask, training=self.training,
+                    m,
+                    h_res,
+                    mu,
+                    nu,
+                    protein_mask,
+                    msa_bins,
+                    msa_pad_mask=msa_pad_mask,
+                    training=self.training,
                 )
             else:
                 with torch.no_grad():
                     m, h_res, mu_new, nu_new = self.msa_module(
-                        m, h_res, mu, nu, protein_mask, msa_bins,
-                        msa_pad_mask=msa_pad_mask, training=self.training,
+                        m,
+                        h_res,
+                        mu,
+                        nu,
+                        protein_mask,
+                        msa_bins,
+                        msa_pad_mask=msa_pad_mask,
+                        training=self.training,
                     )
 
             # Marginal carry: log-space geometric blend (SPEC §5.2)
@@ -298,7 +314,6 @@ def _compute_msa_bins_batched(
     from deepfold.model.msa import _build_protein_indices
 
     B, N = chain_id.shape
-    device = chain_id.device
 
     prot_indices = _build_protein_indices(protein_mask, N_prot)  # (B, N_prot)
 

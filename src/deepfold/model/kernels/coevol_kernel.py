@@ -92,7 +92,7 @@ def _coevol_kernel(
 
     # Load projection weights once — R is small (16)
     r_idx = tl.arange(0, R)  # (R,)
-    w_weight = tl.load(W_WEIGHT_ptr + r_idx, mask=r_idx < R)  # (R,)
+    tl.load(W_WEIGHT_ptr + r_idx, mask=r_idx < R)  # (R,)
     b_weight = tl.load(B_WEIGHT_ptr)  # scalar
 
     # c_bar accumulator: (BLOCK_I, R) — stored across j-tile loop

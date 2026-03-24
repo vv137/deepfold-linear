@@ -76,17 +76,19 @@ def _ensure_fields(arr: np.ndarray, required: list[str]) -> bool:
 # 0=PROTEIN, 1=DNA, 2=RNA, 3=NONPOLYMER
 
 # Token dtype matching what _process() expects
-_TOKEN_DTYPE = np.dtype([
-    ("token_idx", "i8"),
-    ("asym_id", "i8"),
-    ("res_idx", "i8"),
-    ("res_type", "i8"),
-    ("mol_type", "i8"),
-    ("atom_idx", "i8"),
-    ("atom_num", "i8"),
-    ("center_coords", "f4", (3,)),
-    ("resolved_mask", "?"),
-])
+_TOKEN_DTYPE = np.dtype(
+    [
+        ("token_idx", "i8"),
+        ("asym_id", "i8"),
+        ("res_idx", "i8"),
+        ("res_type", "i8"),
+        ("mol_type", "i8"),
+        ("atom_idx", "i8"),
+        ("atom_num", "i8"),
+        ("center_coords", "f4", (3,)),
+        ("resolved_mask", "?"),
+    ]
+)
 
 _TOKEN_BOND_DTYPE = np.dtype([("token_1", "i8"), ("token_2", "i8")])
 
@@ -110,7 +112,10 @@ def tokenize_boltz_structure(struct: dict) -> dict:
     residues = struct["residues"]
     chains = struct["chains"]
     mask = struct.get("mask", np.ones(len(chains), dtype=bool))
-    raw_bonds = struct.get("bonds", np.array([], dtype=[("atom_1", "i4"), ("atom_2", "i4"), ("type", "i1")]))
+    raw_bonds = struct.get(
+        "bonds",
+        np.array([], dtype=[("atom_1", "i4"), ("atom_2", "i4"), ("type", "i1")]),
+    )
     connections = struct.get("connections", np.array([]))
 
     # --- Build per-residue chain info (vectorized) ---
@@ -124,8 +129,8 @@ def tokenize_boltz_structure(struct: dict) -> dict:
             continue
         rs = int(chain["res_idx"])
         rn = int(chain["res_num"])
-        res_mol_type[rs:rs + rn] = int(chain["mol_type"])
-        res_asym_id[rs:rs + rn] = int(chain["asym_id"])
+        res_mol_type[rs : rs + rn] = int(chain["mol_type"])
+        res_asym_id[rs : rs + rn] = int(chain["asym_id"])
 
     # --- Identify valid residues (belonging to unmasked chains) ---
     valid_res_mask = np.zeros(n_res, dtype=bool)
@@ -133,7 +138,7 @@ def tokenize_boltz_structure(struct: dict) -> dict:
         if mask[ci]:
             rs = int(chain["res_idx"])
             rn = int(chain["res_num"])
-            valid_res_mask[rs:rs + rn] = True
+            valid_res_mask[rs : rs + rn] = True
 
     # --- Separate standard vs non-standard residues ---
     is_standard = residues["is_standard"] & valid_res_mask
@@ -152,10 +157,15 @@ def tokenize_boltz_structure(struct: dict) -> dict:
         result = dict(struct)
         result["tokens"] = np.array([], dtype=_TOKEN_DTYPE)
         result["token_bonds"] = np.array([], dtype=_TOKEN_BOND_DTYPE)
-        result["atom_name_indices"] = _atom_name_hash_vectorized(
-            atoms["name"].reshape(-1, atoms["name"].shape[-1]) if atoms["name"].ndim > 1
-            else np.zeros((len(atoms), 4), dtype=np.int8)
-        ) if len(atoms) > 0 else np.array([], dtype=np.int64)
+        result["atom_name_indices"] = (
+            _atom_name_hash_vectorized(
+                atoms["name"].reshape(-1, atoms["name"].shape[-1])
+                if atoms["name"].ndim > 1
+                else np.zeros((len(atoms), 4), dtype=np.int8)
+            )
+            if len(atoms) > 0
+            else np.array([], dtype=np.int64)
+        )
         return result
 
     tokens = np.zeros(n_tokens, dtype=_TOKEN_DTYPE)
@@ -192,8 +202,10 @@ def tokenize_boltz_structure(struct: dict) -> dict:
             tokens["mol_type"][sl] = res_mol_type[ri]
             tokens["atom_idx"][sl] = np.arange(a_start, a_start + a_count)
             tokens["atom_num"][sl] = 1
-            tokens["center_coords"][sl] = atoms["coords"][a_start:a_start + a_count]
-            tokens["resolved_mask"][sl] = atoms["is_present"][a_start:a_start + a_count]
+            tokens["center_coords"][sl] = atoms["coords"][a_start : a_start + a_count]
+            tokens["resolved_mask"][sl] = atoms["is_present"][
+                a_start : a_start + a_count
+            ]
             off += a_count
 
     # --- Build atom_to_token map (vectorized for standard residues) ---
@@ -202,14 +214,14 @@ def tokenize_boltz_structure(struct: dict) -> dict:
         for ti, ri in enumerate(std_idx):
             a_s = int(residues[ri]["atom_idx"])
             a_c = int(residues[ri]["atom_num"])
-            atom_to_token[a_s:a_s + a_c] = ti
+            atom_to_token[a_s : a_s + a_c] = ti
 
     if n_nonstd_tokens > 0:
         off = n_std
         for ri in nonstd_idx:
             a_s = int(residues[ri]["atom_idx"])
             a_c = int(residues[ri]["atom_num"])
-            atom_to_token[a_s:a_s + a_c] = np.arange(off, off + a_c)
+            atom_to_token[a_s : a_s + a_c] = np.arange(off, off + a_c)
             off += a_c
 
     # --- Convert atom-level bonds to token-level (vectorized) ---
@@ -225,10 +237,16 @@ def tokenize_boltz_structure(struct: dict) -> dict:
         t2 = atom_to_token[a2]
         cross = (t1 != t2) & (t1 >= 0) & (t2 >= 0)
         for i in np.where(cross)[0]:
-            lo, hi = (int(t1[i]), int(t2[i])) if t1[i] < t2[i] else (int(t2[i]), int(t1[i]))
+            lo, hi = (
+                (int(t1[i]), int(t2[i])) if t1[i] < t2[i] else (int(t2[i]), int(t1[i]))
+            )
             bond_set.add((lo, hi))
 
-    if len(connections) > 0 and connections.dtype.names and "atom_1" in connections.dtype.names:
+    if (
+        len(connections) > 0
+        and connections.dtype.names
+        and "atom_1" in connections.dtype.names
+    ):
         a1 = connections["atom_1"].astype(np.int64)
         a2 = connections["atom_2"].astype(np.int64)
         valid = (a1 < len(atom_to_token)) & (a2 < len(atom_to_token))
@@ -237,7 +255,9 @@ def tokenize_boltz_structure(struct: dict) -> dict:
         t2 = atom_to_token[a2]
         cross = (t1 != t2) & (t1 >= 0) & (t2 >= 0)
         for i in np.where(cross)[0]:
-            lo, hi = (int(t1[i]), int(t2[i])) if t1[i] < t2[i] else (int(t2[i]), int(t1[i]))
+            lo, hi = (
+                (int(t1[i]), int(t2[i])) if t1[i] < t2[i] else (int(t2[i]), int(t1[i]))
+            )
             bond_set.add((lo, hi))
 
     if bond_set:
@@ -281,7 +301,9 @@ def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
 
     sequences = data["sequences"]
     residues = data["residues"]
-    deletions = data.get("deletions", np.array([], dtype=[("res_idx", "i2"), ("deletion", "i2")]))
+    deletions = data.get(
+        "deletions", np.array([], dtype=[("res_idx", "i2"), ("deletion", "i2")])
+    )
 
     S = len(sequences)
     if S == 0:
@@ -302,7 +324,7 @@ def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
         if n != L:
             # Variable-length alignment — truncate/pad to query length
             n = min(n, L)
-        msa_seqs[i, :n] = residues["res_type"][rs:rs + n]
+        msa_seqs[i, :n] = residues["res_type"][rs : rs + n]
 
         # Sparse deletions → dense
         ds, de = int(seq["del_start"]), int(seq["del_end"])
@@ -430,15 +452,18 @@ class DeepFoldDataset(Dataset):
             raise ValueError(f"No valid tokens (all chains masked): {path.name}")
         atoms = struct["atoms"]
         # Use token-level bonds (from tokenization or pre-existing)
-        bonds = struct.get("token_bonds", struct.get(
-            "bonds", np.array([], dtype=[("token_1", "i8"), ("token_2", "i8")])
-        ))
+        bonds = struct.get(
+            "token_bonds",
+            struct.get(
+                "bonds", np.array([], dtype=[("token_1", "i8"), ("token_2", "i8")])
+            ),
+        )
 
         # Ensure bonds has correct dtype
         if bonds.dtype.names is None or "token_1" not in bonds.dtype.names:
             bonds = np.array([], dtype=[("token_1", "i8"), ("token_2", "i8")])
 
-        N_all = len(tokens)
+        len(tokens)
 
         # 2. Extract token center coords and atom info for cropping (vectorized)
         center_coords = tokens["center_coords"].astype(np.float32)
@@ -498,16 +523,17 @@ class DeepFoldDataset(Dataset):
         # 4-byte name arrays, not single ints).  atom_name_indices is built
         # by tokenize_boltz_structure().
         if "atom_name_indices" in struct and N_atom > 0:
-            atom_name_all = struct["atom_name_indices"][crop.atom_indices].astype(np.int64)
+            atom_name_all = struct["atom_name_indices"][crop.atom_indices].astype(
+                np.int64
+            )
         elif N_atom > 0 and "name" in cropped_atoms.dtype.names:
             name_raw = cropped_atoms["name"]
             if name_raw.ndim > 1:
-                # Multi-byte atom name (Boltz format) — hash each to [0,64)
-                atom_name_all = np.array(
-                    [_atom_name_to_index(n) for n in name_raw], dtype=np.int64
+                raise ValueError(
+                    "Multi-byte atom names require pre-computed atom_name_indices "
+                    "(run tokenize_boltz_structure first)"
                 )
-            else:
-                atom_name_all = name_raw.astype(np.int64)
+            atom_name_all = name_raw.astype(np.int64)
         else:
             atom_name_all = np.zeros(N_atom, dtype=np.int64)
         atom_mask_all = (
@@ -521,11 +547,13 @@ class DeepFoldDataset(Dataset):
         starts = crop.token_to_atom_start
         counts = crop.token_to_atom_count
         for tok_id in range(N):
-            atom_to_token_all[starts[tok_id]:starts[tok_id] + counts[tok_id]] = tok_id
+            atom_to_token_all[starts[tok_id] : starts[tok_id] + counts[tok_id]] = tok_id
 
         # Re-map token bonds to cropped token space (vectorized lookup)
         orig_ids = cropped_tokens["token_idx"].astype(np.int64)
-        orig_to_local = np.full(int(orig_ids.max()) + 1 if N > 0 else 0, -1, dtype=np.int64)
+        orig_to_local = np.full(
+            int(orig_ids.max()) + 1 if N > 0 else 0, -1, dtype=np.int64
+        )
         orig_to_local[orig_ids] = np.arange(N)
         bond_pairs = []
         n_dropped = 0
@@ -541,7 +569,9 @@ class DeepFoldDataset(Dataset):
             bond_pairs = list(zip(l1[keep].tolist(), l2[keep].tolist()))
             n_dropped = int((~keep).sum()) + int((~valid).sum())
         if n_dropped > 0:
-            logger.debug("Dropped %d/%d bonds outside crop window", n_dropped, len(bonds))
+            logger.debug(
+                "Dropped %d/%d bonds outside crop window", n_dropped, len(bonds)
+            )
 
         # MSA mask (vectorized)
         msa_mask = (token_types == const.MOL_PROTEIN) | (token_types == const.MOL_RNA)
@@ -656,7 +686,9 @@ class DeepFoldDataset(Dataset):
             if not this_chain_mask.any():
                 continue
 
-            prot_global_idx = cropped_tokens["res_idx"][this_chain_mask].astype(np.int64)
+            prot_global_idx = cropped_tokens["res_idx"][this_chain_mask].astype(
+                np.int64
+            )
             local_idx = prot_global_idx - chain_res_start
 
             # Clamp out-of-range (shouldn't happen but be safe)

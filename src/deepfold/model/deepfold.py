@@ -149,9 +149,9 @@ class DeepFoldLinear(nn.Module):
             protein_mask,
             token_pad_mask=token_pad_mask,
             # msa_pad_mask from collate is (B, S, N_prot); MSA module expects (B, N_prot)
-            msa_pad_mask=msa_pad_mask.amax(dim=1) if (
-                msa_pad_mask is not None and msa_pad_mask.dim() == 3
-            ) else msa_pad_mask,
+            msa_pad_mask=msa_pad_mask.amax(dim=1)
+            if (msa_pad_mask is not None and msa_pad_mask.dim() == 3)
+            else msa_pad_mask,
         )
 
         result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res}
@@ -207,15 +207,22 @@ class DeepFoldLinear(nn.Module):
                     use_reentrant=False,
                 )
 
-                l_diff_parts.append(edm_diffusion_loss(
-                    x_pred_i, x_true_i, sigma_i,
-                    resolved_mask=atom_resolved_mask,
-                    atom_weights=atom_weights,
-                ))
-                l_lddt_parts.append(smooth_lddt(
-                    x_pred_i, x_true_i,
-                    resolved_mask=atom_resolved_mask,
-                ))
+                l_diff_parts.append(
+                    edm_diffusion_loss(
+                        x_pred_i,
+                        x_true_i,
+                        sigma_i,
+                        resolved_mask=atom_resolved_mask,
+                        atom_weights=atom_weights,
+                    )
+                )
+                l_lddt_parts.append(
+                    smooth_lddt(
+                        x_pred_i,
+                        x_true_i,
+                        resolved_mask=atom_resolved_mask,
+                    )
+                )
 
             # Average over M samples
             l_diff = torch.stack(l_diff_parts).mean()
@@ -230,7 +237,9 @@ class DeepFoldLinear(nn.Module):
             else:
                 # Unbatched: build (N, N) pair mask from resolved mask
                 if token_resolved_mask is not None:
-                    disto_mask = token_resolved_mask[:, None] * token_resolved_mask[None, :]
+                    disto_mask = (
+                        token_resolved_mask[:, None] * token_resolved_mask[None, :]
+                    )
                 else:
                     disto_mask = None
                 l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
@@ -282,7 +291,7 @@ class DeepFoldLinear(nn.Module):
         p_lm = self.atom_pair_embed(p_lm[:, :3], p_lm[:, 4:5])
 
         # Precompute position bins
-        pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
+        compute_bins(chain_id, global_idx, bond_matrix)
 
         # Trunk
         h_res, mu, nu, x_res = self.trunk(

@@ -5,7 +5,6 @@ import math
 import torch.nn as nn
 
 
-
 def _make_small_model():
     """Build a minimal DeepFoldLinear for init testing."""
     from deepfold.model.deepfold import DeepFoldLinear
@@ -86,12 +85,11 @@ class TestDepthScaling:
 
     def test_trunk_w_o_scaled(self):
         model = _make_small_model()
-        n_uot = 4  # small model has 4 blocks
         for name, p in model.named_parameters():
             if "trunk.uot_blocks.0.w_o.weight" in name:
                 fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(p)
                 xavier_std = math.sqrt(2.0 / (fan_in + fan_out))
-                expected_std = xavier_std / math.sqrt(48)  # always uses 48
+                xavier_std / math.sqrt(48)  # always uses 48
                 actual_std = p.std().item()
                 # Scaled down significantly from Xavier
                 assert actual_std < xavier_std * 0.5, (

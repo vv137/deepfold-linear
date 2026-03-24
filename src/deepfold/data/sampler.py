@@ -106,7 +106,10 @@ class ClusterWeightedSampler(Sampler):
         logger.info(
             "ClusterWeightedSampler: %d records, %d clusters, "
             "top weight=%.4f, min weight=%.6f",
-            len(records), n_clusters, self.probs.max(), self.probs.min(),
+            len(records),
+            n_clusters,
+            self.probs.max(),
+            self.probs.min(),
         )
 
     def __iter__(self):
@@ -145,11 +148,14 @@ def load_manifest(manifest_path: str | Path) -> list[Record]:
         records = []
         for entry in data:
             from deepfold.data.types import StructureInfo
-            records.append(Record(
-                id=entry["id"],
-                structure=StructureInfo(**entry["structure"]),
-                chains=[ChainInfo(**c) for c in entry["chains"]],
-            ))
+
+            records.append(
+                Record(
+                    id=entry["id"],
+                    structure=StructureInfo(**entry["structure"]),
+                    chains=[ChainInfo(**c) for c in entry["chains"]],
+                )
+            )
         return records
 
     raise ValueError(f"Unsupported manifest format: {path}")

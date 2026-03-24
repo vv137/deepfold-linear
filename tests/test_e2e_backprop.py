@@ -8,7 +8,6 @@ entire model:
 """
 
 import torch
-import pytest
 
 from deepfold.model.deepfold import DeepFoldLinear
 from deepfold.train.trainer import build_optimizer, get_lr
@@ -199,9 +198,9 @@ class TestEndToEndBackprop:
                 gamma_grads.append((name, p.grad.abs().sum().item()))
 
         assert len(gamma_grads) > 0, "No EGNN γ parameters received gradient"
-        assert any(
-            g > 0 for _, g in gamma_grads
-        ), f"All EGNN γ gradients are zero: {gamma_grads}"
+        assert any(g > 0 for _, g in gamma_grads), (
+            f"All EGNN γ gradients are zero: {gamma_grads}"
+        )
 
     def test_multi_step_training(self):
         """3 training steps: loss stays finite, parameters change."""
@@ -210,9 +209,7 @@ class TestEndToEndBackprop:
         optimizer = build_optimizer(model, lr=1e-3)
         batch = _make_batch()
 
-        initial_params = {
-            name: p.clone() for name, p in model.named_parameters()
-        }
+        initial_params = {name: p.clone() for name, p in model.named_parameters()}
         losses = []
 
         for step in range(3):
@@ -242,9 +239,9 @@ class TestEndToEndBackprop:
         assert n_changed > 0, "No parameters changed after 3 steps"
 
         # All losses finite
-        assert all(
-            torch.isfinite(torch.tensor(l)) for l in losses
-        ), f"NaN/Inf in losses: {losses}"
+        assert all(torch.isfinite(torch.tensor(l)) for l in losses), (
+            f"NaN/Inf in losses: {losses}"
+        )
 
     def test_multi_step_loss_trend(self):
         """5 steps on same batch with high LR: loss should decrease or stay finite."""
@@ -265,9 +262,9 @@ class TestEndToEndBackprop:
             losses.append(loss.item())
 
         # Must not explode
-        assert all(
-            torch.isfinite(torch.tensor(l)) for l in losses
-        ), f"Loss exploded: {losses}"
+        assert all(torch.isfinite(torch.tensor(l)) for l in losses), (
+            f"Loss exploded: {losses}"
+        )
 
     def test_optimizer_three_param_groups(self):
         """Optimizer has 3 groups: decay, no-decay, gamma."""

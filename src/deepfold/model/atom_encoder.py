@@ -116,7 +116,9 @@ class AtomToTokenEncoder(nn.Module):
             pair_bias = torch.zeros(
                 B, H, N_atom, N_atom, device=q.device, dtype=bias.dtype
             )
-            b_idx = torch.arange(B, device=q.device).unsqueeze(1).expand(-1, n_pairs)  # (B, n_pairs)
+            b_idx = (
+                torch.arange(B, device=q.device).unsqueeze(1).expand(-1, n_pairs)
+            )  # (B, n_pairs)
             src_idx = p_lm_idx[..., 0]  # (B, n_pairs)
             dst_idx = p_lm_idx[..., 1]  # (B, n_pairs)
 
@@ -140,12 +142,16 @@ class AtomToTokenEncoder(nn.Module):
             scores = scores + pair_bias
 
         # Mask: only attend within same token (local attention)
-        token_mask = token_idx[:, :, None] == token_idx[:, None, :]  # (B, N_atom, N_atom)
+        token_mask = (
+            token_idx[:, :, None] == token_idx[:, None, :]
+        )  # (B, N_atom, N_atom)
 
         # Apply atom padding mask if batched
         if atom_pad_mask is not None:
             # Both query and key must be real atoms
-            pair_valid = atom_pad_mask[:, :, None] & atom_pad_mask[:, None, :]  # (B, N_atom, N_atom)
+            pair_valid = (
+                atom_pad_mask[:, :, None] & atom_pad_mask[:, None, :]
+            )  # (B, N_atom, N_atom)
             token_mask = token_mask & pair_valid
 
         scores = scores.masked_fill(~token_mask[:, None, :, :], float("-inf"))

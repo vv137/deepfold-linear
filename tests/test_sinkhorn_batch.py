@@ -79,19 +79,17 @@ class TestSinkhornBatchedMasked:
         log_u1, log_v1 = sinkhorn_solve(C1, log_mu1, log_nu1, eps, K=K_iters)
 
         # Unbatched sample 2 (only N2 tokens)
-        log_u2, log_v2 = sinkhorn_solve(C2_raw, log_mu2_raw, log_nu2_raw, eps, K=K_iters)
+        log_u2, log_v2 = sinkhorn_solve(
+            C2_raw, log_mu2_raw, log_nu2_raw, eps, K=K_iters
+        )
 
         # Sample 1 should match exactly
         torch.testing.assert_close(log_u_b[0], log_u1, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(log_v_b[0], log_v1, atol=1e-5, rtol=1e-5)
 
         # Sample 2: real tokens should match
-        torch.testing.assert_close(
-            log_u_b[1, :, :N2], log_u2, atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            log_v_b[1, :, :N2], log_v2, atol=1e-5, rtol=1e-5
-        )
+        torch.testing.assert_close(log_u_b[1, :, :N2], log_u2, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(log_v_b[1, :, :N2], log_v2, atol=1e-5, rtol=1e-5)
 
     def test_mask_excludes_padded(self):
         """Verify padded positions have zero log_u/log_v output."""
@@ -102,8 +100,12 @@ class TestSinkhornBatchedMasked:
         mask[0, :N_real] = 1.0
 
         log_u, log_v = sinkhorn_solve(
-            C.unsqueeze(0), log_mu.unsqueeze(0), log_nu.unsqueeze(0),
-            eps, K=10, mask=mask
+            C.unsqueeze(0),
+            log_mu.unsqueeze(0),
+            log_nu.unsqueeze(0),
+            eps,
+            K=10,
+            mask=mask,
         )
 
         # Padded positions must be zero
@@ -124,9 +126,13 @@ class TestTransportOutputBatched:
 
         # Batched B=1
         o_b, T_b, xc_b = compute_transport_output(
-            V.unsqueeze(0), G.unsqueeze(0),
-            log_u.unsqueeze(0), log_v.unsqueeze(0),
-            C.unsqueeze(0), eps, x_res.unsqueeze(0)
+            V.unsqueeze(0),
+            G.unsqueeze(0),
+            log_u.unsqueeze(0),
+            log_v.unsqueeze(0),
+            C.unsqueeze(0),
+            eps,
+            x_res.unsqueeze(0),
         )
 
         assert o_b.shape == (1, N, H * d_h)
@@ -176,7 +182,9 @@ class TestTransportOutputBatched:
         V_b = torch.stack([V1, V2])
         G_b = torch.stack([G1, G2])
         x_b = torch.stack([x1, x2])
-        o_b, T_b, xc_b = compute_transport_output(V_b, G_b, lu_b, lv_b, C_b, eps, x_b, mask=mask)
+        o_b, T_b, xc_b = compute_transport_output(
+            V_b, G_b, lu_b, lv_b, C_b, eps, x_b, mask=mask
+        )
 
         # Sample 1 matches
         torch.testing.assert_close(o_b[0], o1, atol=1e-5, rtol=1e-5)

@@ -26,7 +26,17 @@ def _make_atom_block_inputs(B, N, N_atom, n_pairs, d_atom=128, d_model=512, seed
     token_idx = torch.randint(0, N, (B, N_atom), generator=g)
     atom_pad_mask = torch.ones(B, N_atom)
     pair_valid_mask = torch.ones(B, n_pairs)
-    return q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx, atom_pad_mask, pair_valid_mask
+    return (
+        q,
+        c_atom,
+        h_cond,
+        p_lm,
+        p_lm_idx,
+        t_emb,
+        token_idx,
+        atom_pad_mask,
+        pair_valid_mask,
+    )
 
 
 class TestAtomBlockBatched:
@@ -35,11 +45,28 @@ class TestAtomBlockBatched:
     def test_atom_block_batched_shape(self):
         B, N, N_atom, n_pairs = 2, 8, 20, 30
         block = AtomBlock(128, 512, 4)
-        q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx, atom_pad_mask, pair_valid_mask = (
-            _make_atom_block_inputs(B, N, N_atom, n_pairs)
+        (
+            q,
+            c_atom,
+            h_cond,
+            p_lm,
+            p_lm_idx,
+            t_emb,
+            token_idx,
+            atom_pad_mask,
+            pair_valid_mask,
+        ) = _make_atom_block_inputs(B, N, N_atom, n_pairs)
+        out = block(
+            q,
+            c_atom,
+            h_cond,
+            p_lm,
+            p_lm_idx,
+            t_emb,
+            token_idx,
+            atom_pad_mask=atom_pad_mask,
+            pair_valid_mask=pair_valid_mask,
         )
-        out = block(q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx,
-                     atom_pad_mask=atom_pad_mask, pair_valid_mask=pair_valid_mask)
         assert out.shape == (B, N_atom, 128)
 
     def test_atom_block_unbatched_compat(self):
@@ -71,16 +98,33 @@ class TestAtomBlockBatched:
         block = AtomBlock(128, 512, 4)
         block.eval()
 
-        q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx, atom_pad_mask, pair_valid_mask = (
-            _make_atom_block_inputs(B, N, N_atom, n_pairs, seed=7)
-        )
+        (
+            q,
+            c_atom,
+            h_cond,
+            p_lm,
+            p_lm_idx,
+            t_emb,
+            token_idx,
+            atom_pad_mask,
+            pair_valid_mask,
+        ) = _make_atom_block_inputs(B, N, N_atom, n_pairs, seed=7)
 
         # Mask out last 3 atoms in sample 1
         atom_pad_mask[1, 7:] = 0
 
         with torch.no_grad():
-            out = block(q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx,
-                        atom_pad_mask=atom_pad_mask, pair_valid_mask=pair_valid_mask)
+            out = block(
+                q,
+                c_atom,
+                h_cond,
+                p_lm,
+                p_lm_idx,
+                t_emb,
+                token_idx,
+                atom_pad_mask=atom_pad_mask,
+                pair_valid_mask=pair_valid_mask,
+            )
 
         # Padded positions should be zero
         assert (out[1, 7:] == 0).all()
@@ -108,8 +152,16 @@ class TestDiffusionModuleBatched:
         atom_pad_mask = torch.ones(B, N_atom)
 
         with torch.no_grad():
-            out = mod(h_res, c_atom, p_lm, p_lm_idx, x_noisy, sigma, token_idx,
-                      atom_pad_mask=atom_pad_mask)
+            out = mod(
+                h_res,
+                c_atom,
+                p_lm,
+                p_lm_idx,
+                x_noisy,
+                sigma,
+                token_idx,
+                atom_pad_mask=atom_pad_mask,
+            )
 
         assert out.shape == (B, N_atom, 3)
 
@@ -156,8 +208,16 @@ class TestDiffusionModuleBatched:
         atom_pad_mask = torch.ones(B, N_atom)
 
         with torch.no_grad():
-            out = mod(h_res, c_atom, p_lm, p_lm_idx, x_noisy, sigma, token_idx,
-                      atom_pad_mask=atom_pad_mask)
+            out = mod(
+                h_res,
+                c_atom,
+                p_lm,
+                p_lm_idx,
+                x_noisy,
+                sigma,
+                token_idx,
+                atom_pad_mask=atom_pad_mask,
+            )
 
         assert out.shape == (B, N_atom, 3)
 
@@ -364,7 +424,9 @@ class TestTritonDistogramLoss:
         )
 
         assert triton_loss.dim() == 0
-        torch.testing.assert_close(triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3
+        )
 
     @torch.no_grad()
     def test_triton_b2_matches_python(self):
@@ -389,4 +451,6 @@ class TestTritonDistogramLoss:
         )
 
         assert triton_loss.dim() == 0
-        torch.testing.assert_close(triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            triton_loss.cpu(), python_loss.cpu(), atol=1e-3, rtol=1e-3
+        )

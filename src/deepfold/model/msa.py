@@ -124,7 +124,12 @@ class MSABlock(nn.Module):
         if N_prot == 0:
             result_m, result_h = m, h_res + 0
             if unbatched:
-                return result_m.squeeze(0), result_h.squeeze(0), mu.squeeze(0), nu.squeeze(0)
+                return (
+                    result_m.squeeze(0),
+                    result_h.squeeze(0),
+                    mu.squeeze(0),
+                    nu.squeeze(0),
+                )
             return result_m, result_h, mu, nu
 
         # Precompute protein indices once for gather/scatter operations
@@ -159,7 +164,9 @@ class MSABlock(nn.Module):
 
         # ---- 3. Column weighted mean ----
         m_n = self.ln_col(m)  # (B, S, N_prot, d_msa)
-        alpha = F.softmax(self.col_weight(m_n), dim=1)  # (B, S, N_prot, 1) softmax over S
+        alpha = F.softmax(
+            self.col_weight(m_n), dim=1
+        )  # (B, S, N_prot, 1) softmax over S
         col_agg = (alpha * m_n).sum(dim=1)  # (B, N_prot, d_msa)
         h_prot_update = self.col_to_single(col_agg)  # (B, N_prot, d_model)
 
@@ -174,14 +181,12 @@ class MSABlock(nn.Module):
         h_coevol = self.coevol_value(h_res)  # (B, N, d_model)
 
         # Triton path: inference only, CUDA only, fuses sigmoid+matmul
-        use_triton = (
-            _HAS_TRITON
-            and not training
-            and h_res.is_cuda
-        )
+        use_triton = _HAS_TRITON and not training and h_res.is_cuda
 
         h_agg = torch.zeros_like(h_res)  # (B, N, d_model)
-        c_bar_accum = torch.zeros(B, N, self.coevol_rank, device=device, dtype=h_res.dtype)
+        c_bar_accum = torch.zeros(
+            B, N, self.coevol_rank, device=device, dtype=h_res.dtype
+        )
 
         if use_triton:
             # Triton kernel does not apply msa_pad_mask (assumes no padding at inference).
@@ -190,15 +195,19 @@ class MSABlock(nn.Module):
 
             with torch.no_grad():
                 h_agg_prot, c_bar_prot = triton_coevol(
-                    U,       # (B, S, N_prot, R)
-                    V_,      # (B, S, N_prot, R)
+                    U,  # (B, S, N_prot, R)
+                    V_,  # (B, S, N_prot, R)
                     h_coevol_prot,  # (B, N_prot, D)
-                    self.coevol_weight.weight.squeeze(0),  # (R,) — Lin(R→1).weight is (1,R)
-                    self.coevol_weight.bias,                # (1,)
+                    self.coevol_weight.weight.squeeze(
+                        0
+                    ),  # (R,) — Lin(R→1).weight is (1,R)
+                    self.coevol_weight.bias,  # (1,)
                 )
             # Scatter protein results back to full token dimension
             _scatter_add_at_indices(h_agg, h_agg_prot.to(h_agg.dtype), prot_indices)
-            _scatter_add_at_indices(c_bar_accum, c_bar_prot.to(c_bar_accum.dtype), prot_indices)
+            _scatter_add_at_indices(
+                c_bar_accum, c_bar_prot.to(c_bar_accum.dtype), prot_indices
+            )
         else:
             TILE = self.tile_size
             for i0 in range(0, N_prot, TILE):
@@ -209,7 +218,9 @@ class MSABlock(nn.Module):
                     je = min(j0 + TILE, N_prot)
                     V_j = V_[:, :, j0:je, :]  # (B, S, tj, r)
 
-                    c_tile = torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S  # (B, ti, tj, r)
+                    c_tile = (
+                        torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S
+                    )  # (B, ti, tj, r)
 
                     w_tile = torch.sigmoid(
                         self.coevol_weight(c_tile).squeeze(-1)
@@ -218,13 +229,17 @@ class MSABlock(nn.Module):
                     # Mask padded positions in j dimension
                     w_tile = w_tile * msa_pad_mask[:, j0:je].unsqueeze(1)
 
-                    h_j = _gather_at_indices(h_coevol, prot_indices[:, j0:je])  # (B, tj, d_model)
+                    h_j = _gather_at_indices(
+                        h_coevol, prot_indices[:, j0:je]
+                    )  # (B, tj, d_model)
                     tile_out = torch.bmm(w_tile, h_j)  # (B, ti, d_model)
                     _scatter_add_at_indices(h_agg, tile_out, prot_indices[:, i0:ie])
 
                     c_bar_tile = c_tile.sum(dim=2)  # (B, ti, r)
                     c_bar_tile = c_bar_tile * msa_pad_mask[:, i0:ie].unsqueeze(-1)
-                    _scatter_add_at_indices(c_bar_accum, c_bar_tile, prot_indices[:, i0:ie])
+                    _scatter_add_at_indices(
+                        c_bar_accum, c_bar_tile, prot_indices[:, i0:ie]
+                    )
 
         h_res = h_res + self.coevol_out(h_agg)
         c_bar = c_bar_accum / max(N_prot, 1)  # (B, N, r)
@@ -234,8 +249,12 @@ class MSABlock(nn.Module):
         nu_logit = self.nu_proj(h_res)  # (B, N, H_res)
 
         # Co-evolution bias masked to protein tokens
-        coevol_bias = self.coevol_to_marginal(c_bar) * protein_mask.unsqueeze(-1).float()
-        bias_t = (alpha_coevol[None, None, :] * coevol_bias).permute(0, 2, 1)  # (B, H_res, N)
+        coevol_bias = (
+            self.coevol_to_marginal(c_bar) * protein_mask.unsqueeze(-1).float()
+        )
+        bias_t = (alpha_coevol[None, None, :] * coevol_bias).permute(
+            0, 2, 1
+        )  # (B, H_res, N)
 
         mu_new = F.softmax(mu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
         nu_new = F.softmax(nu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
@@ -255,9 +274,7 @@ class MSABlock(nn.Module):
         return m, h_res, mu_new, nu_new
 
 
-def _build_protein_indices(
-    protein_mask: torch.Tensor, N_prot: int
-) -> torch.Tensor:
+def _build_protein_indices(protein_mask: torch.Tensor, N_prot: int) -> torch.Tensor:
     """Build (B, N_prot) index tensor of protein positions per batch element.
 
     Uses stable argsort to put True positions first, preserving relative order.
@@ -274,9 +291,7 @@ def _build_protein_indices(
     return sorted_idx[:, :N_prot].contiguous()
 
 
-def _gather_at_indices(
-    h: torch.Tensor, indices: torch.Tensor
-) -> torch.Tensor:
+def _gather_at_indices(h: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     """Gather from h at given indices along dim=1.
 
     Args:
@@ -299,7 +314,9 @@ def _scatter_add_at_indices(
         source: (B, K, D)
         indices: (B, K) long
     """
-    target.scatter_add_(1, indices.unsqueeze(-1).expand_as(source), source.to(target.dtype))
+    target.scatter_add_(
+        1, indices.unsqueeze(-1).expand_as(source), source.to(target.dtype)
+    )
 
 
 class MSAModule(nn.Module):

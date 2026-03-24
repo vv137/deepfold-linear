@@ -297,9 +297,21 @@ def bench_flash_sinkhorn_backward():
                 for t in [Q_data, K_data, V_data, G_data, x_data, pb_data, wd_data]
             ]
             o, xc, _, _ = FlashSinkhornAttn.apply(
-                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g.unsqueeze(0),
-                x.unsqueeze(0), pb.unsqueeze(0), eps, wd,
-                log_mu.unsqueeze(0), log_nu.unsqueeze(0), 7, 1.0, 10.0, None, None
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                g.unsqueeze(0),
+                x.unsqueeze(0),
+                pb.unsqueeze(0),
+                eps,
+                wd,
+                log_mu.unsqueeze(0),
+                log_nu.unsqueeze(0),
+                7,
+                1.0,
+                10.0,
+                None,
+                None,
             )
             (o.sum() + xc.sum()).backward()
             return q.grad, k.grad, v.grad, x.grad, wd.grad, pb.grad
@@ -311,9 +323,21 @@ def bench_flash_sinkhorn_backward():
                 for t in [Q_data, K_data, V_data, x_data, pb_data, wd_data]
             ]
             O, xc, _, _ = FlashSinkhornFunction.apply(
-                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-                x.unsqueeze(0), pb.unsqueeze(0), eps, wd,
-                log_mu.unsqueeze(0), log_nu.unsqueeze(0), 7, 1.0, 10.0, None, None, 32
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                x.unsqueeze(0),
+                pb.unsqueeze(0),
+                eps,
+                wd,
+                log_mu.unsqueeze(0),
+                log_nu.unsqueeze(0),
+                7,
+                1.0,
+                10.0,
+                None,
+                None,
+                32,
             )
             (O.sum() + xc.sum()).backward()
             return q.grad, k.grad, v.grad, x.grad, wd.grad, pb.grad

@@ -19,7 +19,7 @@ def _python_coevol_reference(U, V, h_coevol, w_weight, b_weight):
         c_bar: (N, R)
     """
     S, N, R = U.shape
-    D = h_coevol.shape[1]
+    h_coevol.shape[1]
 
     # c[i,j,r] = (1/S) * sum_s U[s,i,r] * V[s,j,r]
     c = torch.einsum("sir,sjr->ijr", U.float(), V.float()) / S  # (N, N, R)
@@ -94,12 +94,8 @@ def test_triton_coevol_b2_matches_per_sample():
     # Per-sample reference
     for i in range(B):
         h_ref, c_ref = _python_coevol_reference(U[i], V[i], h[i], w, b)
-        torch.testing.assert_close(
-            h_tri[i].cpu(), h_ref.cpu(), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            c_tri[i].cpu(), c_ref.cpu(), atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(h_tri[i].cpu(), h_ref.cpu(), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(c_tri[i].cpu(), c_ref.cpu(), atol=1e-2, rtol=1e-2)
 
 
 @skip_no_triton

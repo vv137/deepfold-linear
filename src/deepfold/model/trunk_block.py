@@ -155,21 +155,44 @@ class TokenUOTBlock(nn.Module):
             init_u = log_u_prev.float() if log_u_prev is not None else None
             init_v = log_v_prev.float() if log_v_prev is not None else None
             log_u, log_v = sinkhorn_solve(
-                C.float(), log_mu.float(), log_nu.float(),
-                eps=eps_fp32, lam=1.0, K=K_ITER,
-                log_u_init=init_u, log_v_init=init_v, mask=mask,
+                C.float(),
+                log_mu.float(),
+                log_nu.float(),
+                eps=eps_fp32,
+                lam=1.0,
+                K=K_ITER,
+                log_u_init=init_u,
+                log_v_init=init_v,
+                mask=mask,
             )
             o, _, x_centroid = compute_transport_output(
-                V.float(), G.float(), log_u, log_v, C.float(), eps_fp32,
-                x_res.float(), mask=mask,
+                V.float(),
+                G.float(),
+                log_u,
+                log_v,
+                C.float(),
+                eps_fp32,
+                x_res.float(),
+                mask=mask,
             )
         else:
             # Inference: flash Sinkhorn (O(N) memory, Triton forward)
             o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
-                Q_ln, K_ln, V, G, x_res, pos_bias,
-                self.eps, effective_w_dist, log_mu, log_nu,
-                K_iter=K_ITER, lam=1.0, r_0=self.r_0,
-                log_u_init=log_u_prev, log_v_init=log_v_prev,
+                Q_ln,
+                K_ln,
+                V,
+                G,
+                x_res,
+                pos_bias,
+                self.eps,
+                effective_w_dist,
+                log_mu,
+                log_nu,
+                K_iter=K_ITER,
+                lam=1.0,
+                r_0=self.r_0,
+                log_u_init=log_u_prev,
+                log_v_init=log_v_prev,
                 mask=mask,
             )
         # o: (B, N, H*d_h), x_centroid: (B, H, N, 3)
@@ -196,5 +219,10 @@ class TokenUOTBlock(nn.Module):
         log_v_out = log_v.to(h.dtype)
 
         if unbatched:
-            return h.squeeze(0), x_res.squeeze(0), log_u_out.squeeze(0), log_v_out.squeeze(0)
+            return (
+                h.squeeze(0),
+                x_res.squeeze(0),
+                log_u_out.squeeze(0),
+                log_v_out.squeeze(0),
+            )
         return h, x_res, log_u_out, log_v_out

@@ -42,7 +42,9 @@ def make_synthetic_batch(N=32, N_atom=64, S=4, device="cuda"):
                 idx_list.append([offset + i, offset + j])
                 disp = torch.randn(3, device=device)
                 inv_d = 1.0 / (1.0 + (disp**2).sum())
-                pair_list.append(torch.cat([disp, inv_d.unsqueeze(0), torch.ones(1, device=device)]))
+                pair_list.append(
+                    torch.cat([disp, inv_d.unsqueeze(0), torch.ones(1, device=device)])
+                )
         offset += c
     if pair_list:
         p_lm = torch.stack(pair_list)  # (n_pairs, 5)
@@ -129,9 +131,7 @@ def main():
     optimizer = build_optimizer(model, lr=1e-4)
 
     N, N_atom = 512, 4096
-    batch = make_synthetic_batch(
-        N=N, N_atom=N_atom, S=4, device=device
-    )
+    batch = make_synthetic_batch(N=N, N_atom=N_atom, S=4, device=device)
 
     print(f"\nTraining {5} steps (N={N}, N_atom={N_atom})...\n")
 

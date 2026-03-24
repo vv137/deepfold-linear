@@ -83,7 +83,10 @@ def _distogram_fwd_kernel(
 
     # Load V_tile: (BLOCK_J, D_LOW)
     v_tile = tl.load(
-        V_ptr + uv_batch_offset + j_idx[:, None] * stride_un + d_idx[None, :] * stride_ud,
+        V_ptr
+        + uv_batch_offset
+        + j_idx[:, None] * stride_un
+        + d_idx[None, :] * stride_ud,
         mask=j_mask[:, None],
         other=0.0,
     )

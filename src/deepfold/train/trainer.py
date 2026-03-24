@@ -86,7 +86,9 @@ def get_lr(
 
 
 def build_optimizer(
-    model: nn.Module, lr: float = 1e-4, weight_decay: float = 0.01,
+    model: nn.Module,
+    lr: float = 1e-4,
+    weight_decay: float = 0.01,
     betas: tuple[float, float] = (0.9, 0.999),
 ) -> AdamW:
     """Build AdamW optimizer with 3 param groups (SPEC §13.1 v4.5).
@@ -124,7 +126,9 @@ def build_optimizer(
 _METRIC_KEYS = ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
 
 
-def _reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str, float]:
+def _reduce_metrics(
+    metrics: dict[str, float], device: torch.device
+) -> dict[str, float]:
     """All-reduce metrics across DDP ranks (mean)."""
     if not dist.is_initialized():
         return metrics
@@ -187,14 +191,18 @@ def train_step(
             scaler.scale(loss).backward()
             if not is_accumulating:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm).item()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                ).item()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
         else:
             loss.backward()
             if not is_accumulating:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm).item()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                ).item()
                 optimizer.step()
                 optimizer.zero_grad()
 

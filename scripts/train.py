@@ -15,8 +15,6 @@ from dotenv import load_dotenv
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-load_dotenv()  # load WANDB_API_KEY from .env
-
 from deepfold.data.crop import get_crop_size, set_crop_schedule
 from deepfold.data.dataset import DeepFoldDataset, collate_fn
 from deepfold.data.sampler import ClusterWeightedSampler, load_manifest
@@ -28,6 +26,7 @@ from deepfold.train.trainer import (
     train_step,
     val_step,
 )
+load_dotenv()  # load WANDB_API_KEY from .env
 
 # Python 3.14 defaults to forkserver which requires picklable worker args.
 # Use fork for compatibility with closures and CUDA context sharing.
@@ -42,19 +41,40 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/model.yaml")
     parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--manifest", type=str, default=None,
-                        help="JSON manifest for cluster-weighted sampling")
-    parser.add_argument("--msa-dir", type=str, default=None,
-                        help="Directory with MSA NPZ files ({pdb}_{chain}.npz)")
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="JSON manifest for cluster-weighted sampling",
+    )
+    parser.add_argument(
+        "--msa-dir",
+        type=str,
+        default=None,
+        help="Directory with MSA NPZ files ({pdb}_{chain}.npz)",
+    )
     parser.add_argument("--val-data-dir", type=str, default=None)
-    parser.add_argument("--output-dir", type=str, default="runs",
-                        help="Base directory for run outputs (auto-generates timestamped subdir)")
-    parser.add_argument("--run-name", type=str, default=None,
-                        help="Custom run name (default: YYYYMMDD_HHMMSS)")
-    parser.add_argument("--checkpoint-dir", type=str, default=None,
-                        help="Override checkpoint directory (default: <run_dir>/checkpoints)")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="runs",
+        help="Base directory for run outputs (auto-generates timestamped subdir)",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Custom run name (default: YYYYMMDD_HHMMSS)",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Override checkpoint directory (default: <run_dir>/checkpoints)",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume from"
+    )
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--val-every", type=int, default=5_000)
@@ -65,8 +85,12 @@ def main():
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--release-cutoff", type=str, default=None,
-                        help="Only train on structures released before this date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--release-cutoff",
+        type=str,
+        default=None,
+        help="Only train on structures released before this date (YYYY-MM-DD)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -112,7 +136,9 @@ def main():
         dist.broadcast_object_list(name_list, src=0)
         run_name = name_list[0]
     run_dir = Path(args.output_dir) / run_name
-    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else run_dir / "checkpoints"
+    checkpoint_dir = (
+        Path(args.checkpoint_dir) if args.checkpoint_dir else run_dir / "checkpoints"
+    )
 
     if rank0:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +152,7 @@ def main():
 
         # Save resolved config for reproducibility
         import yaml as _yaml
+
         config_snapshot = {
             "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
             "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
@@ -158,7 +185,9 @@ def main():
                 "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
                 "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
                 "loss_weights": cfg.loss_weights.to_dict(),
-                "diffusion": {k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)},
+                "diffusion": {
+                    k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)
+                },
                 "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
                 "msa": {k: getattr(cfg.msa, k) for k in vars(cfg.msa)},
                 "args": vars(args),
@@ -192,7 +221,9 @@ def main():
         logger.info("Loss weights: %s", cfg.loss_weights.to_dict())
 
     optimizer = build_optimizer(
-        model, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay,
+        model,
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
         betas=tuple(cfg.training.betas),
     )
     ema = EMA(
@@ -232,7 +263,9 @@ def main():
                 restored.append("rng" if not use_ddp else "rng(reseeded)")
             logger.info(
                 "Resumed from %s at step %d (restored: %s)",
-                args.resume, start_step, ", ".join(restored),
+                args.resume,
+                start_step,
+                ", ".join(restored),
             )
 
     if use_ddp:
@@ -249,30 +282,36 @@ def main():
     val_paths_from_cutoff = []
     if args.release_cutoff and args.manifest:
         import json
+
         with open(args.manifest) as f:
             manifest = json.load(f)
         release_by_id = {
-            r["id"]: r.get("structure", {}).get("released", "9999")
-            for r in manifest
+            r["id"]: r.get("structure", {}).get("released", "9999") for r in manifest
         }
         before = len(train_paths)
         val_paths_from_cutoff = [
-            p for p in train_paths
+            p
+            for p in train_paths
             if p.stem in release_by_id and release_by_id[p.stem] > args.release_cutoff
         ]
         train_paths = [
-            p for p in train_paths
+            p
+            for p in train_paths
             if p.stem in release_by_id and release_by_id[p.stem] <= args.release_cutoff
         ]
         if rank0:
             logger.info(
                 "Release cutoff %s: %d → %d train, %d val (%.1f%% train)",
-                args.release_cutoff, before, len(train_paths),
+                args.release_cutoff,
+                before,
+                len(train_paths),
                 len(val_paths_from_cutoff),
                 100 * len(train_paths) / before,
             )
         if not train_paths:
-            raise FileNotFoundError(f"No structures before cutoff {args.release_cutoff}")
+            raise FileNotFoundError(
+                f"No structures before cutoff {args.release_cutoff}"
+            )
 
     train_dataset = DeepFoldDataset(
         data_paths=train_paths,
@@ -367,8 +406,11 @@ def main():
         effective_batch = batch_size * cfg.training.grad_accum_steps * world_size
         logger.info(
             "Training on %d structures (batch_size=%d, accum=%d, gpus=%d, effective=%d)",
-            len(train_paths), batch_size, cfg.training.grad_accum_steps,
-            world_size, effective_batch,
+            len(train_paths),
+            batch_size,
+            cfg.training.grad_accum_steps,
+            world_size,
+            effective_batch,
         )
         if val_loader:
             logger.info("Validation on %d structures", len(val_paths))
@@ -444,9 +486,15 @@ def main():
             logger.info(
                 "step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f "
                 "grad_norm=%.4f lr=%.6f crop=%d",
-                step, metrics["loss"], metrics["l_diff"], metrics["l_lddt"],
-                metrics["l_disto"], metrics["l_trunk_coord"],
-                metrics["grad_norm"], metrics["lr"], crop_size,
+                step,
+                metrics["loss"],
+                metrics["l_diff"],
+                metrics["l_lddt"],
+                metrics["l_disto"],
+                metrics["l_trunk_coord"],
+                metrics["grad_norm"],
+                metrics["lr"],
+                crop_size,
             )
             if use_wandb and step % cfg.wandb.log_every == 0:
                 wandb.log(
@@ -469,10 +517,14 @@ def main():
             torch.cuda.empty_cache()
             raw_model = model.module if use_ddp else model
             ema.apply(raw_model)
-            val_metrics_sum = {k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")}
+            val_metrics_sum = {
+                k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
+            }
             n_val = 0
             for val_batch in val_loader:
-                val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+                val_batch = {
+                    k: v.to(device, non_blocking=True) for k, v in val_batch.items()
+                }
                 vm = val_step(raw_model, val_batch)
                 for k in val_metrics_sum:
                     val_metrics_sum[k] += vm[k]
@@ -486,8 +538,12 @@ def main():
                 val_avg = {k: v / n_val for k, v in val_metrics_sum.items()}
                 logger.info(
                     "[val] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f",
-                    step, val_avg["loss"], val_avg["l_diff"], val_avg["l_lddt"],
-                    val_avg["l_disto"], val_avg["l_trunk_coord"],
+                    step,
+                    val_avg["loss"],
+                    val_avg["l_diff"],
+                    val_avg["l_lddt"],
+                    val_avg["l_disto"],
+                    val_avg["l_trunk_coord"],
                 )
                 if use_wandb:
                     wandb.log(

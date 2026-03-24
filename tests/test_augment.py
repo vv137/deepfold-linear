@@ -59,8 +59,13 @@ class TestCenterRandomAugmentation:
         rng = np.random.default_rng(0)
         # Use identity-like rotation by fixing the rng
         results = center_random_augmentation(
-            atom_coords, token_coords, ref_pos,
-            mask=mask, s_trans=0.0, training=True, rng=rng,
+            atom_coords,
+            token_coords,
+            ref_pos,
+            mask=mask,
+            s_trans=0.0,
+            training=True,
+            rng=rng,
         )
         # Output should be float32
         for r in results:
@@ -73,8 +78,13 @@ class TestCenterRandomAugmentation:
 
         # No translation so only rotation + centering
         aug_atoms, _, _ = center_random_augmentation(
-            atom_coords, token_coords, ref_pos,
-            mask=mask, s_trans=0.0, training=False, rng=rng,
+            atom_coords,
+            token_coords,
+            ref_pos,
+            mask=mask,
+            s_trans=0.0,
+            training=False,
+            rng=rng,
         )
 
         # Centered original for comparison
@@ -83,6 +93,7 @@ class TestCenterRandomAugmentation:
 
         # Pairwise distances
         from scipy.spatial.distance import pdist
+
         d_orig = pdist(orig_centered[:20])
         d_aug = pdist(aug_atoms[:20])
         np.testing.assert_allclose(d_aug, d_orig, atol=1e-4)
@@ -91,11 +102,19 @@ class TestCenterRandomAugmentation:
         atom_coords, token_coords, ref_pos, mask = coords
         rng = np.random.default_rng(42)
         train_results = center_random_augmentation(
-            atom_coords, mask=mask, s_trans=1.0, training=True, rng=rng,
+            atom_coords,
+            mask=mask,
+            s_trans=1.0,
+            training=True,
+            rng=rng,
         )
         rng2 = np.random.default_rng(42)
         infer_results = center_random_augmentation(
-            atom_coords, mask=mask, s_trans=1.0, training=False, rng=rng2,
+            atom_coords,
+            mask=mask,
+            s_trans=1.0,
+            training=False,
+            rng=rng2,
         )
         # Same rotation, but training adds translation → means differ
         train_mean = train_results[0].mean(axis=0)
@@ -111,8 +130,13 @@ class TestCenterRandomAugmentation:
         atom_coords, token_coords, ref_pos, mask = coords
         rng = np.random.default_rng(77)
         aug_a, aug_t, aug_r = center_random_augmentation(
-            atom_coords, token_coords, ref_pos,
-            mask=mask, s_trans=1.0, training=True, rng=rng,
+            atom_coords,
+            token_coords,
+            ref_pos,
+            mask=mask,
+            s_trans=1.0,
+            training=True,
+            rng=rng,
         )
         # Recover the rotation: compare centered originals to augmented
         center = atom_coords[mask].mean(axis=0)
@@ -141,11 +165,15 @@ class TestCenterRandomAugmentation:
         atom_coords, token_coords, ref_pos, mask = coords
         for seed in [0, 42, 999]:
             r1 = center_random_augmentation(
-                atom_coords, mask=mask, training=True,
+                atom_coords,
+                mask=mask,
+                training=True,
                 rng=np.random.default_rng(seed),
             )
             r2 = center_random_augmentation(
-                atom_coords, mask=mask, training=True,
+                atom_coords,
+                mask=mask,
+                training=True,
                 rng=np.random.default_rng(seed),
             )
             np.testing.assert_array_equal(r1[0], r2[0])

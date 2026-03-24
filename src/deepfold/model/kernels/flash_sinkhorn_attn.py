@@ -115,10 +115,20 @@ class FlashSinkhornAttn(torch.autograd.Function):
             )
 
             O_avg, x_centroid, log_u, log_v = _triton_fwd(
-                Q_ln, K_ln, V, x_res, pos_bias,
-                eps, w_dist, log_mu, log_nu,
-                K_iter, lam, r_0,
-                log_u_init, log_v_init,
+                Q_ln,
+                K_ln,
+                V,
+                x_res,
+                pos_bias,
+                eps,
+                w_dist,
+                log_mu,
+                log_nu,
+                K_iter,
+                lam,
+                r_0,
+                log_u_init,
+                log_v_init,
                 mask=mask,
             )
         except Exception:
@@ -154,10 +164,14 @@ class FlashSinkhornAttn(torch.autograd.Function):
 
                 for _ in range(K_iter):
                     lu = kappa[:, None] * (
-                        log_mu[b] - torch.logsumexp(log_K + lv[:, None, :] + cmb, dim=-1)
+                        log_mu[b]
+                        - torch.logsumexp(log_K + lv[:, None, :] + cmb, dim=-1)
                     )
                     lv = kappa[:, None] * (
-                        log_nu[b] - torch.logsumexp(log_K + lu[:, :, None] + cmb.unsqueeze(1), dim=-2)
+                        log_nu[b]
+                        - torch.logsumexp(
+                            log_K + lu[:, :, None] + cmb.unsqueeze(1), dim=-2
+                        )
                     )
 
                 log_score = lu[:, :, None] + log_K + lv[:, None, :]
@@ -170,10 +184,10 @@ class FlashSinkhornAttn(torch.autograd.Function):
                 lu_list.append(lu)
                 lv_list.append(lv)
 
-            O_avg = torch.stack(O_avg_list)      # (B, H, N, d_h)
-            x_centroid = torch.stack(xc_list)     # (B, H, N, 3)
-            log_u = torch.stack(lu_list)          # (B, H, N)
-            log_v = torch.stack(lv_list)          # (B, H, N)
+            O_avg = torch.stack(O_avg_list)  # (B, H, N, d_h)
+            x_centroid = torch.stack(xc_list)  # (B, H, N, 3)
+            log_u = torch.stack(lu_list)  # (B, H, N)
+            log_v = torch.stack(lv_list)  # (B, H, N)
 
         # Gated output
         sig_G = torch.sigmoid(G)
@@ -188,9 +202,22 @@ class FlashSinkhornAttn(torch.autograd.Function):
 
         # Save for backward — all O(N·d), no N×N
         ctx.save_for_backward(
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
-            log_u, log_v, O_avg, x_centroid, sig_G, mask,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
+            log_u,
+            log_v,
+            O_avg,
+            x_centroid,
+            sig_G,
+            mask,
         )
         ctx.K_iter = K_iter
         ctx.lam = lam
@@ -201,9 +228,22 @@ class FlashSinkhornAttn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_o_flat, grad_xc, grad_lu_unused, grad_lv_unused):
         (
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
-            log_u, log_v, O_avg, x_centroid, sig_G, mask,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
+            log_u,
+            log_v,
+            O_avg,
+            x_centroid,
+            sig_G,
+            mask,
         ) = ctx.saved_tensors
         K_back = ctx.K_iter
         lam = ctx.lam
@@ -216,7 +256,9 @@ class FlashSinkhornAttn(torch.autograd.Function):
         # ====================================================================
         # Step 0: Backward through gating
         # ====================================================================
-        grad_o_gated = grad_o_flat.view(B, N, H, d_h).permute(0, 2, 1, 3)  # (B, H, N, d_h)
+        grad_o_gated = grad_o_flat.view(B, N, H, d_h).permute(
+            0, 2, 1, 3
+        )  # (B, H, N, d_h)
         grad_O_avg = sig_G * grad_o_gated  # (B, H, N, d_h)
         grad_G = sig_G * (1 - sig_G) * O_avg * grad_o_gated  # (B, H, N, d_h)
 
@@ -248,10 +290,21 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         je = min(j0 + TILE, N)
                         j_sl = slice(j0, je)
                         _, log_K_tile, _, _ = _compute_cost_tile_py(
-                            Q_ln[b, h], K_ln[b, h], x_res[b],
-                            pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                            Q_ln[b, h],
+                            K_ln[b, h],
+                            x_res[b],
+                            pos_bias[b, h],
+                            w_dist_h,
+                            r_0,
+                            i_sl,
+                            j_sl,
+                            eps_h,
                         )
-                        score = log_u[b, h, i_sl, None] + log_K_tile + log_v[b, h, None, j_sl]
+                        score = (
+                            log_u[b, h, i_sl, None]
+                            + log_K_tile
+                            + log_v[b, h, None, j_sl]
+                        )
                         tile_max = score.max(dim=-1).values
                         new_max = torch.maximum(max_val, tile_max)
                         sum_exp = sum_exp * torch.exp(max_val - new_max) + torch.exp(
@@ -286,11 +339,22 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         i_sl = slice(i0, ie)
 
                         _, log_K_tile, _, _ = _compute_cost_tile_py(
-                            Q_ln[b, h], K_ln[b, h], x_res[b],
-                            pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                            Q_ln[b, h],
+                            K_ln[b, h],
+                            x_res[b],
+                            pos_bias[b, h],
+                            w_dist_h,
+                            r_0,
+                            i_sl,
+                            j_sl,
+                            eps_h,
                         )
 
-                        log_score = log_u[b, h, i_sl, None] + log_K_tile + log_v[b, h, None, j_sl]
+                        log_score = (
+                            log_u[b, h, i_sl, None]
+                            + log_K_tile
+                            + log_v[b, h, None, j_sl]
+                        )
                         T_norm_tile = torch.exp(log_score - log_Z[b, h, i_sl, None])
 
                         dT = (
@@ -330,8 +394,15 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         je = min(j0 + TILE, N)
                         j_sl = slice(j0, je)
                         _, log_K_tile, _, _ = _compute_cost_tile_py(
-                            Q_ln[b, h], K_ln[b, h], x_res[b],
-                            pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                            Q_ln[b, h],
+                            K_ln[b, h],
+                            x_res[b],
+                            pos_bias[b, h],
+                            w_dist_h,
+                            r_0,
+                            i_sl,
+                            j_sl,
+                            eps_h,
                         )
                         score = log_K_tile + log_v[b, h, None, j_sl]
                         tile_max = score.max(dim=-1).values
@@ -354,8 +425,15 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         ie = min(i0 + TILE, N)
                         i_sl = slice(i0, ie)
                         _, log_K_tile, _, _ = _compute_cost_tile_py(
-                            Q_ln[b, h], K_ln[b, h], x_res[b],
-                            pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                            Q_ln[b, h],
+                            K_ln[b, h],
+                            x_res[b],
+                            pos_bias[b, h],
+                            w_dist_h,
+                            r_0,
+                            i_sl,
+                            j_sl,
+                            eps_h,
                         )
                         score = (log_K_tile + log_u[b, h, i_sl, None]).T
                         tile_max = score.max(dim=-1).values
@@ -389,11 +467,20 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             je = min(j0 + TILE, N)
                             j_sl = slice(j0, je)
                             _, log_K_tile, _, _ = _compute_cost_tile_py(
-                                Q_ln[b, h], K_ln[b, h], x_res[b],
-                                pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                                Q_ln[b, h],
+                                K_ln[b, h],
+                                x_res[b],
+                                pos_bias[b, h],
+                                w_dist_h,
+                                r_0,
+                                i_sl,
+                                j_sl,
+                                eps_h,
                             )
                             log_s = (
-                                log_K_tile + log_u[b, h, i_sl, None] - col_lse[b, h, None, j_sl]
+                                log_K_tile
+                                + log_u[b, h, i_sl, None]
+                                - col_lse[b, h, None, j_sl]
                             )
                             s_col_tile = torch.exp(log_s)
                             acc += (s_col_tile * z_v[b, h, None, j_sl]).sum(dim=-1)
@@ -407,11 +494,20 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             ie = min(i0 + TILE, N)
                             i_sl = slice(i0, ie)
                             _, log_K_tile, _, _ = _compute_cost_tile_py(
-                                Q_ln[b, h], K_ln[b, h], x_res[b],
-                                pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                                Q_ln[b, h],
+                                K_ln[b, h],
+                                x_res[b],
+                                pos_bias[b, h],
+                                w_dist_h,
+                                r_0,
+                                i_sl,
+                                j_sl,
+                                eps_h,
                             )
                             log_s = (
-                                log_K_tile + log_v[b, h, None, j_sl] - row_lse[b, h, i_sl, None]
+                                log_K_tile
+                                + log_v[b, h, None, j_sl]
+                                - row_lse[b, h, i_sl, None]
                             )
                             s_row_tile = torch.exp(log_s)
                             acc += (s_row_tile * z_u_new[b, h, i_sl, None]).sum(dim=0)
@@ -444,12 +540,25 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         je = min(j0 + TILE, N)
                         j_sl = slice(j0, je)
 
-                        C_tile, log_K_tile, dist_tile, diff_tile = _compute_cost_tile_py(
-                            Q_ln[b, h], K_ln[b, h], x_res[b],
-                            pos_bias[b, h], w_dist_h, r_0, i_sl, j_sl, eps_h,
+                        C_tile, log_K_tile, dist_tile, diff_tile = (
+                            _compute_cost_tile_py(
+                                Q_ln[b, h],
+                                K_ln[b, h],
+                                x_res[b],
+                                pos_bias[b, h],
+                                w_dist_h,
+                                r_0,
+                                i_sl,
+                                j_sl,
+                                eps_h,
+                            )
                         )
 
-                        log_score = log_u[b, h, i_sl, None] + log_K_tile + log_v[b, h, None, j_sl]
+                        log_score = (
+                            log_u[b, h, i_sl, None]
+                            + log_K_tile
+                            + log_v[b, h, None, j_sl]
+                        )
                         T_norm_tile = torch.exp(log_score - log_Z[b, h, i_sl, None])
 
                         dT = (
@@ -460,11 +569,15 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         grad_C_direct = grad_ls_direct * (-1.0 / eps_h)
 
                         log_s_row = (
-                            log_K_tile + log_v[b, h, None, j_sl] - row_lse[b, h, i_sl, None]
+                            log_K_tile
+                            + log_v[b, h, None, j_sl]
+                            - row_lse[b, h, i_sl, None]
                         )
                         s_row_tile = torch.exp(log_s_row)
                         log_s_col = (
-                            log_K_tile + log_u[b, h, i_sl, None] - col_lse[b, h, None, j_sl]
+                            log_K_tile
+                            + log_u[b, h, i_sl, None]
+                            - col_lse[b, h, None, j_sl]
                         )
                         s_col_tile = torch.exp(log_s_col)
 
@@ -484,8 +597,12 @@ class FlashSinkhornAttn(torch.autograd.Function):
 
                         geo_grad_coeff = w_dist_h * r_0 / (r_0 + dist_tile) ** 2
                         weighted = grad_C_total * geo_grad_coeff / dist_tile
-                        grad_x_cost[b, i_sl] += (weighted.unsqueeze(-1) * diff_tile).sum(dim=1)
-                        grad_x_cost[b, j_sl] -= (weighted.unsqueeze(-1) * diff_tile).sum(dim=0)
+                        grad_x_cost[b, i_sl] += (
+                            weighted.unsqueeze(-1) * diff_tile
+                        ).sum(dim=1)
+                        grad_x_cost[b, j_sl] -= (
+                            weighted.unsqueeze(-1) * diff_tile
+                        ).sum(dim=0)
 
                         f_dist_tile = dist_tile / (r_0 + dist_tile)
                         grad_w_dist[h] += (grad_C_total * f_dist_tile).sum()
@@ -585,20 +702,40 @@ def flash_sinkhorn_attn(
         # flash_sinkhorn returns (O_avg, x_centroid, log_u, log_v)
         # with Triton backward — no Python-tiled IFT needed
         O_avg, x_centroid, log_u, log_v = _triton_fn(
-            Q_ln, K_ln, V, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
-            K_iter, lam, r_0,
-            log_u_init, log_v_init,
+            Q_ln,
+            K_ln,
+            V,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
+            K_iter,
+            lam,
+            r_0,
+            log_u_init,
+            log_v_init,
             mask=mask,
         )
     except Exception:
         # CPU fallback: use FlashSinkhornAttn (Python-tiled backward)
         result = FlashSinkhornAttn.apply(
-            Q_ln, K_ln, V, G,
-            x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
-            K_iter, lam, r_0,
-            log_u_init, log_v_init,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
+            K_iter,
+            lam,
+            r_0,
+            log_u_init,
+            log_v_init,
             mask,
         )
         if unbatched:
@@ -618,5 +755,10 @@ def flash_sinkhorn_attn(
     log_v = log_v * mask_hn
 
     if unbatched:
-        return o_flat.squeeze(0), x_centroid.squeeze(0), log_u.squeeze(0), log_v.squeeze(0)
+        return (
+            o_flat.squeeze(0),
+            x_centroid.squeeze(0),
+            log_u.squeeze(0),
+            log_v.squeeze(0),
+        )
     return o_flat, x_centroid, log_u, log_v

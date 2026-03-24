@@ -1,6 +1,5 @@
 """Tests that batched flash_sinkhorn_attn matches per-sample calls."""
 
-import pytest
 import torch
 
 
@@ -38,9 +37,19 @@ class TestFlashSinkhornBatch:
 
         # Batched call
         o_batch, xc_batch, lu_batch, lv_batch = flash_sinkhorn_attn(
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
-            K_iter=K_iter, lam=1.0, r_0=10.0,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
+            K_iter=K_iter,
+            lam=1.0,
+            r_0=10.0,
         )
 
         assert o_batch.shape == (B, N, H * d_h)
@@ -51,25 +60,46 @@ class TestFlashSinkhornBatch:
         # Per-sample calls (unbatched interface)
         for b in range(B):
             o_b, xc_b, lu_b, lv_b = flash_sinkhorn_attn(
-                Q_ln[b], K_ln[b], V[b], G[b],
-                x_res[b], pos_bias[b],
-                eps, w_dist, log_mu[b], log_nu[b],
-                K_iter=K_iter, lam=1.0, r_0=10.0,
+                Q_ln[b],
+                K_ln[b],
+                V[b],
+                G[b],
+                x_res[b],
+                pos_bias[b],
+                eps,
+                w_dist,
+                log_mu[b],
+                log_nu[b],
+                K_iter=K_iter,
+                lam=1.0,
+                r_0=10.0,
             )
             torch.testing.assert_close(
-                o_batch[b], o_b, atol=1e-4, rtol=1e-4,
+                o_batch[b],
+                o_b,
+                atol=1e-4,
+                rtol=1e-4,
                 msg=f"o_flat mismatch at batch {b}",
             )
             torch.testing.assert_close(
-                xc_batch[b], xc_b, atol=1e-4, rtol=1e-4,
+                xc_batch[b],
+                xc_b,
+                atol=1e-4,
+                rtol=1e-4,
                 msg=f"x_centroid mismatch at batch {b}",
             )
             torch.testing.assert_close(
-                lu_batch[b], lu_b, atol=1e-4, rtol=1e-4,
+                lu_batch[b],
+                lu_b,
+                atol=1e-4,
+                rtol=1e-4,
                 msg=f"log_u mismatch at batch {b}",
             )
             torch.testing.assert_close(
-                lv_batch[b], lv_b, atol=1e-4, rtol=1e-4,
+                lv_batch[b],
+                lv_b,
+                atol=1e-4,
+                rtol=1e-4,
                 msg=f"log_v mismatch at batch {b}",
             )
 
@@ -93,8 +123,16 @@ class TestFlashSinkhornBatch:
         from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
 
         o, xc, lu, lv = flash_sinkhorn_attn(
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
             K_iter=K_iter,
         )
 
@@ -124,17 +162,31 @@ class TestFlashSinkhornBatch:
 
         # Unbatched
         o_ub, xc_ub, lu_ub, lv_ub = flash_sinkhorn_attn(
-            Q_ln, K_ln, V, G, x_res, pos_bias,
-            eps, w_dist, log_mu, log_nu,
+            Q_ln,
+            K_ln,
+            V,
+            G,
+            x_res,
+            pos_bias,
+            eps,
+            w_dist,
+            log_mu,
+            log_nu,
             K_iter=K_iter,
         )
 
         # Batched B=1
         o_b, xc_b, lu_b, lv_b = flash_sinkhorn_attn(
-            Q_ln.unsqueeze(0), K_ln.unsqueeze(0), V.unsqueeze(0), G.unsqueeze(0),
-            x_res.unsqueeze(0), pos_bias.unsqueeze(0),
-            eps, w_dist,
-            log_mu.unsqueeze(0), log_nu.unsqueeze(0),
+            Q_ln.unsqueeze(0),
+            K_ln.unsqueeze(0),
+            V.unsqueeze(0),
+            G.unsqueeze(0),
+            x_res.unsqueeze(0),
+            pos_bias.unsqueeze(0),
+            eps,
+            w_dist,
+            log_mu.unsqueeze(0),
+            log_nu.unsqueeze(0),
             K_iter=K_iter,
         )
 

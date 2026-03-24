@@ -85,11 +85,13 @@ def sinkhorn_solve(
 
         # Row update — mask columns before logsumexp over dim=-1
         log_u = kappa[None, :, None] * (
-            log_mu - torch.logsumexp(log_K + log_v[:, :, None, :] + col_mask_bias, dim=-1)
+            log_mu
+            - torch.logsumexp(log_K + log_v[:, :, None, :] + col_mask_bias, dim=-1)
         )
         # Column update — mask rows before logsumexp over dim=-2
         log_v = kappa[None, :, None] * (
-            log_nu - torch.logsumexp(log_K + log_u[:, :, :, None] + row_mask_bias, dim=-2)
+            log_nu
+            - torch.logsumexp(log_K + log_u[:, :, :, None] + row_mask_bias, dim=-2)
         )
 
         # Early stopping: L∞ on potential change (flash-sinkhorn convention)

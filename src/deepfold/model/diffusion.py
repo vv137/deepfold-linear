@@ -426,7 +426,13 @@ class DiffusionModule(nn.Module):
         # 4. Atom blocks
         for block in self.atom_blocks:
             q = block(
-                q, c_atom, h_cond, p_lm, p_lm_idx, t_emb, token_idx,
+                q,
+                c_atom,
+                h_cond,
+                p_lm,
+                p_lm_idx,
+                t_emb,
+                token_idx,
                 atom_pad_mask=atom_pad_mask,
                 pair_valid_mask=pair_valid_mask,
             )
@@ -440,7 +446,9 @@ class DiffusionModule(nn.Module):
         mask_f = atom_pad_mask.float()  # (B, N_atom)
         mask_sum = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
         x_f32 = x_atom_new.float()
-        com = (x_f32 * mask_f.unsqueeze(-1)).sum(dim=1, keepdim=True) / mask_sum.unsqueeze(-1)
+        com = (x_f32 * mask_f.unsqueeze(-1)).sum(
+            dim=1, keepdim=True
+        ) / mask_sum.unsqueeze(-1)
         x_atom_new = (x_f32 - com).to(x_atom_new.dtype)
 
         # Zero out padded atom positions
@@ -468,9 +476,7 @@ class DiffusionModule(nn.Module):
         h_cond = h_res + self.t_proj(t_emb_normed)  # (N, 512) broadcast
 
         # 3. Atom embedding — scale by c_in = 1/sqrt(σ²+σ_data²) (AF3 Alg 20 line 2)
-        q = c_atom + self.atom_coord_proj(
-            x_atom_noisy * c_in
-        )  # (N_atom, 128)
+        q = c_atom + self.atom_coord_proj(x_atom_noisy * c_in)  # (N_atom, 128)
 
         # 4. Atom blocks
         for block in self.atom_blocks:

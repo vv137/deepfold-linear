@@ -158,7 +158,9 @@ class TestAtomToTokenEncoder:
         B, N_atom, n_tokens, n_pairs = 2, 12, 4, 8
 
         c_atom = torch.randn(B, N_atom, 128)
-        token_idx = torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        token_idx = (
+            torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        )
         p_lm = torch.randn(B, n_pairs, 16)
         src = torch.randint(0, N_atom, (B, n_pairs))
         dst = torch.randint(0, N_atom, (B, n_pairs))
@@ -173,7 +175,13 @@ class TestAtomToTokenEncoder:
         B, N_atom, n_tokens, n_pairs = 2, 12, 4, 10
 
         c_atom = torch.randn(B, N_atom, 128)
-        token_idx = torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1).clone()
+        token_idx = (
+            torch.arange(n_tokens)
+            .repeat_interleave(3)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .clone()
+        )
 
         p_lm = torch.randn(B, n_pairs, 16)
         src = torch.randint(0, N_atom, (B, n_pairs))
@@ -192,7 +200,11 @@ class TestAtomToTokenEncoder:
         token_pad_mask[1, 3] = False
 
         out = m(
-            c_atom, p_lm, p_lm_idx, token_idx, n_tokens,
+            c_atom,
+            p_lm,
+            p_lm_idx,
+            token_idx,
+            n_tokens,
             atom_pad_mask=atom_pad_mask,
             pair_pad_mask=pair_pad_mask,
             token_pad_mask=token_pad_mask,
@@ -212,7 +224,9 @@ class TestAtomToTokenEncoder:
         B, N_atom, n_tokens, n_pairs = 2, 12, 4, 6
 
         c_atom = torch.randn(B, N_atom, 128)
-        token_idx = torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        token_idx = (
+            torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        )
         p_lm = torch.randn(B, n_pairs, 16)
         src = torch.randint(0, N_atom, (B, n_pairs))
         dst = torch.randint(0, N_atom, (B, n_pairs))
@@ -254,7 +268,9 @@ class TestAtomToTokenEncoder:
         B, N_atom, n_tokens, n_pairs = 2, 6, 2, 4
 
         c_atom = torch.randn(B, N_atom, 128, requires_grad=True)
-        token_idx = torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        token_idx = (
+            torch.arange(n_tokens).repeat_interleave(3).unsqueeze(0).expand(B, -1)
+        )
         p_lm = torch.randn(B, n_pairs, 16)
         src = torch.randint(0, N_atom, (B, n_pairs))
         dst = torch.randint(0, N_atom, (B, n_pairs))

@@ -136,9 +136,15 @@ def random_rotation_matrices_torch(
 
     R = torch.stack(
         [
-            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
-            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
-            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x * x + y * y),
         ],
         dim=-1,
     ).view(n, 3, 3)

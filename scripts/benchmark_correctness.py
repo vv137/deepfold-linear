@@ -4,17 +4,29 @@ Reports per-output atol, rtol, mean/max errors, and gradient comparison.
 """
 
 import torch
-import torch.nn.functional as F
 
 DEVICE = torch.device("cuda")
 
 
-def pytorch_sinkhorn_full(Q_ln, K_ln, V, G, x_res, pos_bias, eps, w_dist,
-                          log_mu, log_nu, K_iter, lam=1.0, r_0=10.0):
+def pytorch_sinkhorn_full(
+    Q_ln,
+    K_ln,
+    V,
+    G,
+    x_res,
+    pos_bias,
+    eps,
+    w_dist,
+    log_mu,
+    log_nu,
+    K_iter,
+    lam=1.0,
+    r_0=10.0,
+):
     """Reference PyTorch: full N×N materialized."""
     H, N, d_h = Q_ln.shape
 
-    content = -torch.einsum("hid,hjd->hij", Q_ln, K_ln) / (d_h ** 0.5)
+    content = -torch.einsum("hid,hjd->hij", Q_ln, K_ln) / (d_h**0.5)
     dist = torch.cdist(x_res, x_res)
     geo = w_dist[:, None, None] * dist / (r_0 + dist)
     C = content + pos_bias + geo
@@ -25,8 +37,12 @@ def pytorch_sinkhorn_full(Q_ln, K_ln, V, G, x_res, pos_bias, eps, w_dist,
     log_v = torch.zeros(H, N, device=C.device, dtype=torch.float32)
 
     for _ in range(K_iter):
-        log_u = kappa[:, None] * (log_mu - torch.logsumexp(log_K + log_v[:, None, :], dim=-1))
-        log_v = kappa[:, None] * (log_nu - torch.logsumexp(log_K + log_u[:, :, None], dim=-2))
+        log_u = kappa[:, None] * (
+            log_mu - torch.logsumexp(log_K + log_v[:, None, :], dim=-1)
+        )
+        log_v = kappa[:, None] * (
+            log_nu - torch.logsumexp(log_K + log_u[:, :, None], dim=-2)
+        )
 
     log_score = log_u[:, :, None] + log_K + log_v[:, None, :]
     row_max = log_score.max(dim=-1, keepdim=True).values
@@ -55,12 +71,18 @@ def report_error(name, ref, tri):
     rel_err = abs_err / ref_abs
 
     print(f"  {name:20s}  shape={list(ref.shape)}")
-    print(f"    atol: max={abs_err.max():.6e}  mean={abs_err.mean():.6e}  "
-          f"median={abs_err.median():.6e}  p99={abs_err.quantile(0.99):.6e}")
-    print(f"    rtol: max={rel_err.max():.6e}  mean={rel_err.mean():.6e}  "
-          f"median={rel_err.median():.6e}  p99={rel_err.quantile(0.99):.6e}")
-    print(f"    ref range: [{ref.min():.4f}, {ref.max():.4f}]  "
-          f"tri range: [{tri.min():.4f}, {tri.max():.4f}]")
+    print(
+        f"    atol: max={abs_err.max():.6e}  mean={abs_err.mean():.6e}  "
+        f"median={abs_err.median():.6e}  p99={abs_err.quantile(0.99):.6e}"
+    )
+    print(
+        f"    rtol: max={rel_err.max():.6e}  mean={rel_err.mean():.6e}  "
+        f"median={rel_err.median():.6e}  p99={rel_err.quantile(0.99):.6e}"
+    )
+    print(
+        f"    ref range: [{ref.min():.4f}, {ref.max():.4f}]  "
+        f"tri range: [{tri.min():.4f}, {tri.max():.4f}]"
+    )
     # Check standard torch.allclose thresholds
     for atol, rtol in [(1e-5, 1e-5), (1e-4, 1e-4), (1e-3, 1e-3), (1e-2, 1e-2)]:
         ok = torch.allclose(ref, tri, atol=atol, rtol=rtol)
@@ -70,16 +92,18 @@ def report_error(name, ref, tri):
         else:
             n_fail = (~torch.isclose(ref, tri, atol=atol, rtol=rtol)).sum().item()
             total = ref.numel()
-            print(f"    torch.allclose(atol={atol}, rtol={rtol}): FAIL ({n_fail}/{total} elements)")
+            print(
+                f"    torch.allclose(atol={atol}, rtol={rtol}): FAIL ({n_fail}/{total} elements)"
+            )
     print()
 
 
 def run_correctness(N, H=16, d_h=32, K_iter=7):
     from deepfold.model.kernels.sinkhorn_kernel import flash_sinkhorn
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"N={N}, H={H}, d_h={d_h}, K_iter={K_iter}")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     torch.manual_seed(42)
     Q_ln = torch.randn(H, N, d_h, device=DEVICE, dtype=torch.float32)
@@ -88,7 +112,11 @@ def run_correctness(N, H=16, d_h=32, K_iter=7):
     G = torch.randn(H, N, d_h, device=DEVICE, dtype=torch.float32)
     x_res = torch.randn(N, 3, device=DEVICE, dtype=torch.float32) * 10
     pos_bias = torch.randn(H, N, N, device=DEVICE, dtype=torch.float32) * 0.1
-    eps = torch.tensor([0.5]*4 + [1.0]*4 + [2.0]*4 + [4.0]*4, device=DEVICE, dtype=torch.float32)
+    eps = torch.tensor(
+        [0.5] * 4 + [1.0] * 4 + [2.0] * 4 + [4.0] * 4,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
     w_dist = torch.randn(H, device=DEVICE, dtype=torch.float32) * 0.1
     log_mu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
     log_nu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
@@ -126,7 +154,7 @@ def run_correctness(N, H=16, d_h=32, K_iter=7):
             print()
 
     # --- Gradient comparison (IFT backward) ---
-    print(f"\n\n[Backward Pass (IFT)]")
+    print("\n\n[Backward Pass (IFT)]")
 
     # PyTorch reference backward
     from deepfold.model.sinkhorn import sinkhorn_solve, compute_transport_output
@@ -136,19 +164,21 @@ def run_correctness(N, H=16, d_h=32, K_iter=7):
     x_res_pt = x_res.clone().requires_grad_(True)
     V_pt = V.clone().requires_grad_(True)
 
-    content_pt = -torch.einsum("hid,hjd->hij", Q_ln_pt, K_ln_pt) / (d_h ** 0.5)
+    content_pt = -torch.einsum("hid,hjd->hij", Q_ln_pt, K_ln_pt) / (d_h**0.5)
     dist_pt = torch.cdist(x_res_pt, x_res_pt)
     geo_pt = w_dist[:, None, None] * dist_pt / (10.0 + dist_pt)
     C_pt = content_pt + pos_bias + geo_pt
 
     lu_pt, lv_pt = sinkhorn_solve(C_pt, log_mu, log_nu, eps, K=K_iter, use_ift=True)
-    o_pt, _, xc_pt = compute_transport_output(V_pt, G, lu_pt, lv_pt, C_pt, eps, x_res_pt)
+    o_pt, _, xc_pt = compute_transport_output(
+        V_pt, G, lu_pt, lv_pt, C_pt, eps, x_res_pt
+    )
 
     # Create a combined scalar loss
     loss_pt = o_pt.sum() + xc_pt.sum()
     loss_pt.backward()
 
-    print(f"  PyTorch IFT backward completed.")
+    print("  PyTorch IFT backward completed.")
     print(f"  grad_Q norm: {Q_ln_pt.grad.norm():.6e}")
     print(f"  grad_K norm: {K_ln_pt.grad.norm():.6e}")
     print(f"  grad_V norm: {V_pt.grad.norm():.6e}")
@@ -164,20 +194,22 @@ def run_correctness(N, H=16, d_h=32, K_iter=7):
     O_tr, xc_tr, lu_tr, lv_tr = flash_sinkhorn(
         Q_ln_tr, K_ln_tr, V, x_res_tr, pos_bias, eps, w_dist, log_mu, log_nu, K_iter
     )
-    loss_tr = (O_tr.sum() + xc_tr.sum())
+    loss_tr = O_tr.sum() + xc_tr.sum()
     try:
         loss_tr.backward()
-        print(f"\n  Triton IFT backward completed.")
+        print("\n  Triton IFT backward completed.")
         if Q_ln_tr.grad is not None:
             print(f"  grad_Q norm: {Q_ln_tr.grad.norm():.6e}")
             report_error("grad_Q", Q_ln_pt.grad, Q_ln_tr.grad)
         else:
-            print(f"  grad_Q: None (cost gradient pass stubbed — IFT adjoint runs, but ∂C→∂Q not yet fused)")
+            print(
+                "  grad_Q: None (cost gradient pass stubbed — IFT adjoint runs, but ∂C→∂Q not yet fused)"
+            )
         if x_res_tr.grad is not None:
             print(f"  grad_x norm: {x_res_tr.grad.norm():.6e}")
             report_error("grad_x", x_res_pt.grad, x_res_tr.grad)
         else:
-            print(f"  grad_x: None (cost gradient pass stubbed)")
+            print("  grad_x: None (cost gradient pass stubbed)")
     except Exception as e:
         print(f"  Triton backward error: {e}")
 
@@ -190,9 +222,9 @@ def main():
         run_correctness(N)
 
     # Also test with warm start
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("Warm-start test (K=4, init from cold K=7)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     from deepfold.model.kernels.sinkhorn_kernel import flash_sinkhorn
 
     N, H, d_h = 256, 16, 32
@@ -202,7 +234,7 @@ def main():
     V = torch.randn(H, N, d_h, device=DEVICE)
     x_res = torch.randn(N, 3, device=DEVICE) * 10
     pos_bias = torch.randn(H, N, N, device=DEVICE) * 0.1
-    eps = torch.tensor([0.5]*4 + [1.0]*4 + [2.0]*4 + [4.0]*4, device=DEVICE)
+    eps = torch.tensor([0.5] * 4 + [1.0] * 4 + [2.0] * 4 + [4.0] * 4, device=DEVICE)
     w_dist = torch.randn(H, device=DEVICE) * 0.1
     log_mu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
     log_nu = torch.log_softmax(torch.randn(H, N, device=DEVICE), dim=-1)
@@ -214,8 +246,18 @@ def main():
 
     # Warm start from cold
     O_warm, xc_warm, lu_warm, lv_warm = flash_sinkhorn(
-        Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist, log_mu, log_nu,
-        K_iter=4, log_u_init=lu_cold, log_v_init=lv_cold,
+        Q_ln,
+        K_ln,
+        V,
+        x_res,
+        pos_bias,
+        eps,
+        w_dist,
+        log_mu,
+        log_nu,
+        K_iter=4,
+        log_u_init=lu_cold,
+        log_v_init=lv_cold,
     )
 
     # Compare: warm K=4 from cold K=7 vs fresh cold K=11

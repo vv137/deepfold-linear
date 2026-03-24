@@ -49,7 +49,8 @@ class TestConjugateGradient:
         n = 20
         A = torch.diag(torch.linspace(0.1, 10.0, n))
         b = torch.randn(n)
-        precond = lambda v: v / torch.diag(A)
+        def precond(v):
+            return v / torch.diag(A)
 
         _, info_no = conjugate_gradient(lambda v: A @ v, b, max_iter=50)
         _, info_yes = conjugate_gradient(

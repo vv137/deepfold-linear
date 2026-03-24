@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-import pytest
 
 from deepfold.data.dataset import collate_fn
 
@@ -128,8 +127,14 @@ class TestCollateBatch:
         assert result["bond_matrix"].dtype == torch.bool
         assert result["bond_matrix"].shape == (2, 8, 8)
         # Original bond preserved
-        assert result["bond_matrix"][0, 0, 1] is True or result["bond_matrix"][0, 0, 1].item()
-        assert result["bond_matrix"][0, 1, 0] is True or result["bond_matrix"][0, 1, 0].item()
+        assert (
+            result["bond_matrix"][0, 0, 1] is True
+            or result["bond_matrix"][0, 0, 1].item()
+        )
+        assert (
+            result["bond_matrix"][0, 1, 0] is True
+            or result["bond_matrix"][0, 1, 0].item()
+        )
         # Padded region is False
         assert not result["bond_matrix"][0, 5:, :].any()
         assert not result["bond_matrix"][0, :, 5:].any()
@@ -141,13 +146,9 @@ class TestCollateBatch:
         result = collate_fn([s1, s2])
 
         # Check that s1's profile data is preserved
-        torch.testing.assert_close(
-            result["profile"][0, :6, :], s1["profile"]
-        )
+        torch.testing.assert_close(result["profile"][0, :6, :], s1["profile"])
         # Check s2's c_atom is preserved
-        torch.testing.assert_close(
-            result["c_atom"][1, :40, :], s2["c_atom"]
-        )
+        torch.testing.assert_close(result["c_atom"][1, :40, :], s2["c_atom"])
 
     def test_zero_pad_coordinates(self):
         """Coordinate tensors (x_atom_true, x_res_true) are zero-padded."""
@@ -160,9 +161,7 @@ class TestCollateBatch:
         # Padded region should be zeros
         assert result["x_atom_true"][0, 15:, :].abs().sum() == 0.0
         # Real data preserved
-        torch.testing.assert_close(
-            result["x_atom_true"][0, :15, :], s1["x_atom_true"]
-        )
+        torch.testing.assert_close(result["x_atom_true"][0, :15, :], s1["x_atom_true"])
 
     def test_equal_sizes_no_padding(self):
         """Samples with identical sizes still batch correctly."""

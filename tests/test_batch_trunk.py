@@ -1,7 +1,6 @@
 """Tests for batched MSA module, trunk block, and trunk orchestrator."""
 
 import torch
-import pytest
 
 
 class TestTokenUOTBlockBatch:
@@ -9,6 +8,7 @@ class TestTokenUOTBlockBatch:
 
     def _make_block(self, d_model=64, n_heads=4):
         from deepfold.model.trunk_block import TokenUOTBlock
+
         return TokenUOTBlock(d_model=d_model, n_heads=n_heads, block_idx=0)
 
     def test_unbatched_compat(self):
@@ -28,6 +28,7 @@ class TestTokenUOTBlockBatch:
         pos_bins = torch.randint(0, 68, (N, N))
 
         from deepfold.model.position_encoding import PositionBias
+
         pb = PositionBias(n_heads, 68)
         pos_bias = pb(pos_bins)  # (H, N, N)
 
@@ -40,10 +41,14 @@ class TestTokenUOTBlockBatch:
         # Batched B=1
         with torch.no_grad():
             h_b, x_b, lu_b, lv_b = block(
-                h.unsqueeze(0), x_res.unsqueeze(0),
-                mu.unsqueeze(0), nu.unsqueeze(0),
-                log_u.unsqueeze(0), log_v.unsqueeze(0),
-                pos_bias.unsqueeze(0), w_dist,
+                h.unsqueeze(0),
+                x_res.unsqueeze(0),
+                mu.unsqueeze(0),
+                nu.unsqueeze(0),
+                log_u.unsqueeze(0),
+                log_v.unsqueeze(0),
+                pos_bias.unsqueeze(0),
+                w_dist,
                 pos_bins.unsqueeze(0),
             )
 
@@ -72,15 +77,24 @@ class TestTokenUOTBlockBatch:
         pos_bins = torch.randint(0, 68, (B, N, N))
 
         from deepfold.model.position_encoding import PositionBias
+
         pb = PositionBias(n_heads, 68)
         pos_bias = pb(pos_bins)  # (B, H, N, N)
 
         mask = torch.ones(B, N)
-        mask[1, N_real[1]:] = 0  # pad positions 6-9 for sample 1
+        mask[1, N_real[1] :] = 0  # pad positions 6-9 for sample 1
 
         with torch.no_grad():
             h_out, x_out, lu_out, lv_out = block(
-                h, x_res, mu, nu, log_u, log_v, pos_bias, w_dist, pos_bins,
+                h,
+                x_res,
+                mu,
+                nu,
+                log_u,
+                log_v,
+                pos_bias,
+                w_dist,
+                pos_bins,
                 mask=mask,
             )
 
@@ -95,8 +109,8 @@ class TestTokenUOTBlockBatch:
         # Actually we need to check that the *update* is zero at pad positions.
         # Since we zero updates with mask, padded h_out == original h at those positions.
         # But h was modified in-place... let's just check log_u, log_v are zero at pad.
-        assert (lu_out[1, :, N_real[1]:].abs() < 1e-6).all()
-        assert (lv_out[1, :, N_real[1]:].abs() < 1e-6).all()
+        assert (lu_out[1, :, N_real[1] :].abs() < 1e-6).all()
+        assert (lv_out[1, :, N_real[1] :].abs() < 1e-6).all()
 
     def test_gradient_flows(self):
         """Verify gradients flow through batched block."""
@@ -114,11 +128,20 @@ class TestTokenUOTBlockBatch:
         pos_bins = torch.randint(0, 68, (B, N, N))
 
         from deepfold.model.position_encoding import PositionBias
+
         pb = PositionBias(n_heads, 68)
         pos_bias = pb(pos_bins)
 
         h_out, x_out, _, _ = block(
-            h, x_res, mu, nu, log_u, log_v, pos_bias, w_dist, pos_bins,
+            h,
+            x_res,
+            mu,
+            nu,
+            log_u,
+            log_v,
+            pos_bias,
+            w_dist,
+            pos_bins,
         )
         loss = h_out.sum() + x_out.sum()
         loss.backward()
@@ -133,9 +156,14 @@ class TestMSABlockBatch:
 
     def _make_module(self, d_model=64, d_msa=16, h_msa=2, h_res=4):
         from deepfold.model.msa import MSABlock
+
         return MSABlock(
-            d_model=d_model, d_msa=d_msa, h_msa=h_msa, h_res=h_res,
-            coevol_rank=4, tile_size=4,
+            d_model=d_model,
+            d_msa=d_msa,
+            h_msa=h_msa,
+            h_res=h_res,
+            coevol_rank=4,
+            tile_size=4,
         )
 
     def test_unbatched_compat(self):
@@ -156,6 +184,7 @@ class TestMSABlockBatch:
         alpha_coevol = torch.randn(h_res)
 
         from deepfold.model.position_encoding import PositionBias
+
         pb = PositionBias(h_msa, 68)
         msa_bins = torch.randint(0, 68, (N_prot, N_prot))
         pos_bias = pb(msa_bins)
@@ -163,14 +192,26 @@ class TestMSABlockBatch:
         # Unbatched
         with torch.no_grad():
             m_ub, h_ub, mu_ub, nu_ub = block(
-                m, h, mu, nu, protein_mask, pos_bias, alpha_coevol, training=False,
+                m,
+                h,
+                mu,
+                nu,
+                protein_mask,
+                pos_bias,
+                alpha_coevol,
+                training=False,
             )
 
         # Batched B=1
         with torch.no_grad():
             m_b, h_b, mu_b, nu_b = block(
-                m.unsqueeze(0), h.unsqueeze(0), mu.unsqueeze(0), nu.unsqueeze(0),
-                protein_mask.unsqueeze(0), pos_bias.unsqueeze(0), alpha_coevol,
+                m.unsqueeze(0),
+                h.unsqueeze(0),
+                mu.unsqueeze(0),
+                nu.unsqueeze(0),
+                protein_mask.unsqueeze(0),
+                pos_bias.unsqueeze(0),
+                alpha_coevol,
                 training=False,
             )
 
@@ -204,13 +245,21 @@ class TestMSABlockBatch:
         msa_bins = torch.randint(0, 68, (B, N_prot, N_prot))
 
         from deepfold.model.position_encoding import PositionBias
+
         pb = PositionBias(h_msa, 68)
         pos_bias = pb(msa_bins)  # (B, H, N_prot, N_prot)
 
         with torch.no_grad():
             m_out, h_out, mu_out, nu_out = block(
-                m, h, mu, nu, protein_mask, pos_bias, alpha_coevol,
-                msa_pad_mask=msa_pad_mask, training=False,
+                m,
+                h,
+                mu,
+                nu,
+                protein_mask,
+                pos_bias,
+                alpha_coevol,
+                msa_pad_mask=msa_pad_mask,
+                training=False,
             )
 
         assert m_out.shape == (B, S, N_prot, d_msa)
@@ -224,12 +273,17 @@ class TestMSAModuleBatch:
     def test_batched_forward(self):
         torch.manual_seed(55)
         from deepfold.model.msa import MSAModule
+
         d_model, d_msa, h_msa, h_res = 64, 16, 2, 4
         B, N, S, N_prot = 2, 8, 2, 4
 
         mod = MSAModule(
-            n_blocks=2, d_model=d_model, d_msa=d_msa,
-            h_msa=h_msa, h_res=h_res, coevol_rank=4,
+            n_blocks=2,
+            d_model=d_model,
+            d_msa=d_msa,
+            h_msa=h_msa,
+            h_res=h_res,
+            coevol_rank=4,
         )
         mod.eval()
 
@@ -243,7 +297,13 @@ class TestMSAModuleBatch:
 
         with torch.no_grad():
             m_out, h_out, mu_out, nu_out = mod(
-                m, h, mu, nu, protein_mask, msa_bins, training=False,
+                m,
+                h,
+                mu,
+                nu,
+                protein_mask,
+                msa_bins,
+                training=False,
             )
 
         assert m_out.shape == m.shape
@@ -270,20 +330,37 @@ class TestTrunkBatch:
         protein_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
         protein_mask[:, :N_prot] = True
         return (
-            token_type, profile, del_mean, has_msa, msa_feat,
-            c_atom, p_lm, p_lm_idx, token_idx,
-            chain_id, global_idx, bond_matrix, protein_mask,
+            token_type,
+            profile,
+            del_mean,
+            has_msa,
+            msa_feat,
+            c_atom,
+            p_lm,
+            p_lm_idx,
+            token_idx,
+            chain_id,
+            global_idx,
+            bond_matrix,
+            protein_mask,
         )
 
     def test_trunk_forward_batched(self):
         """Trunk forward with B=2 runs without error."""
         from deepfold.model.trunk import Trunk
+
         torch.manual_seed(42)
 
         B, N, N_atom, N_prot, S = 2, 8, 12, 4, 2
         trunk = Trunk(
-            d_model=64, d_msa=16, d_atom=128, h_res=4, h_msa=2,
-            n_msa_blocks=1, n_uot_blocks=1, max_cycles=1,
+            d_model=64,
+            d_msa=16,
+            d_atom=128,
+            h_res=4,
+            h_msa=2,
+            n_msa_blocks=1,
+            n_uot_blocks=1,
+            max_cycles=1,
             inference_cycles=1,
         )
         trunk.eval()
@@ -301,12 +378,19 @@ class TestTrunkBatch:
     def test_trunk_unbatched_still_works(self):
         """Trunk forward with unbatched input still works."""
         from deepfold.model.trunk import Trunk
+
         torch.manual_seed(42)
 
         N, N_atom, N_prot, S = 8, 12, 4, 2
         trunk = Trunk(
-            d_model=64, d_msa=16, d_atom=128, h_res=4, h_msa=2,
-            n_msa_blocks=1, n_uot_blocks=1, max_cycles=1,
+            d_model=64,
+            d_msa=16,
+            d_atom=128,
+            h_res=4,
+            h_msa=2,
+            n_msa_blocks=1,
+            n_uot_blocks=1,
+            max_cycles=1,
             inference_cycles=1,
         )
         trunk.eval()
@@ -328,9 +412,19 @@ class TestTrunkBatch:
 
         with torch.no_grad():
             h_res, mu, nu, x_res = trunk(
-                token_type, profile, del_mean, has_msa, msa_feat,
-                c_atom, p_lm, p_lm_idx, token_idx,
-                chain_id, global_idx, bond_matrix, protein_mask,
+                token_type,
+                profile,
+                del_mean,
+                has_msa,
+                msa_feat,
+                c_atom,
+                p_lm,
+                p_lm_idx,
+                token_idx,
+                chain_id,
+                global_idx,
+                bond_matrix,
+                protein_mask,
             )
 
         assert h_res.shape == (N, 64)

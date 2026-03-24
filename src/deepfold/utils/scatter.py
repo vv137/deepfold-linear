@@ -51,7 +51,9 @@ def scatter_mean(
     B, M, D = values.shape
 
     # Offset indices per batch element so they don't collide when flattened
-    offsets = torch.arange(B, device=indices.device).unsqueeze(1) * num_segments  # (B, 1)
+    offsets = (
+        torch.arange(B, device=indices.device).unsqueeze(1) * num_segments
+    )  # (B, 1)
     flat_indices = (indices + offsets).reshape(-1)  # (B*M,)
     flat_values = values.reshape(-1, D)  # (B*M, D)
 

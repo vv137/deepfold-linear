@@ -722,7 +722,7 @@ def parse_mmcif(
     """
     path = str(path)
     block = gemmi.cif.read(path)[0]
-    resolution = _get_resolution(block)
+    _get_resolution(block)
 
     # Load gemmi structure
     struct = gemmi.make_structure_from_block(block)
