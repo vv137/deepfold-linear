@@ -55,7 +55,7 @@ class EMA:
             p.data.copy_(self.backup[name])
 
     def state_dict(self) -> dict:
-        return {"shadow": self.shadow, "step": self.step}
+        return {"shadow": {k: v.clone() for k, v in self.shadow.items()}, "step": self.step}
 
     def load_state_dict(self, state: dict):
         self.shadow = state["shadow"]
