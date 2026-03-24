@@ -422,6 +422,7 @@ class TestTritonBackward:
 
     def test_backward_unbatched(self):
         grads = self._compare_grads(B=1, H=2, N=16, d_h=32, K_iter=3, lam=1.0, r_0=10.0, mask=None)
+        # 5e-3 tolerance: FP32 atomic_add non-determinism + error amplification through K Sinkhorn iterations
         for name, gd, gt in grads:
             torch.testing.assert_close(gd, gt, atol=5e-3, rtol=5e-3, msg=f"{name} mismatch")
 

@@ -788,6 +788,9 @@ def _unrolled_row_bwd_kernel(
     acc_gx_i_1 = tl.zeros([BLOCK], dtype=tl.float32)
     acc_gx_i_2 = tl.zeros([BLOCK], dtype=tl.float32)
 
+    # Hoist i-tile coordinate load (invariant across j-tiles)
+    xi_0, xi_1, xi_2 = _load_x_components(X_b, i_idx, i_mask, stride_xn, BLOCK)
+
     for j0 in range(0, N, BLOCK):
         j_idx = j0 + tl.arange(0, BLOCK)
         j_mask = j_idx < N
@@ -829,8 +832,7 @@ def _unrolled_row_bwd_kernel(
         )
         tl.atomic_add(gk_ptrs, grad_K_tile, mask=j_mask[:, None])
 
-        # Geometry gradient
-        xi_0, xi_1, xi_2 = _load_x_components(X_b, i_idx, i_mask, stride_xn, BLOCK)
+        # Geometry gradient (xi hoisted above loop)
         xj_0, xj_1, xj_2 = _load_x_components(X_b, j_idx, j_mask, stride_xn, BLOCK)
         dx = xi_0[:, None] - xj_0[None, :]
         dy = xi_1[:, None] - xj_1[None, :]
@@ -2306,11 +2308,16 @@ class FlashSinkhornFunction(torch.autograd.Function):
             BLOCK_BWD,
         )
 
+        # Pre-allocate per-iteration buffers (reused via .zero_() to avoid K*3 allocations)
+        log_u_after = torch.empty(B, H, N, device=device, dtype=torch.float32)
+        grad_log_u_new = torch.empty(B, H, N, device=device, dtype=torch.float32)
+        grad_log_v_new = torch.empty(B, H, N, device=device, dtype=torch.float32)
+
         for k in reversed(range(K_back)):
             log_v_before = log_v_hist[k]
 
             # Recompute log_u_after for this iteration
-            log_u_after = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            log_u_after.zero_()
             _sinkhorn_row_update[grid](
                 Q_ln, K_ln, x_res, pos_weight, pos_bins, eps, w_dist,
                 log_mu, log_v_before, log_u_after, mask_bias,
@@ -2320,7 +2327,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
             )
 
             # Col backward: grad_log_v → grad_log_u_new
-            grad_log_u_new = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            grad_log_u_new.zero_()
             _unrolled_col_bwd_kernel[grid](
                 Q_ln, K_ln, x_res, pos_weight, pos_bins, eps, w_dist, kappa,
                 log_u_after, grad_log_v, mask_bias,
@@ -2332,7 +2339,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
             grad_log_u += grad_log_u_new
 
             # Row backward: grad_log_u → grad_log_v_new
-            grad_log_v_new = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            grad_log_v_new.zero_()
             _unrolled_row_bwd_kernel[grid](
                 Q_ln, K_ln, x_res, pos_weight, pos_bins, eps, w_dist, kappa,
                 log_v_before, grad_log_u, mask_bias,
@@ -2344,7 +2351,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
 
             # Prepare for next iteration (going backward)
             grad_log_v = grad_log_v_new
-            grad_log_u = torch.zeros(B, H, N, device=device, dtype=torch.float32)
+            grad_log_u.zero_()
 
         # ---- Step 4: Cost gradient from transport output (already in _backward_gv_grad_V_kernel) ----
         # The cost gradient from the transport output was computed in Step 2 via g_v.
