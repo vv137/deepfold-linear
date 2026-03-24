@@ -1,7 +1,7 @@
-"""Test consistency between training (dense) and inference (flash Triton) paths.
+"""Test consistency between Triton kernel and Python fallback paths.
 
-Verifies that TokenUOTBlock produces the same outputs in train vs eval mode,
-which exercises the materialized pos_bias path vs the gather-in-kernel path.
+1. TokenUOTBlock train (dense) vs eval (flash) consistency
+2. Direct Triton forward vs Python fallback forward at flash_sinkhorn_attn level
 """
 
 import pytest
@@ -138,3 +138,176 @@ class TestTritonFallbackConsistency:
         atol, rtol = 1e-3, 1e-3
         torch.testing.assert_close(h_train, h_eval, atol=atol, rtol=rtol)
         torch.testing.assert_close(x_train, x_eval, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestTritonVsPythonFallback:
+    """Directly compare Triton kernel forward vs Python fallback forward."""
+
+    def _make_inputs(self, B, H, N, d_h, device="cuda"):
+        torch.manual_seed(42)
+        Q_ln = torch.randn(B, H, N, d_h, device=device)
+        K_ln = torch.randn(B, H, N, d_h, device=device)
+        V = torch.randn(B, H, N, d_h, device=device)
+        G = torch.randn(B, H, N, d_h, device=device)
+        x_res = torch.randn(B, N, 3, device=device)
+        pos_weight = torch.randn(H, 68, device=device) * 0.1
+        pos_bins = torch.randint(0, 68, (B, N, N), dtype=torch.int32, device=device)
+        eps = torch.tensor([0.5, 1.0, 2.0, 4.0][:H], device=device, dtype=torch.float32)
+        w_dist = torch.randn(H, device=device) * 0.1
+        log_mu = torch.log(torch.softmax(torch.randn(B, H, N, device=device), dim=-1).clamp(min=1e-8))
+        log_nu = torch.log(torch.softmax(torch.randn(B, H, N, device=device), dim=-1).clamp(min=1e-8))
+        return Q_ln, K_ln, V, G, x_res, pos_weight, pos_bins, eps, w_dist, log_mu, log_nu
+
+    def _run_python_fallback(self, Q_ln, K_ln, V, G, x_res, pos_weight, pos_bins,
+                              eps, w_dist, log_mu, log_nu, K_iter, lam, r_0, mask):
+        """Run the Python fallback path from FlashSinkhornAttn.forward."""
+        B, H, N, d_h = Q_ln.shape
+        kappa = lam / (lam + eps)
+
+        Q_ln = Q_ln.float()
+        K_ln = K_ln.float()
+        V = V.float()
+        G = G.float()
+        x_res = x_res.float()
+        pos_weight = pos_weight.float()
+
+        if mask is None:
+            mask = Q_ln.new_ones(B, N)
+        col_mask_bias = (1.0 - mask).unsqueeze(1) * (-1e9)
+
+        O_avg_list, xc_list, lu_list, lv_list = [], [], [], []
+        for b in range(B):
+            C = torch.zeros(H, N, N, device=Q_ln.device, dtype=torch.float32)
+            for h in range(H):
+                content = -(Q_ln[b, h] @ K_ln[b, h].T) / (d_h ** 0.5)
+                dist = torch.cdist(x_res[b], x_res[b])
+                geo = w_dist[h] * dist / (r_0 + dist)
+                pb_h = pos_weight[h][pos_bins[b].long()]
+                C[h] = content + pb_h + geo
+
+            log_K = -C / eps[:, None, None]
+            lu = torch.zeros(H, N, device=Q_ln.device)
+            lv = torch.zeros(H, N, device=Q_ln.device)
+            mask_vec = col_mask_bias[b].squeeze(0)  # (N,)
+
+            for _ in range(K_iter):
+                lu = kappa[:, None] * (
+                    log_mu[b] - torch.logsumexp(log_K + lv[:, None, :] + mask_vec[None, :], dim=-1)
+                )
+                lv = kappa[:, None] * (
+                    log_nu[b] - torch.logsumexp(
+                        log_K + lu[:, :, None] + mask_vec[:, None], dim=-2
+                    )
+                )
+
+            # Transport output
+            log_T = lu[:, :, None] + log_K + lv[:, None, :] + mask_vec[None, :]
+            row_max = log_T.max(dim=-1, keepdim=True).values
+            T = torch.exp(log_T - row_max)
+            T_sum = T.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            T_norm = T / T_sum
+
+            o_h = torch.bmm(T_norm, V[b])  # (H, N, d_h)
+            g_h = torch.sigmoid(G[b])
+            o_gated = o_h * g_h
+            o_flat = o_gated.permute(1, 0, 2).reshape(N, H * d_h)
+
+            xc_h = torch.bmm(T_norm, x_res[b].unsqueeze(0).expand(H, -1, -1))
+
+            O_avg_list.append(o_flat)
+            xc_list.append(xc_h)
+            lu_list.append(lu)
+            lv_list.append(lv)
+
+        return (
+            torch.stack(O_avg_list),
+            torch.stack(xc_list),
+            torch.stack(lu_list),
+            torch.stack(lv_list),
+        )
+
+    def _run_triton(self, Q_ln, K_ln, V, G, x_res, pos_weight, pos_bins,
+                     eps, w_dist, log_mu, log_nu, K_iter, lam, r_0, mask):
+        """Run the Triton kernel path."""
+        from deepfold.model.kernels.sinkhorn_kernel import flash_sinkhorn
+
+        B, H, N, d_h = Q_ln.shape
+        if mask is None:
+            mask = Q_ln.new_ones(B, N)
+
+        O_avg, x_centroid, log_u, log_v = flash_sinkhorn(
+            Q_ln, K_ln, V, x_res, pos_weight, pos_bins,
+            eps, w_dist, log_mu, log_nu,
+            K_iter=K_iter, lam=lam, r_0=r_0, mask=mask,
+        )
+
+        # flash_sinkhorn returns O_avg (B, H, N, d_h) — need to gate and flatten
+        G_sig = torch.sigmoid(G.float())
+        o_gated = O_avg * G_sig
+        o_flat = o_gated.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
+
+        return o_flat, x_centroid, log_u, log_v
+
+    def test_forward_consistency_unbatched(self):
+        """Single sample: Triton vs Python fallback should match."""
+        B, H, N, d_h = 1, 4, 16, 16
+        inputs = self._make_inputs(B, H, N, d_h)
+        K_iter, lam, r_0 = 7, 1.0, 10.0
+
+        with torch.no_grad():
+            o_py, xc_py, lu_py, lv_py = self._run_python_fallback(
+                *inputs, K_iter, lam, r_0, mask=None
+            )
+            o_tr, xc_tr, lu_tr, lv_tr = self._run_triton(
+                *inputs, K_iter, lam, r_0, mask=None
+            )
+
+        atol, rtol = 1e-3, 1e-3
+        torch.testing.assert_close(lu_py, lu_tr, atol=atol, rtol=rtol, msg="log_u mismatch")
+        torch.testing.assert_close(lv_py, lv_tr, atol=atol, rtol=rtol, msg="log_v mismatch")
+        torch.testing.assert_close(o_py, o_tr, atol=atol, rtol=rtol, msg="output mismatch")
+        torch.testing.assert_close(xc_py, xc_tr, atol=atol, rtol=rtol, msg="centroid mismatch")
+
+    def test_forward_consistency_batched_no_pad(self):
+        """B=2 without padding: Triton vs Python fallback should match."""
+        B, H, N, d_h = 2, 4, 16, 16
+        inputs = self._make_inputs(B, H, N, d_h)
+        K_iter, lam, r_0 = 7, 1.0, 10.0
+
+        with torch.no_grad():
+            o_py, xc_py, lu_py, lv_py = self._run_python_fallback(
+                *inputs, K_iter, lam, r_0, mask=None
+            )
+            o_tr, xc_tr, lu_tr, lv_tr = self._run_triton(
+                *inputs, K_iter, lam, r_0, mask=None
+            )
+
+        atol, rtol = 1e-3, 1e-3
+        torch.testing.assert_close(lu_py, lu_tr, atol=atol, rtol=rtol, msg="log_u mismatch")
+        torch.testing.assert_close(lv_py, lv_tr, atol=atol, rtol=rtol, msg="log_v mismatch")
+        torch.testing.assert_close(o_py, o_tr, atol=atol, rtol=rtol, msg="output mismatch")
+        torch.testing.assert_close(xc_py, xc_tr, atol=atol, rtol=rtol, msg="centroid mismatch")
+
+    def test_forward_consistency_batched_masked(self):
+        """B=2 with padding: Triton vs Python fallback."""
+        B, H, N, d_h = 2, 4, 16, 16
+        inputs = self._make_inputs(B, H, N, d_h)
+        K_iter, lam, r_0 = 7, 1.0, 10.0
+
+        mask = torch.ones(B, N, device="cuda")
+        mask[1, 12:] = 0  # pad last 4 in sample 1
+
+        with torch.no_grad():
+            o_py, xc_py, lu_py, lv_py = self._run_python_fallback(
+                *inputs, K_iter, lam, r_0, mask=mask
+            )
+            o_tr, xc_tr, lu_tr, lv_tr = self._run_triton(
+                *inputs, K_iter, lam, r_0, mask=mask
+            )
+
+        atol, rtol = 2e-3, 2e-3
+        torch.testing.assert_close(lu_py, lu_tr, atol=atol, rtol=rtol, msg="log_u mismatch")
+        torch.testing.assert_close(lv_py, lv_tr, atol=atol, rtol=rtol, msg="log_v mismatch")
+        torch.testing.assert_close(o_py, o_tr, atol=atol, rtol=rtol, msg="output mismatch")
+        torch.testing.assert_close(xc_py, xc_tr, atol=atol, rtol=rtol, msg="centroid mismatch")

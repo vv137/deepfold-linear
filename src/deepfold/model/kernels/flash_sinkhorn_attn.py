@@ -170,22 +170,28 @@ class FlashSinkhornAttn(torch.autograd.Function):
                     else torch.zeros(H, N, device=Q_ln.device)
                 )
 
-                # Apply mask: add -1e9 to padded columns so they get zero transport
-                cmb = col_mask_bias[b]  # (1, N)
+                # Mask bias: -1e9 for padded positions, 0 for valid
+                # (1, N) for column masking in row update (logsumexp over j)
+                # (N, 1) for row masking in col update (logsumexp over i)
+                mask_vec = col_mask_bias[b].squeeze(0)  # (N,)
 
                 for _ in range(K_iter):
+                    # Row update: mask columns (padded j gets -inf)
                     lu = kappa[:, None] * (
                         log_mu[b]
-                        - torch.logsumexp(log_K + lv[:, None, :] + cmb, dim=-1)
+                        - torch.logsumexp(
+                            log_K + lv[:, None, :] + mask_vec[None, :], dim=-1
+                        )
                     )
+                    # Col update: mask rows (padded i gets -inf)
                     lv = kappa[:, None] * (
                         log_nu[b]
                         - torch.logsumexp(
-                            log_K + lu[:, :, None] + cmb.unsqueeze(1), dim=-2
+                            log_K + lu[:, :, None] + mask_vec[:, None], dim=-2
                         )
                     )
 
-                log_score = lu[:, :, None] + log_K + lv[:, None, :]
+                log_score = lu[:, :, None] + log_K + lv[:, None, :] + mask_vec[None, :]
                 row_max = log_score.max(dim=-1, keepdim=True).values
                 T = torch.exp(log_score - row_max)
                 T_sum = T.sum(dim=-1, keepdim=True)
