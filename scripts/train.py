@@ -78,6 +78,8 @@ def main():
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--val-every", type=int, default=5_000)
+    parser.add_argument("--val-batches", type=int, default=50,
+                        help="Max batches per validation run (0=all)")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--local-rank", type=int, default=0)
     # CLI overrides for config values
@@ -521,7 +523,10 @@ def main():
                 k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
             }
             n_val = 0
+            max_val = args.val_batches if args.val_batches > 0 else len(val_loader)
             for val_batch in val_loader:
+                if n_val >= max_val:
+                    break
                 val_batch = {
                     k: v.to(device, non_blocking=True) for k, v in val_batch.items()
                 }
