@@ -173,51 +173,30 @@ class DeepFoldLinear(nn.Module):
         # Trunk squeezes back to unbatched when input was unbatched.
         # Ensure everything is batched (B, ...) for diffusion v2.
         if not is_batched:
-            h_res = h_res.unsqueeze(0)
-            mu = mu.unsqueeze(0)
-            nu = nu.unsqueeze(0)
-            x_res = x_res.unsqueeze(0)
-            c_atom = c_atom.unsqueeze(0)
-            token_idx = token_idx.unsqueeze(0)
-            token_type = token_type.unsqueeze(0)
-            s_inputs = s_inputs.unsqueeze(0)
-            if pos_bins.dim() == 2:
-                pos_bins = pos_bins.unsqueeze(0)
-            if token_atom_starts is not None:
-                token_atom_starts = token_atom_starts.unsqueeze(0)
-            if token_atom_counts is not None:
-                token_atom_counts = token_atom_counts.unsqueeze(0)
-            if x_atom_true is not None:
-                x_atom_true = x_atom_true.unsqueeze(0)
-            if x_res_true is not None:
-                x_res_true = x_res_true.unsqueeze(0)
-            if atom_resolved_mask is not None:
-                atom_resolved_mask = atom_resolved_mask.unsqueeze(0)
-            if token_resolved_mask is not None:
-                token_resolved_mask = token_resolved_mask.unsqueeze(0)
-            if token_pad_mask is not None:
-                token_pad_mask = token_pad_mask.unsqueeze(0)
-            if atom_pad_mask is not None:
-                atom_pad_mask = atom_pad_mask.unsqueeze(0)
-            is_batched = True  # now everything is batched
+            def _unsqueeze(t):
+                return t.unsqueeze(0) if t is not None else None
+            h_res, mu, nu, x_res = _unsqueeze(h_res), _unsqueeze(mu), _unsqueeze(nu), _unsqueeze(x_res)
+            c_atom, token_idx, token_type, s_inputs, pos_bins = (
+                _unsqueeze(c_atom), _unsqueeze(token_idx), _unsqueeze(token_type),
+                _unsqueeze(s_inputs), _unsqueeze(pos_bins),
+            )
+            token_atom_starts = _unsqueeze(token_atom_starts)
+            token_atom_counts = _unsqueeze(token_atom_counts)
+            x_atom_true, x_res_true = _unsqueeze(x_atom_true), _unsqueeze(x_res_true)
+            atom_resolved_mask = _unsqueeze(atom_resolved_mask)
+            token_resolved_mask = _unsqueeze(token_resolved_mask)
+            token_pad_mask, atom_pad_mask = _unsqueeze(token_pad_mask), _unsqueeze(atom_pad_mask)
+            is_batched = True
 
         # Compute token_atom_starts/counts from token_idx if not provided
         if token_atom_starts is None or token_atom_counts is None:
             B_cur = token_idx.shape[0]
             N_cur = h_res.shape[1]
-            M_cur = token_idx.shape[1]
-            starts_list = []
-            counts_list = []
+            counts_list, starts_list = [], []
             for b in range(B_cur):
-                s_b = torch.zeros(N_cur, dtype=torch.int32, device=device)
-                c_b = torch.zeros(N_cur, dtype=torch.int32, device=device)
-                for n in range(N_cur):
-                    mask = token_idx[b] == n
-                    c_b[n] = mask.sum()
-                    if c_b[n] > 0:
-                        s_b[n] = mask.nonzero(as_tuple=True)[0][0]
-                starts_list.append(s_b)
-                counts_list.append(c_b)
+                c = torch.bincount(token_idx[b], minlength=N_cur).to(torch.int32)
+                counts_list.append(c)
+                starts_list.append(torch.cumsum(c, dim=0) - c)
             token_atom_starts = torch.stack(starts_list)
             token_atom_counts = torch.stack(counts_list)
 
@@ -359,74 +338,80 @@ class DeepFoldLinear(nn.Module):
         global_idx: torch.Tensor,
         bond_matrix: torch.Tensor,
         protein_mask: torch.Tensor,
+        token_atom_starts: torch.Tensor | None = None,
+        token_atom_counts: torch.Tensor | None = None,
         n_steps: int = 200,
     ) -> torch.Tensor:
         """Inference: trunk + Heun 2nd-order diffusion sampling (SPEC §12)."""
         device = token_type.device
-        N_atom = token_idx.shape[0]
+        is_unbatched = token_type.dim() == 1
 
         # Embed atom features once (SPEC §3.3, §3.4)
         c_atom = self.atom_single_embed(c_atom)
-        p_lm = self.atom_pair_embed(p_lm[:, :3], p_lm[:, 4:5])
+        p_lm = self.atom_pair_embed(p_lm[..., :3], p_lm[..., 4:5])
 
-        # Precompute position bins
-        compute_bins(chain_id, global_idx, bond_matrix)
+        # Compute s_inputs and pos_bins
+        s_inputs = self.trunk.token_embed(token_type, profile, del_mean, has_msa)
+        pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
 
         # Trunk
         h_res, mu, nu, x_res = self.trunk(
-            token_type,
-            profile,
-            del_mean,
-            has_msa,
-            msa_feat,
-            c_atom,
-            p_lm,
-            p_lm_idx,
-            token_idx,
-            chain_id,
-            global_idx,
-            bond_matrix,
-            protein_mask,
+            token_type, profile, del_mean, has_msa, msa_feat,
+            c_atom, p_lm, p_lm_idx, token_idx,
+            chain_id, global_idx, bond_matrix, protein_mask,
         )
+
+        # Ensure batched
+        if is_unbatched:
+            def _unsq(t):
+                return t.unsqueeze(0) if t is not None else None
+            h_res, s_inputs, c_atom, token_idx = (
+                _unsq(h_res), _unsq(s_inputs), _unsq(c_atom), _unsq(token_idx))
+            pos_bins = _unsq(pos_bins)
+            token_atom_starts, token_atom_counts = _unsq(token_atom_starts), _unsq(token_atom_counts)
+
+        B = h_res.shape[0]
+        M = token_idx.shape[1]
+        N = h_res.shape[1]
+
+        # Compute starts/counts if not provided
+        if token_atom_starts is None or token_atom_counts is None:
+            cl, sl = [], []
+            for b in range(B):
+                c = torch.bincount(token_idx[b], minlength=N).to(torch.int32)
+                cl.append(c)
+                sl.append(torch.cumsum(c, dim=0) - c)
+            token_atom_starts = torch.stack(sl)
+            token_atom_counts = torch.stack(cl)
 
         # Initialize from noise
         sigmas = karras_schedule(n_steps, device)
-        x_atom = torch.randn(N_atom, 3, device=device) * SIGMA_MAX
+        x_atom = torch.randn(B, M, 3, device=device) * SIGMA_MAX
 
-        # Heun 2nd-order sampling (probability flow ODE: dx/dσ = (x - D(x;σ)) / σ)
+        def _denoise(x, sigma):
+            return self.diffusion(
+                h_res, s_inputs, c_atom, x, sigma,
+                token_idx, pos_bins,
+                token_atom_starts, token_atom_counts,
+            )
+
+        # Heun 2nd-order sampling (probability flow ODE)
         for i in range(n_steps - 1):
             sigma_cur = sigmas[i]
             sigma_next = sigmas[i + 1]
 
-            # Denoise: D(x; σ) ≈ x_clean
-            denoised = self.diffusion(
-                h_res,
-                c_atom,
-                p_lm,
-                p_lm_idx,
-                x_atom,
-                sigma_cur,
-                token_idx,
-            )
+            denoised = _denoise(x_atom, sigma_cur)
             d_cur = (x_atom - denoised) / sigma_cur
 
-            # Euler step
             x_next = x_atom + (sigma_next - sigma_cur) * d_cur
 
-            # Heun correction (except last step)
             if sigma_next > 0 and i < n_steps - 2:
-                denoised_next = self.diffusion(
-                    h_res,
-                    c_atom,
-                    p_lm,
-                    p_lm_idx,
-                    x_next,
-                    sigma_next,
-                    token_idx,
-                )
+                denoised_next = _denoise(x_next, sigma_next)
                 d_next = (x_next - denoised_next) / sigma_next
                 x_next = x_atom + (sigma_next - sigma_cur) * 0.5 * (d_cur + d_next)
 
             x_atom = x_next
 
+        if is_unbatched:
+            x_atom = x_atom.squeeze(0)
         return x_atom

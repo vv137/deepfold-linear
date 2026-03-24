@@ -37,3 +37,11 @@ def zero_init_linear(d_in: int, d_out: int) -> nn.Linear:
     nn.init.zeros_(lin.weight)
     nn.init.zeros_(lin.bias)
     return lin
+
+
+def adaln_zero_gate(d_in: int, d_out: int) -> nn.Linear:
+    """AdaLN-Zero gate: w=0, b=-2 → sigmoid(-2) ≈ 0.12 at init."""
+    lin = nn.Linear(d_in, d_out)
+    nn.init.zeros_(lin.weight)
+    nn.init.constant_(lin.bias, -2.0)
+    return lin

@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold.model.primitives import SwiGLU, zero_init_linear
+from deepfold.model.primitives import SwiGLU, zero_init_linear, adaln_zero_gate
 from deepfold.model.position_encoding import PositionBias
 from deepfold.model.diffusion import (
     FourierEmbedding,
@@ -130,18 +130,13 @@ class DiffusionTransformerLayer(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False)
 
         # AdaLN-Zero gate for attention output
-        self._attn_gate = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self._attn_gate.weight)
-        nn.init.constant_(self._attn_gate.bias, -2.0)
+        self._attn_gate = adaln_zero_gate(d_model, d_model)
 
         # SwiGLU transition
         self.adaln_ff = AdaLN(d_model, d_model)
         self.swiglu = SwiGLU(d_model, d_model * 4, d_model)
 
-        # AdaLN-Zero gate for transition output
-        self._ff_gate = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self._ff_gate.weight)
-        nn.init.constant_(self._ff_gate.bias, -2.0)
+        self._ff_gate = adaln_zero_gate(d_model, d_model)
 
     def forward(
         self,
@@ -222,15 +217,11 @@ class WindowedAtomBlock(nn.Module):
         self.w_g = nn.Linear(d_atom, d_atom, bias=False)
         self.w_o = nn.Linear(d_atom, d_atom, bias=False)
 
-        self._attn_gate = nn.Linear(d_cond, d_atom)
-        nn.init.zeros_(self._attn_gate.weight)
-        nn.init.constant_(self._attn_gate.bias, -2.0)
+        self._attn_gate = adaln_zero_gate(d_cond, d_atom)
 
         self.swiglu = SwiGLU(d_atom, d_atom * 4, d_atom)
 
-        self._ff_gate = nn.Linear(d_cond, d_atom)
-        nn.init.zeros_(self._ff_gate.weight)
-        nn.init.constant_(self._ff_gate.bias, -2.0)
+        self._ff_gate = adaln_zero_gate(d_cond, d_atom)
 
     def forward(
         self,
@@ -273,7 +264,7 @@ class WindowedAtomBlock(nn.Module):
         a = a * atom_mask.unsqueeze(-1)
 
         # --- SwiGLU transition ---
-        ff_update = self.swiglu(self.adaln_ff(a, cond)) if hasattr(self, 'adaln_ff') else self.swiglu(self.adaln2(a, cond))
+        ff_update = self.swiglu(self.adaln2(a, cond))
         a = a + torch.sigmoid(self._ff_gate(cond)) * ff_update
         a = a * atom_mask.unsqueeze(-1)
 
@@ -291,7 +282,6 @@ class AtomToTokenCrossAttn(nn.Module):
     def __init__(self, d_token: int = 512, d_atom: int = 128, n_heads: int = 4):
         super().__init__()
         self.n_heads = n_heads
-        d_h = d_atom // n_heads
 
         self.w_q = nn.Linear(d_token, d_atom, bias=False)
         self.w_k = nn.Linear(d_atom, d_atom, bias=False)
@@ -355,7 +345,6 @@ class TokenToAtomCrossAttn(nn.Module):
     def __init__(self, d_token: int = 512, d_atom: int = 128, n_heads: int = 4):
         super().__init__()
         self.n_heads = n_heads
-        d_h = d_atom // n_heads
 
         self.w_q = nn.Linear(d_atom, d_atom, bias=False)
         self.w_k = nn.Linear(d_token, d_atom, bias=False)
@@ -568,16 +557,12 @@ class DiffusionModuleV2(nn.Module):
         s = self.ln_transformer(s)
 
         # ---- 4. AtomDecoder ----
-        # Initialize decoder atoms from encoder skip + token broadcast
-        s_broadcast = torch.gather(
+        # Gather refined s to atom level (shared for skip init + conditioning)
+        s_at_atoms = torch.gather(
             s, 1, token_idx.unsqueeze(-1).expand(-1, -1, d_model)
         )
-        a = a_enc + self.token_to_atom_proj(s_broadcast)
-
-        # Recompute atom conditioning from refined s
-        atom_cond_dec = self.atom_cond_proj(
-            torch.gather(s, 1, token_idx.unsqueeze(-1).expand(-1, -1, d_model))
-        )
+        a = a_enc + self.token_to_atom_proj(s_at_atoms)
+        atom_cond_dec = self.atom_cond_proj(s_at_atoms)
 
         for cross_attn, atom_block in zip(
             self.decoder_cross_attns, self.decoder_atom_blocks
