@@ -195,12 +195,14 @@ def smooth_lddt(
     x_pred: torch.Tensor,
     x_true: torch.Tensor,
     cutoff: float = 15.0,
+    nucleic_acid_cutoff: float = 30.0,
     thresholds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0),
-    slope: float = 10.0,
+    slope: float = 1.0,
     resolved_mask: torch.Tensor | None = None,
+    is_nucleotide: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Differentiable smooth LDDT loss (SPEC §11.2).
+    Differentiable smooth LDDT loss (SPEC §11.2, Boltz-1 convention).
 
     L_lddt = 1 - mean over valid pairs of mean over thresholds of
              sigmoid((threshold - |d_pred - d_true|) * slope)
@@ -208,15 +210,21 @@ def smooth_lddt(
     Args:
         x_pred: (B, M, 3) or (M, 3) predicted coordinates
         x_true: (B, M, 3) or (M, 3) ground truth coordinates
-        cutoff: distance cutoff for valid pairs
+        cutoff: distance cutoff for non-nucleotide valid pairs
+        nucleic_acid_cutoff: distance cutoff for nucleotide pairs (Boltz-1: 30 Å)
         thresholds: LDDT thresholds in Angstroms
-        slope: sigmoid steepness
+        slope: sigmoid steepness (Boltz-1 uses 1.0)
         resolved_mask: (B, M) or (M,) float, 1 for resolved, 0 otherwise
+        is_nucleotide: (B, M) or (M,) float, 1 for nucleotide atoms, 0 otherwise
     """
-    # Unbatched path
+    # Unbatched → batched
     if x_pred.dim() == 2:
-        return _smooth_lddt_single(
-            x_pred, x_true, cutoff, thresholds, slope, resolved_mask
+        return smooth_lddt(
+            x_pred.unsqueeze(0),
+            x_true.unsqueeze(0),
+            cutoff, nucleic_acid_cutoff, thresholds, slope,
+            resolved_mask.unsqueeze(0) if resolved_mask is not None else None,
+            is_nucleotide.unsqueeze(0) if is_nucleotide is not None else None,
         )
 
     # Batched path: (B, M, 3)
@@ -226,65 +234,40 @@ def smooth_lddt(
     d_pred = torch.cdist(x_pred, x_pred)
     d_true = torch.cdist(x_true, x_true)
 
-    # Valid pairs: true distance < cutoff, exclude diagonal, both resolved
+    # Per-pair cutoff: nucleotide pairs get wider cutoff (Boltz-1 convention)
     eye = torch.eye(M, device=x_pred.device).unsqueeze(0)  # (1, M, M)
-    valid = (d_true < cutoff) & (eye == 0)
+    if is_nucleotide is not None:
+        # If either atom in pair is nucleotide, use nucleic_acid_cutoff
+        nuc_pair = is_nucleotide.unsqueeze(-1).expand(-1, -1, M)  # (B, M, M)
+        pair_cutoff = (
+            nuc_pair * nucleic_acid_cutoff
+            + (1 - nuc_pair) * cutoff
+        )
+        valid = (d_true < pair_cutoff) & (eye == 0)
+    else:
+        valid = (d_true < cutoff) & (eye == 0)
 
     if resolved_mask is not None:
-        # (B, M) -> (B, M, M) outer product mask
         pair_mask = resolved_mask.unsqueeze(-1) * resolved_mask.unsqueeze(-2)
         valid = valid & (pair_mask > 0)
 
     # Per-sample LDDT
     dev = (d_pred - d_true).abs()  # (B, M, M)
+    mask = valid.float()
 
-    # Compute per-sample losses
-    losses = []
-    for b in range(B):
-        valid_b = valid[b]
-        if not valid_b.any():
-            losses.append((x_pred[b] * 0).sum())
-            continue
-        dev_b = dev[b]
-        scores = []
-        for t in thresholds:
-            s = torch.sigmoid((t - dev_b[valid_b]) * slope)
-            scores.append(s)
-        lddt_b = torch.stack(scores, dim=0).mean(dim=0).mean()
-        losses.append(1.0 - lddt_b)
+    # Vectorized: compute sigmoid scores for all thresholds
+    score_sum = sum(
+        torch.sigmoid((t - dev) * slope) for t in thresholds
+    ) / len(thresholds)  # (B, M, M)
 
-    return torch.stack(losses).mean()
+    # Masked mean per sample
+    num = (score_sum * mask).sum(dim=(-1, -2))  # (B,)
+    den = mask.sum(dim=(-1, -2)).clamp(min=1)  # (B,)
+    lddt = num / den  # (B,)
+
+    return (1.0 - lddt).mean()
 
 
-def _smooth_lddt_single(
-    x_pred: torch.Tensor,
-    x_true: torch.Tensor,
-    cutoff: float,
-    thresholds: tuple[float, ...],
-    slope: float,
-    resolved_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Original unbatched smooth LDDT."""
-    M = x_pred.shape[0]
-    d_pred = torch.cdist(x_pred, x_pred)
-    d_true = torch.cdist(x_true, x_true)
-
-    valid = (d_true < cutoff) & (torch.eye(M, device=x_pred.device) == 0)
-    if resolved_mask is not None:
-        pair_mask = resolved_mask[:, None] * resolved_mask[None, :]
-        valid = valid & (pair_mask > 0)
-
-    if not valid.any():
-        return (x_pred * 0).sum()
-
-    dev = (d_pred - d_true).abs()
-    scores = []
-    for t in thresholds:
-        s = torch.sigmoid((t - dev[valid]) * slope)
-        scores.append(s)
-
-    lddt = torch.stack(scores, dim=0).mean(dim=0).mean()
-    return 1.0 - lddt
 
 
 # ============================================================================

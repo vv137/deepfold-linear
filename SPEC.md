@@ -1053,13 +1053,24 @@ EDM preconditioning:
 
 The network predicts the denoised signal. The EDM weighting ensures equal contribution across noise levels.
 
-### 11.2 Smooth LDDT Loss
+### 11.2 Smooth LDDT Loss (Boltz-1 convention)
 
 ```
-L_lddt = 1 − (1/|P|) Σ_{(i,j)∈P} (1/4) Σ_{δ∈{0.5,1,2,4}} sigmoid((δ − |d_ij^pred − d_ij^true|) / 0.1)
+L_lddt = 1 − (1/|P|) Σ_{(i,j)∈P} (1/4) Σ_{δ∈{0.5,1,2,4}} sigmoid(δ − |d_ij^pred − d_ij^true|)
 ```
 
-P: atom pairs with d_ij^true < 15 Å. Differentiable approximation of LDDT.
+**Slope = 1** (no scaling factor). Boltz-1 uses implicit slope=1 in `sigmoid(t - dev)`. A steeper slope (e.g. 10) causes sigmoid saturation at both extremes, killing gradients early in training when predictions are poor.
+
+**Per-type pair cutoff** (Boltz-1 convention):
+- Nucleotide atom pairs: d_ij^true < 30 Å (nucleic acids have larger inter-residue spacing)
+- All other pairs: d_ij^true < 15 Å
+- A pair is "nucleotide" if either atom belongs to a DNA/RNA chain
+
+**No σ-weighting**: Unlike L_diff, L_lddt is not weighted by σ. Boltz-1 adds it to the total loss with weight 1.0 at all noise levels.
+
+**Zero-pair fallback**: When no valid pairs exist for a sample (e.g. all atoms masked), the loss returns 1.0 (worst case), not 0.0.
+
+**Memory**: O(M²) where M = number of atoms — materializes pairwise distance matrices. At crop=384 tokens (~2000 atoms), this is ~100–200 MB, comparable to the trunk's Sinkhorn cost matrix.
 
 ### 11.3 Low-Rank Bilinear Distogram Loss (Tiled)
 
@@ -1174,7 +1185,7 @@ Direct structural supervision on the trunk's EGNN-refined coordinates. This is c
 L_trunk_coord = smooth_lddt(x_res_final, x_0_res)
 ```
 
-Uses the same smooth LDDT formulation as §11.2, but evaluated on token-level (Cα) coordinates from the trunk, not atom-level coordinates from the diffusion module. Since smooth LDDT uses internal pairwise distances, it is invariant to rigid-body transformations — no alignment needed, consistent with the equivariant architecture.
+Uses the same smooth LDDT formulation as §11.2 (slope=1, per-type cutoff 15/30 Å, nucleotide flag), but evaluated on token-level (Cα) coordinates from the trunk, not atom-level coordinates from the diffusion module. Since smooth LDDT uses internal pairwise distances, it is invariant to rigid-body transformations — no alignment needed, consistent with the equivariant architecture.
 
 ### 11.6 Total Loss
 

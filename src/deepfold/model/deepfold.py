@@ -28,6 +28,7 @@ from deepfold.model.losses import (
     total_loss,
 )
 from deepfold.data.augment import batch_augment
+from deepfold.data import const
 
 
 class DeepFoldLinear(nn.Module):
@@ -164,6 +165,15 @@ class DeepFoldLinear(nn.Module):
             # Per-atom loss weights by mol_type (Boltz-1: nucleotide 5×, ligand 10×)
             atom_weights = _atom_type_weights(token_idx, token_type)
 
+            # Per-atom / per-token nucleotide flag for smooth LDDT cutoff
+            token_is_nuc = (
+                (token_type == const.MOL_DNA) | (token_type == const.MOL_RNA)
+            ).float()
+            if token_idx.dim() == 1:
+                atom_is_nuc = token_is_nuc[token_idx]
+            else:
+                atom_is_nuc = torch.gather(token_is_nuc, 1, token_idx)
+
             # Generate M augmented copies of atom coords
             # Unbatched: (N_atom, 3) → (M, N_atom, 3)
             # Batched:   (B, N_atom, 3) → (M, B, N_atom, 3)
@@ -221,6 +231,7 @@ class DeepFoldLinear(nn.Module):
                         x_pred_i,
                         x_true_i,
                         resolved_mask=atom_resolved_mask,
+                        is_nucleotide=atom_is_nuc,
                     )
                 )
 
@@ -245,7 +256,8 @@ class DeepFoldLinear(nn.Module):
                 l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
 
             l_trunk_coord = smooth_lddt(
-                x_res, x_res_true, resolved_mask=token_resolved_mask
+                x_res, x_res_true, resolved_mask=token_resolved_mask,
+                is_nucleotide=token_is_nuc,
             )
             l_total = total_loss(
                 l_diff, l_lddt, l_disto, l_trunk_coord, **self.loss_weights

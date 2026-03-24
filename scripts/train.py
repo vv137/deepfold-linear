@@ -37,6 +37,36 @@ logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 
+def _log_gamma_heatmap(model, step, wandb):
+    """Log tanh(gamma) heatmap (48 layers × 16 heads) to wandb.
+
+    Blue = attraction (negative γ), Red = repulsion (positive γ).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    raw_model = model.module if hasattr(model, "module") else model
+    gamma_map = (
+        torch.stack([b.gamma for b in raw_model.trunk.blocks])
+        .detach().cpu().tanh().numpy()
+    )  # (n_layers, n_heads)
+
+    with plt.rc_context({"mathtext.fontset": "cm"}):
+        fig, ax = plt.subplots(figsize=(8, 12))
+        im = ax.imshow(
+            gamma_map, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1,
+            interpolation="nearest",
+        )
+        ax.set_xlabel(r"Head $h$")
+        ax.set_ylabel(r"Layer $\ell$")
+        ax.set_title(rf"$\tanh(\gamma_{{h,\ell}})$ — step {step}")
+        fig.colorbar(im, ax=ax, label=r"$\tanh(\gamma)$: $\leftarrow$ attraction | repulsion $\rightarrow$")
+        fig.tight_layout()
+    wandb.log({"gamma_heatmap": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/model.yaml")
@@ -77,6 +107,8 @@ def main():
     )
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--extra-log-every", type=int, default=1_000,
+                        help="Interval for expensive wandb logs (gamma heatmap, etc.)")
     parser.add_argument("--val-every", type=int, default=1_000)
     parser.add_argument("--val-batches", type=int, default=50,
                         help="Max batches per validation run (0=all)")
@@ -512,6 +544,8 @@ def main():
                     },
                     step=step,
                 )
+            if use_wandb and step % args.extra_log_every == 0:
+                _log_gamma_heatmap(model, step, wandb)
 
         # Validation
         if val_loader and step % args.val_every == 0:
