@@ -851,140 +851,84 @@ Zeros init: coordinates don't move initially — EGNN must earn its influence. A
 
 ---
 
-## 9. Diffusion Module
+## 9. Diffusion Module (v5 — Boltz-1 style, no pair representation)
 
 ### 9.1 Design Intent
 
-The diffusion module is a local atom-level refinement engine. It receives the trunk's h_res (which encodes all inter-token structural context from 48 UOT+EGNN blocks) and refines noisy atom coordinates toward the ground truth structure.
+The diffusion module is an encoder-transformer-decoder that refines noisy atom coordinates. It adopts Boltz-1's architecture — atom encoder aggregates atom features to token level, a token-level transformer reasons globally, then an atom decoder broadcasts back and predicts coordinate updates.
 
-**No UOT blocks in diffusion**: The trunk's h_res already contains the complete inter-token structural information. Re-running UOT attention per diffusion step with noisy coordinates adds expense without benefit — at high σ, geometry is garbage (UOT would suppress it anyway); at low σ, the trunk's encoding is already accurate. AF3 similarly does not re-run its Pairformer per diffusion step.
+**Key divergence from Boltz-1**: No O(N²) pair representation z. The 68-bin PositionBias (same as trunk) replaces Boltz's pair attention bias. All attention uses custom Triton kernels for O(N) memory.
 
-**No μ, ν in diffusion**: The learned marginals were only needed for UOT attention. Without UOT blocks, the diffusion module has no use for marginals.
+**End-to-end gradient**: h_res is NOT detached. L_diff, L_lddt backpropagate through the full diffusion module → SingleConditioning → h_res → trunk.
 
-**End-to-end gradient (no freezing)**: h_res is NOT detached before the diffusion module. The diffusion loss (L_diff, L_lddt) backpropagates through the atom blocks, through the AdaLN conditioning, into h_res, and back through the trunk. This teaches the trunk to produce h_res representations that help with atom-level placement — not just distogram classification. One σ is sampled per training step (standard EDM), so only one diffusion forward/backward is added to the graph.
+**Proper EDM preconditioning**: `x_pred = c_skip · x_noisy + c_out · F_θ(c_in · x_noisy)`. The v4.5 residual form (`x_noisy + c_out · Δx`) is replaced.
 
-### 9.2 Diffusion Step
+### 9.2 Architecture (~155M params)
 
-```python
-def diffusion_step(h_res, c_atom, p_lm, x_atom_noisy, sigma, token_idx):
-    """
-    h_res:        (N, 512)     from trunk (NOT detached — gradients flow back)
-    c_atom:       (N_atom, 128) frozen reference conformer embedding
-    p_lm:         (local, 16)   frozen atom pair representation (intra-token)
-    x_atom_noisy: (N_atom, 3)   current noisy coordinates
-    sigma:        scalar         current noise level
-    token_idx:    (N_atom,)      maps atoms to tokens
-    """
+```
+Input: h_res(B,N,512), s_inputs(B,N,512), c_atom(B,M,128), x_noisy(B,M,3), σ, pos_bins(B,N,N)
 
-    # 1. Timestep embedding + token conditioning (AF3 Alg 21-22)
-    # FourierEmbedding: frozen random projection, cos(2π(c_noise·w + b))
-    # w, b ~ N(0, 1), requires_grad=False (sampled once, never updated)
-    c_noise = log(sigma / sigma_data) * 0.25                     # AF3/Boltz c_noise
-    t_emb = FourierEmbedding(d=128)(c_noise)                     # (128,)
-    h_cond = h_res + LinNoBias(128 → 512)(LN(t_emb))            # LN on Fourier features
+1. SingleConditioning (~4M)
+   c_noise = log(σ/σ_data) * 0.25
+   t_emb = FourierEmbedding(256)(c_noise)                → (B, 256)
+   s = h_res + s_inputs + Lin(LN(t_emb))                 → (B, N, 512)
+   s = s + SwiGLU_transition(LN(s))  ×2
 
-    # 2. Atom embedding: scale by c_in (AF3 Alg 20 line 2)
-    c_in = 1 / sqrt(sigma² + sigma_data²)                       # EDM input scaling
-    q = c_atom + Lin(3 → 128)(x_atom_noisy * c_in)              # (N_atom, 128)
+2. AtomEncoder (3 layers, ~4.5M)
+   a = c_atom + Lin(x_noisy * c_in)                      → (B, M, 128)
+   atom_cond = Lin(gather(s, token_idx))                  → (B, M, 128)
+   ×3:
+     a = WindowedAtomSelfAttn(a, atom_cond, W=32, H=128)  — Triton kernel
+     s = s + AtomToTokenCrossAttn(Q=s, K/V=a)              — sparse Triton kernel
+   a_enc = a                                               — cached for decoder skip
 
-    # 3. Atom blocks × 10
-    for block in atom_blocks:
-        q = block(q, c_atom, h_cond, p_lm, sigma, token_idx)
+3. DiffusionTransformer (24 layers, ~101M)
+   ×24:
+     s = s + AdaLN-Zero gated FlashSelfAttn(s, pos_bias[pos_bins])  — Triton kernel
+     s = s + AdaLN-Zero gated SwiGLU(s)
+   s = LN(s)
 
-    # 4. Coordinate update
-    delta_x = zero_init_Lin(128 → 3)(LN(q))                     # (N_atom, 3)
-    x_atom_new = x_atom_noisy + c_out(sigma) * delta_x
+4. AtomDecoder (3 layers, ~4.5M)
+   a = a_enc + zero_init_Lin(gather(s, token_idx))        — skip + broadcast
+   atom_cond_dec = Lin(gather(s, token_idx))
+   ×3:
+     a = a + TokenToAtomCrossAttn(Q=a, K/V=s)              — dense Triton kernel
+     a = WindowedAtomSelfAttn(a, atom_cond_dec)
+   Δx = zero_init_Lin(LN(a))                              → (B, M, 3)
 
-    return x_atom_new
+5. EDM Output
+   x_pred = c_skip · x_noisy + c_out · Δx
+   x_pred = recenter(x_pred, atom_mask)
 ```
 
-**Gradient flow**: L_diff → x_atom_new → delta_x → atom blocks → h_cond → h_res → trunk (48 UOT+EGNN blocks). All four losses now train the trunk end-to-end.
+### 9.3 Triton Attention Kernels
 
-**zero_init_Lin**: Output linear layer initialized to zeros so initial prediction is the identity (no update). Standard practice in diffusion models.
+All diffusion attention uses custom Triton kernels for O(N) memory:
 
-### 9.3 Atom Block
+| Kernel | File | Grid | Memory |
+|--------|------|------|--------|
+| Flash token self-attn | `kernels/flash_diffusion_attn.py` | (B\*H, ⌈N/64⌉) | O(N) — online softmax, pos_bias gathered per-tile from (H,68) |
+| Windowed atom self-attn | `kernels/flash_atom_attn.py` | (B\*H, ⌈M/32⌉) | O(M) — 32×128 fits in SRAM, direct softmax |
+| Atom→token cross-attn | `kernels/cross_attn_kernel.py` | (B\*H, N) | O(N) — sparse, each token gathers its atoms |
+| Token→atom cross-attn | `kernels/cross_attn_kernel.py` | (B\*H, ⌈M/64⌉) | O(M) — tiled over atom queries |
 
-```python
-class AtomBlock(nn.Module):
-    def __init__(self, d_atom=128, H_atom=4):
-        # Conditioning projection
-        self.cond_proj = Lin(512, 128)          # h_cond → atom dimension
+All kernels include forward + backward + Python reference for testing.
 
-        # AdaLN (AF3 Algorithm 26): sigmoid-bounded scale, LN on conditioning
-        # a = sigmoid(Lin(s)) * LayerNorm(a, affine=False) + LinNoBias(s)
-        # s is normalized by its own LayerNorm before producing scale/shift
-        self.adaln1 = AdaLN(128, 128)           # pre-attention
-        self.adaln2 = AdaLN(128, 128)           # pre-transition
+### 9.4 Cross-Attention Design
 
-        # Self-attention
-        self.W_Q = Lin(128, 128, bias=True)     # AF3: Q has bias
-        self.W_K = Lin(128, 128, bias=False)
-        self.W_V = Lin(128, 128, bias=False)
-        self.W_G = Lin(128, 128, bias=False)
-        self.W_O = Lin(128, 128, bias=False)
+**AtomToTokenCrossAttn** (encoder): Tokens query, atoms key/value. Sparse — each token only attends to its own atoms via `token_atom_starts/counts`. Replaces scatter_mean with a learnable soft aggregation.
 
-        # Atom pair bias projection
-        self.pair_bias_proj = Lin(16, H_atom)   # p_lm → per-head bias
+**TokenToAtomCrossAttn** (decoder): Atoms query, tokens key/value. Dense — each atom attends to all N tokens (N ≤ 384 in training). Replaces hard gather/broadcast with a learnable distribution.
 
-        # AdaLN-Zero output gates (AF3 Algorithm 24, lines 12-14)
-        # weight=0, bias=-2 → sigmoid(-2) ≈ 0.12 at init → near-identity block
-        self._attn_gate       = Lin(128, 128, w_init=0, b_init=-2)
-        self._transition_gate = Lin(128, 128, w_init=0, b_init=-2)
+Both use sigmoid(G)·W_O gating pattern, LN on Q and K/V inputs.
 
-        # Transition (SwiGLU)
-        self.swiglu = SwiGLU(128, 512, 128)
+### 9.5 Stability Features
 
-    def forward(self, q, c_atom, h_cond, p_lm, t_emb, token_idx):
-        """
-        q:            (N_atom, 128)  atom representation
-        c_atom:       (N_atom, 128)  frozen reference
-        h_cond:       (N, 512)       timestep-conditioned token repr
-        p_lm:         (local, 16)    frozen atom pair representation
-        t_emb:        (128,)         Fourier timestep embedding
-        token_idx:    (N_atom,)      maps atoms to tokens
-        """
-
-        # Conditioning signal: timestep + token info
-        cond = t_emb[None, :] + self.cond_proj(h_cond[token_idx])    # (N_atom, 128)
-
-        # AdaLN-normalized input (AF3 Algorithm 26)
-        # sigmoid-bounded scale: a = sigmoid(Lin(s)) * LN(q, affine=False) + LinNoBias(s)
-        q_n = self.adaln1(q, cond)                                   # (N_atom, 128)
-
-        # ---- Self-attention: sequence-local window ----
-        Q = self.W_Q(q_n).view(N_atom, H_atom, 32)
-        K = self.W_K(q_n).view(N_atom, H_atom, 32)
-        V = self.W_V(q_n).view(N_atom, H_atom, 32)
-        G = self.W_G(q_n).view(N_atom, H_atom, 32)
-
-        # Atom pair bias — LN on z_ij before projection (AF3 Alg 24 line 8)
-        b_pair = self.pair_bias_proj(LN(p_lm))                      # (local, H_atom)
-
-        # Sequence-local attention, window size 32 (AF3 style)
-        A = softmax(
-            einsum('ihd,jhd->hij', Q, K) / sqrt(32) + b_pair,
-            dim=-1,
-            window=32
-        )                                                            # sparse (N_atom, H, 32)
-        att_out = sparse_einsum(A, V)                                # (N_atom, H, 32)
-        att_out = rearrange(att_out, 'n h d -> n (h d)')             # (N_atom, 128)
-        attn_update = sigmoid(rearrange(G, 'n h d -> n (h d)')) * self.W_O(att_out)
-
-        # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
-        # sigmoid(Lin(cond, w=0, b=-2)) ≈ 0.12 at init → near-identity block
-        q = q + sigmoid(self._attn_gate(cond)) * attn_update
-
-        # ---- SwiGLU transition with AdaLN + AdaLN-Zero gate ----
-        q_n2 = self.adaln2(q, cond)                                  # (N_atom, 128)
-        transition_update = self.swiglu(q_n2)
-        q = q + sigmoid(self._transition_gate(cond)) * transition_update
-
-        return q
-```
-
-**Window size 32 (not 32→128)**: Following AF3, atom self-attention uses a fixed local window of 32 atoms. This covers approximately 2–3 residues of local context, sufficient for sidechain packing and local backbone geometry. Long-range information enters through the AdaLN conditioning from h_res. AF3 demonstrates this is sufficient — atom-level long-range attention is unnecessary when residue-level attention handles long-range communication.
-
-**No inter-residue atom pair bias**: Atom pair representation p_lm covers intra-token geometry only (same as AF3). Inter-residue atom-atom interactions rely on the learned Q-K dot product and the implicit geometry from coordinate embedding. This is identical to the AF3 design and is empirically validated there.
+- **AdaLN-Zero gates**: w=0, b=-2 → sigmoid(-2) ≈ 0.12 at init → near-identity blocks
+- **zero_init_Lin**: Coordinate output and token-to-atom broadcast projection initialized to zeros
+- **Proper c_skip**: At σ→0, c_skip→1 and c_out→0, so x_pred → x_noisy (identity)
+- **FP32 FourierEmbedding**: Frozen weights stay float32 even under bf16 autocast
+- **Re-centering**: Subtract center-of-mass per sample after each denoising step
 
 ---
 

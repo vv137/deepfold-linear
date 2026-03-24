@@ -317,6 +317,12 @@ def featurize(
         "global_idx": global_idx,  # (N,) int
         "bond_matrix": bond_matrix,  # (N, N) bool
         "protein_mask": protein_mask,  # (N,) bool
+        "token_atom_starts": torch.from_numpy(
+            token_atom_starts.astype(np.int32)
+        ),  # (N,) int32
+        "token_atom_counts": torch.from_numpy(
+            token_atom_counts.astype(np.int32)
+        ),  # (N,) int32
     }
 
     if training:

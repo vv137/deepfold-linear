@@ -18,7 +18,12 @@ class ModelConfig:
     h_msa: int = 8
     n_msa_blocks: int = 4
     n_uot_blocks: int = 48
-    n_atom_blocks: int = 10
+    # Diffusion v2
+    n_diff_transformer_layers: int = 24
+    n_diff_encoder_blocks: int = 3
+    n_diff_decoder_blocks: int = 3
+    n_diff_heads: int = 16
+    d_fourier: int = 256
     sigma_data: float = 16.0
     max_cycles: int = 5
     inference_cycles: int = 3

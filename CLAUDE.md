@@ -20,7 +20,7 @@
 * **Bias**: `bias=False` after LayerNorm (trunk Q/K/V/G/O, SwiGLU, LN_Lin). Exception: AtomBlock W_Q has `bias=True` (AF3 Alg 24). `bias=True` on standalone projections.
 * Einsum output dim order: `(H, N, N)` for attention, `(H, N, d_h)` for projected
 
-## Architecture (~220M params)
+## Architecture (~375M params)
 
 | Component | Module | Key Design |
 |-----------|--------|------------|
@@ -29,7 +29,7 @@
 | Trunk | `model/trunk.py` | 48 UOT+EGNN blocks, random cycles 1-5, flash Sinkhorn attention |
 | Sinkhorn attention | `model/kernels/sinkhorn_kernel.py` | Triton fwd+bwd, O(N) memory, CG-based IFT backward |
 | EGNN | `model/trunk_block.py` | Transport-weighted centroid, per-head γ (zeros init) |
-| Diffusion | `model/diffusion.py` | 10 atom blocks, AdaLN-Zero, FourierEmbedding (frozen), no UOT |
+| Diffusion | `model/diffusion_v2.py` | Boltz-1 style: 3 encoder + 24 transformer + 3 decoder, c_skip EDM |
 | Losses | `model/losses.py` | EDM diffusion (Kabsch-aligned), smooth LDDT, distogram (Triton eval) |
 
 ## Triton Kernels
@@ -38,6 +38,9 @@
 |--------|------|-------|----------|-----------|
 | Flash Sinkhorn (fwd+bwd) | `kernels/sinkhorn_kernel.py` | ✅ (B*H, n_tiles) | ✅ CG-IFT backward | ✅ |
 | Flash Sinkhorn wrapper | `kernels/flash_sinkhorn_attn.py` | ✅ | ✅ | ✅ |
+| Flash diffusion attn | `kernels/flash_diffusion_attn.py` | ✅ (B*H, n_tiles) | ✅ fwd+bwd | ✅ |
+| Windowed atom attn | `kernels/flash_atom_attn.py` | ✅ (B*H, n_windows) | ✅ fwd+bwd | ✅ |
+| Cross-attention | `kernels/cross_attn_kernel.py` | ✅ | ✅ fwd+bwd | ✅ |
 | Co-evolution | `kernels/coevol_kernel.py` | ✅ (B, n_tiles) | ❌ (no autograd) | ✅ |
 | Distogram loss | `kernels/distogram_kernel.py` | ✅ (B, n_i, n_j) | ❌ (no autograd) | ✅ |
 
@@ -60,6 +63,7 @@
 | 11 | SPEC v4.5: remove diffusion UOT, end-to-end gradient |
 | 12 | SPEC v4.6: AF3/Boltz-1 alignment (AdaLN-Zero, FourierEmbed, c_in scaling, Kabsch) |
 | 13 | Flash Sinkhorn: Triton fwd+CG-IFT bwd, batch dims, mask support, kernel wiring |
+| 14 | SPEC v5: Boltz-1 diffusion (encoder-transformer-decoder), Triton flash/windowed/cross-attn kernels, proper c_skip, ~375M total |
 
 ## Known Boltz-1 Divergences
 

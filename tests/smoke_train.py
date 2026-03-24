@@ -119,7 +119,11 @@ def main():
         h_msa=8,
         n_msa_blocks=1,
         n_uot_blocks=4,  # 4 instead of 48
-        n_atom_blocks=2,  # 2 instead of 10
+        n_diff_transformer_layers=2,
+        n_diff_encoder_blocks=1,
+        n_diff_decoder_blocks=1,
+        n_diff_heads=4,
+        d_fourier=32,
         max_cycles=1,
         inference_cycles=1,
         diffusion_multiplicity=4,

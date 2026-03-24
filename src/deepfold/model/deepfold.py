@@ -1,8 +1,9 @@
-"""DeepFold-Linear: Full model combining trunk + diffusion (SPEC §2, v4.5).
+"""DeepFold-Linear: Full model combining trunk + diffusion (SPEC §2, v5).
 
-v4.5: h_res NOT frozen before diffusion — end-to-end gradient from L_diff,
-L_lddt through atom blocks → h_cond → h_res → trunk. No UOT blocks in
-diffusion. ~220M parameters.
+v5: Boltz-1-style diffusion with encoder-transformer-decoder.
+24-layer DiffusionTransformer with 68-bin position bias (no pair repr).
+Triton kernels for O(N) memory. Proper c_skip EDM preconditioning.
+~375M parameters (~220M trunk + ~155M diffusion).
 """
 
 import torch
@@ -14,12 +15,12 @@ from deepfold.model.init import init_model
 from deepfold.model.position_encoding import compute_bins
 from deepfold.model.input_embedding import AtomSingleEmbedding, AtomPairEmbedding
 from deepfold.model.diffusion import (
-    DiffusionModule,
     sample_training_sigma,
     karras_schedule,
     SIGMA_DATA,
     SIGMA_MAX,
 )
+from deepfold.model.diffusion_v2 import DiffusionModuleV2
 from deepfold.model.losses import (
     DistogramLoss,
     _atom_type_weights,
@@ -32,7 +33,7 @@ from deepfold.data import const
 
 
 class DeepFoldLinear(nn.Module):
-    """Full DeepFold-Linear model (~220M params, SPEC §14 v4.5)."""
+    """Full DeepFold-Linear model (~375M params, SPEC §14 v5)."""
 
     def __init__(
         self,
@@ -43,7 +44,12 @@ class DeepFoldLinear(nn.Module):
         h_msa: int = 8,
         n_msa_blocks: int = 4,
         n_uot_blocks: int = 48,
-        n_atom_blocks: int = 10,
+        # Diffusion v2 config
+        n_diff_transformer_layers: int = 24,
+        n_diff_encoder_blocks: int = 3,
+        n_diff_decoder_blocks: int = 3,
+        n_diff_heads: int = 16,
+        d_fourier: int = 256,
         sigma_data: float = SIGMA_DATA,
         max_cycles: int = 5,
         inference_cycles: int = 3,
@@ -71,12 +77,15 @@ class DeepFoldLinear(nn.Module):
             inference_cycles=inference_cycles,
         )
 
-        # Diffusion (v4.5: no UOT blocks, no marginals)
-        self.diffusion = DiffusionModule(
+        # Diffusion v2: encoder-transformer-decoder (Boltz-1 style)
+        self.diffusion = DiffusionModuleV2(
             d_model=d_model,
             d_atom=d_atom,
-            n_atom_blocks=n_atom_blocks,
-            sigma_data=sigma_data,
+            d_fourier=d_fourier,
+            n_transformer_layers=n_diff_transformer_layers,
+            n_encoder_blocks=n_diff_encoder_blocks,
+            n_decoder_blocks=n_diff_decoder_blocks,
+            n_diff_heads=n_diff_heads,
         )
 
         # Distogram loss module (has learnable parameters)
@@ -105,6 +114,8 @@ class DeepFoldLinear(nn.Module):
         global_idx: torch.Tensor,
         bond_matrix: torch.Tensor,
         protein_mask: torch.Tensor,
+        token_atom_starts: torch.Tensor | None = None,
+        token_atom_counts: torch.Tensor | None = None,
         x_atom_true: torch.Tensor | None = None,
         x_res_true: torch.Tensor | None = None,
         atom_resolved_mask: torch.Tensor | None = None,
@@ -128,10 +139,14 @@ class DeepFoldLinear(nn.Module):
         is_batched = token_type.dim() >= 2
 
         # Embed atom features once — shared by trunk and diffusion (SPEC §3.3, §3.4)
-        # nn.Linear handles arbitrary leading dims; [...] slicing works for both
-        # unbatched (N, D) and batched (B, N, D) inputs.
         c_atom = self.atom_single_embed(c_atom)
         p_lm = self.atom_pair_embed(p_lm[..., :3], p_lm[..., 4:5])
+
+        # Compute s_inputs for diffusion conditioning (token embedding before trunk)
+        s_inputs = self.trunk.token_embed(token_type, profile, del_mean, has_msa)
+
+        # Compute pos_bins for diffusion transformer position bias
+        pos_bins = compute_bins(chain_id, global_idx, bond_matrix)  # (B, N, N) int32
 
         # ---- Trunk ----
         h_res, mu, nu, x_res = self.trunk(
@@ -154,6 +169,57 @@ class DeepFoldLinear(nn.Module):
             if (msa_pad_mask is not None and msa_pad_mask.dim() == 3)
             else msa_pad_mask,
         )
+
+        # Trunk squeezes back to unbatched when input was unbatched.
+        # Ensure everything is batched (B, ...) for diffusion v2.
+        if not is_batched:
+            h_res = h_res.unsqueeze(0)
+            mu = mu.unsqueeze(0)
+            nu = nu.unsqueeze(0)
+            x_res = x_res.unsqueeze(0)
+            c_atom = c_atom.unsqueeze(0)
+            token_idx = token_idx.unsqueeze(0)
+            token_type = token_type.unsqueeze(0)
+            s_inputs = s_inputs.unsqueeze(0)
+            if pos_bins.dim() == 2:
+                pos_bins = pos_bins.unsqueeze(0)
+            if token_atom_starts is not None:
+                token_atom_starts = token_atom_starts.unsqueeze(0)
+            if token_atom_counts is not None:
+                token_atom_counts = token_atom_counts.unsqueeze(0)
+            if x_atom_true is not None:
+                x_atom_true = x_atom_true.unsqueeze(0)
+            if x_res_true is not None:
+                x_res_true = x_res_true.unsqueeze(0)
+            if atom_resolved_mask is not None:
+                atom_resolved_mask = atom_resolved_mask.unsqueeze(0)
+            if token_resolved_mask is not None:
+                token_resolved_mask = token_resolved_mask.unsqueeze(0)
+            if token_pad_mask is not None:
+                token_pad_mask = token_pad_mask.unsqueeze(0)
+            if atom_pad_mask is not None:
+                atom_pad_mask = atom_pad_mask.unsqueeze(0)
+            is_batched = True  # now everything is batched
+
+        # Compute token_atom_starts/counts from token_idx if not provided
+        if token_atom_starts is None or token_atom_counts is None:
+            B_cur = token_idx.shape[0]
+            N_cur = h_res.shape[1]
+            M_cur = token_idx.shape[1]
+            starts_list = []
+            counts_list = []
+            for b in range(B_cur):
+                s_b = torch.zeros(N_cur, dtype=torch.int32, device=device)
+                c_b = torch.zeros(N_cur, dtype=torch.int32, device=device)
+                for n in range(N_cur):
+                    mask = token_idx[b] == n
+                    c_b[n] = mask.sum()
+                    if c_b[n] > 0:
+                        s_b[n] = mask.nonzero(as_tuple=True)[0][0]
+                starts_list.append(s_b)
+                counts_list.append(c_b)
+            token_atom_starts = torch.stack(starts_list)
+            token_atom_counts = torch.stack(counts_list)
 
         result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res}
 
@@ -205,15 +271,16 @@ class DeepFoldLinear(nn.Module):
                 x_pred_i = checkpoint(
                     self.diffusion,
                     h_res,
+                    s_inputs,
                     c_atom,
-                    p_lm,
-                    p_lm_idx,
                     x_noisy_i,
                     sigma_i,
                     token_idx,
+                    pos_bins,
+                    token_atom_starts,
+                    token_atom_counts,
                     token_pad_mask,
                     atom_pad_mask,
-                    pair_valid_mask,
                     use_reentrant=False,
                 )
 

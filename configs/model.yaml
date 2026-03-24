@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v4.5)
+# DeepFold-Linear model configuration (SPEC v5)
 
 model:
   d_model: 512
@@ -8,7 +8,12 @@ model:
   h_msa: 8
   n_msa_blocks: 4
   n_uot_blocks: 48
-  n_atom_blocks: 10
+  # Diffusion v2: encoder-transformer-decoder (Boltz-1 style)
+  n_diff_transformer_layers: 24
+  n_diff_encoder_blocks: 3
+  n_diff_decoder_blocks: 3
+  n_diff_heads: 16
+  d_fourier: 256
   sigma_data: 16.0
   max_cycles: 5
   inference_cycles: 3
