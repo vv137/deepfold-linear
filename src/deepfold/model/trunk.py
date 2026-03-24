@@ -65,8 +65,7 @@ class Trunk(nn.Module):
         # Shared position bias for UOT blocks (SPEC §4.3)
         self.pos_bias = PositionBias(h_res, 68)
 
-        # Per-head geometry weight — zeros init (SPEC §7.1)
-        self.w_dist = nn.Parameter(torch.zeros(h_res))
+        # w_dist is now per-block inside TokenUOTBlock
 
     def forward(
         self,
@@ -252,7 +251,6 @@ class Trunk(nn.Module):
                         log_u_prev,
                         log_v_prev,
                         uot_pos_bias,
-                        self.w_dist,
                         pos_bins,
                         mask=token_pad_mask,
                     )
@@ -266,7 +264,6 @@ class Trunk(nn.Module):
                             log_u_prev,
                             log_v_prev,
                             uot_pos_bias,
-                            self.w_dist,
                             pos_bins,
                             mask=token_pad_mask,
                         )

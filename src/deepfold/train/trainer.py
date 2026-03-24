@@ -91,12 +91,19 @@ def build_optimizer(
     weight_decay: float = 0.01,
     betas: tuple[float, float] = (0.9, 0.999),
 ) -> AdamW:
-    """Build AdamW optimizer with 3 param groups (SPEC §13.1 v4.5).
+    """Build AdamW optimizer with 3 param groups (SPEC §13.1).
 
-    1. Weight matrices: weight_decay
-    2. LayerNorm γ/β, standalone biases: no decay
+    1. Standalone weight matrices (not post-LN): weight_decay
+    2. No decay: LN γ/β, biases, post-LN projections (w_q/w_k/w_v/w_g/w_o,
+       SwiGLU — scale-invariant under LN), bounded params (w_dist_logit,
+       alpha_coevol, pos_bias)
     3. EGNN γ: weight_decay (pull toward zero = no coordinate update)
     """
+    # Post-LN projection names — scale-invariant, no decay
+    _POST_LN_NAMES = {"w_q", "w_k", "w_v", "w_g", "w_o", "swiglu"}
+    # Bounded or zeros-init gating params — no decay
+    _BOUNDED_NAMES = {"w_dist_logit", "alpha_coevol", "pos_bias"}
+
     decay_params = []
     no_decay_params = []
     gamma_params = []
@@ -107,6 +114,10 @@ def build_optimizer(
             # EGNN γ — separate group with decay
             gamma_params.append(param)
         elif "layernorm" in name.lower() or "ln" in name.lower() or "bias" in name:
+            no_decay_params.append(param)
+        elif any(k in name for k in _POST_LN_NAMES):
+            no_decay_params.append(param)
+        elif any(k in name for k in _BOUNDED_NAMES):
             no_decay_params.append(param)
         else:
             decay_params.append(param)

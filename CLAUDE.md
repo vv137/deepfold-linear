@@ -17,7 +17,7 @@
 ## Conventions
 
 * Mixed precision: BF16 general, FP32 for Sinkhorn log-domain ops
-* **Bias**: `bias=False` after LayerNorm (Q/K/V/G/O, SwiGLU, LN_Lin). `bias=True` on standalone projections.
+* **Bias**: `bias=False` after LayerNorm (trunk Q/K/V/G/O, SwiGLU, LN_Lin). Exception: AtomBlock W_Q has `bias=True` (AF3 Alg 24). `bias=True` on standalone projections.
 * Einsum output dim order: `(H, N, N)` for attention, `(H, N, d_h)` for projected
 
 ## Architecture (~220M params)

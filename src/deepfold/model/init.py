@@ -4,7 +4,7 @@ Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
   2. Coordinate path (x_res): completely dormant at init.
-     gamma=0, w_dist=0, w_rel=0, alpha_coevol=0.
+     gamma=0, w_dist_logit=-2.0, w_rel=0, alpha_coevol=0.
      Content-only attention first; geometry earns its influence.
 """
 
@@ -15,7 +15,7 @@ import torch.nn as nn
 
 def _is_zero_init(name: str) -> bool:
     """Parameters that must stay at zero (dormant at init)."""
-    return any(tag in name for tag in ("gamma", "w_dist", "alpha_coevol"))
+    return any(tag in name for tag in ("gamma", "alpha_coevol"))
 
 
 def _is_adaln_zero_gate(name: str) -> bool:
@@ -34,7 +34,8 @@ def init_model(model: nn.Module) -> None:
     - Xavier normal for all 2D weight matrices (except zero-init ones).
     - Attention output (w_o) scaled by 1/sqrt(L) for residual depth control.
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
-    - Zeros for gamma, w_dist, w_rel, alpha_coevol, zero_init_linear outputs.
+    - Zeros for gamma, w_rel, alpha_coevol, zero_init_linear outputs.
+    - w_dist_logit init -2.0 (sigmoid ≈ 0.12, weak geometry initially).
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
     - Biases: zeros (PyTorch default).
     """

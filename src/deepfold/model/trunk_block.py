@@ -45,6 +45,10 @@ class TokenUOTBlock(nn.Module):
         # EGNN: per-head signed geometry step size — zeros init (SPEC §8.2)
         self.gamma = nn.Parameter(torch.zeros(n_heads))
 
+        # Per-head geometry weight for cost matrix — sigmoid bounded (0,1)
+        # Init -2.0 → sigmoid ≈ 0.12 (weak geometry bias initially)
+        self.w_dist_logit = nn.Parameter(torch.full((n_heads,), -2.0))
+
         # Per-head entropic regularization (fixed buffer, SPEC §7.2)
         nr = n_heads // 4
         self.register_buffer(
@@ -68,7 +72,6 @@ class TokenUOTBlock(nn.Module):
         log_u_prev: torch.Tensor | None,
         log_v_prev: torch.Tensor | None,
         w_rel_res: torch.Tensor,
-        w_dist: torch.Tensor,
         pos_bins: torch.Tensor,
         geo_gate: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
@@ -82,7 +85,6 @@ class TokenUOTBlock(nn.Module):
             log_u_prev: (H, N) or (B, H, N) or None — warm-start
             log_v_prev: (H, N) or (B, H, N) or None
             w_rel_res:  PositionBias module or (H, N, N) or (B, H, N, N) precomputed
-            w_dist:     (H,) per-head geometry weight
             pos_bins:   (N, N) or (B, N, N) int, 68-bin position encoding
             geo_gate:   (H,) or None — sigma-gated for diffusion blocks
             mask:       (B, N) bool/float, 1=real 0=pad. Only for batched.
@@ -131,7 +133,8 @@ class TokenUOTBlock(nn.Module):
             if pos_bias.dim() == 3:
                 pos_bias = pos_bias.unsqueeze(0)
 
-        effective_w_dist = w_dist  # (H,)
+        w_dist = self.w_dist_logit.sigmoid()  # (H,) bounded (0, 1)
+        effective_w_dist = w_dist
         if geo_gate is not None:
             effective_w_dist = geo_gate * w_dist
 

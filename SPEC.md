@@ -29,7 +29,7 @@
 | LN(a) | nn.LayerNorm(a) — with learnable γ, β |
 | LN_Lin(a→b) | LayerNorm(a) followed by Linear(a, b, bias=False). LN β provides the bias; Linear bias redundant |
 
-**Bias convention**: Projections that follow a LayerNorm use `bias=False` because LN's learnable β already provides the additive shift. This includes all attention projections (W_Q, W_K, W_V, W_G, W_O), SwiGLU projections, and LN_Lin composites. Standalone projections that don't follow LN (input embedding, coordinate output, loss heads, atom-to-token encoder output) use `bias=True`.
+**Bias convention**: Projections that follow a LayerNorm use `bias=False` because LN's learnable β already provides the additive shift. This includes trunk attention projections (W_Q, W_K, W_V, W_G, W_O), SwiGLU projections, and LN_Lin composites. **Exception**: In diffusion AtomBlock (AF3 Alg 24), W_Q uses `bias=True` per AF3 convention. Standalone projections that don't follow LN (input embedding, coordinate output, loss heads, atom-to-token encoder output) use `bias=True`.
 
 **Terminology**: This document uses "token" as the basic unit of the single-track representation. For proteins, one token = one residue. For RNA/DNA, one token = one nucleotide. For ligands/ions/water, one token = one atom or functional group. Legacy references to "residue" in variable names (e.g., h_res) are retained for readability but apply to all token types.
 
@@ -571,8 +571,8 @@ where d_ij = ||x_res_i − x_res_j||₂.
 - f(d) = d/(r_0 + d) is concave, f(0) = 0, bounded in [0, 1).
 - f ∘ d satisfies the triangle inequality (metric).
 - r_0 = 10 Å fixed: roughly contact range (~8 Å) scale.
-- w_dist initialized to zeros: geometry bias starts at zero, learned during training.
-- Per-head w_dist allows multi-scale behavior: some heads develop large w_dist (geometry-sensitive, effective when coordinates are good), others stay near zero (robust to noisy coordinates). The transport-weighted average across heads provides implicit noise robustness.
+- w_dist is per-block, per-head: `w_dist = sigmoid(w_dist_logit)`, bounded to (0, 1). `w_dist_logit` initialized to -2.0 (sigmoid ≈ 0.12, weak geometry initially). No weight decay on `w_dist_logit` (sigmoid already bounds it).
+- Per-block, per-head w_dist allows multi-scale behavior: some heads/layers develop strong geometry sensitivity, others stay weak. The transport-weighted average across heads provides implicit noise robustness.
 - In the trunk: coordinates have variable quality across recycling noise levels. The per-head diversity handles this — geometry-sensitive heads contribute when coordinates are good, geometry-insensitive heads carry the load when coordinates are noisy.
 - In the diffusion module: σ-conditioned geometry gating explicitly modulates the geometry term (see §9.2).
 
@@ -580,7 +580,7 @@ where d_ij = ||x_res_i − x_res_j||₂.
 
 - Content: LN → approximately [−3, 3]
 - w_rel[bin]: AdamW decay → approximately [−1, 1]
-- w_dist · f: f ∈ [0,1), decay → approximately [−1, 1]
+- w_dist · f: sigmoid(logit) · f ∈ [0,1) → [0, 1)
 
 ### 7.2 Transport Problem
 
@@ -1445,8 +1445,8 @@ def init_model(model, num_blocks=48):
             # --- Scalars and vectors ---
             if 'gamma' in name:                    # EGNN γ: dormant at init
                 nn.init.zeros_(param)
-            elif 'w_dist' in name:                 # geometry bias: off at init
-                nn.init.zeros_(param)
+            elif 'w_dist_logit' in name:             # geometry bias: sigmoid(-2.0) ≈ 0.12
+                nn.init.constant_(param, -2.0)
             elif 'w_rel' in name:                  # position bias: off at init
                 nn.init.zeros_(param)
             elif 'alpha_coevol' in name:           # co-evolution gate: off at init
@@ -1476,7 +1476,7 @@ def init_model(model, num_blocks=48):
 | SwiGLU gate, value | Xavier | SiLU(gate) × value product naturally self-suppresses at init |
 | SwiGLU output (ff_out) | Xavier (not scaled) | Product structure already suppresses; double-scaling would starve transitions |
 | γ (EGNN) | zeros | EGNN dormant at init; must earn influence via L_trunk_coord gradient |
-| w_dist | zeros | Geometry cost off at init; coordinates are noise; learns from content first |
+| w_dist_logit | -2.0 (sigmoid ≈ 0.12) | Weak geometry at init; per-block per-head; sigmoid-bounded (0,1); no weight decay |
 | w_rel | zeros | Position bias off at init; learns sequence-distance priors during training |
 | α_coevol | zeros | Co-evolution bias off at init; MSA processing must stabilize first |
 | LN γ, β | (1, 0) | Identity normalization at init |
@@ -1590,7 +1590,7 @@ All post-LN projections use `bias=False`. Standalone projections (input embed, c
 | Token UOT+EGNN: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **zeros** | ✅ |
 | Token UOT+EGNN: ε (per-head, fixed) | buffer (16,), shared all blocks | 0 (not a parameter) | [1.0]×4+[2.0]×4+[4.0]×4+[8.0]×4 | N/A |
 | Token position: w_rel_res | (16, 68) | 1K | zeros | ✅ |
-| Geometry: w_dist | (16,) | 16 | zeros | ✅ |
+| Geometry: w_dist_logit | per block × 48, (16,) each | 768 | **-2.0** (sigmoid ≈ 0.12) | ❌ (sigmoid-bounded) |
 | LN γ, β (attention + transition) | per block × 48, 2 × (512,) each | 48 × 2K = 98K | (1, 0) | ❌ |
 | **Token UOT+EGNN total** | | **~213M** | | |
 | **Trunk total** | | **~216M** | | |

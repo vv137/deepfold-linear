@@ -2,6 +2,7 @@
 
 import math
 
+import torch
 import torch.nn as nn
 
 
@@ -31,11 +32,11 @@ class TestZeroInit:
             if "gamma" in name:
                 assert (p == 0).all(), f"{name} should be zero"
 
-    def test_w_dist_zero(self):
+    def test_w_dist_logit_init(self):
         model = _make_small_model()
         for name, p in model.named_parameters():
-            if "w_dist" in name:
-                assert (p == 0).all(), f"{name} should be zero"
+            if "w_dist_logit" in name:
+                assert torch.allclose(p, torch.full_like(p, -2.0)), f"{name} should be -2.0"
 
     def test_alpha_coevol_zero(self):
         model = _make_small_model()

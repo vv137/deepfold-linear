@@ -24,7 +24,6 @@ class TestTokenUOTBlockBatch:
         nu = torch.softmax(torch.randn(n_heads, N), dim=-1)
         log_u = torch.zeros(n_heads, N)
         log_v = torch.zeros(n_heads, N)
-        w_dist = torch.randn(n_heads)
         pos_bins = torch.randint(0, 68, (N, N))
 
         from deepfold.model.position_encoding import PositionBias
@@ -35,7 +34,7 @@ class TestTokenUOTBlockBatch:
         # Unbatched
         with torch.no_grad():
             h_ub, x_ub, lu_ub, lv_ub = block(
-                h, x_res, mu, nu, log_u, log_v, pos_bias, w_dist, pos_bins
+                h, x_res, mu, nu, log_u, log_v, pos_bias, pos_bins
             )
 
         # Batched B=1
@@ -48,7 +47,6 @@ class TestTokenUOTBlockBatch:
                 log_u.unsqueeze(0),
                 log_v.unsqueeze(0),
                 pos_bias.unsqueeze(0),
-                w_dist,
                 pos_bins.unsqueeze(0),
             )
 
@@ -73,7 +71,6 @@ class TestTokenUOTBlockBatch:
         nu = torch.softmax(torch.randn(B, n_heads, N), dim=-1)
         log_u = torch.zeros(B, n_heads, N)
         log_v = torch.zeros(B, n_heads, N)
-        w_dist = torch.randn(n_heads)
         pos_bins = torch.randint(0, 68, (B, N, N))
 
         from deepfold.model.position_encoding import PositionBias
@@ -93,7 +90,6 @@ class TestTokenUOTBlockBatch:
                 log_u,
                 log_v,
                 pos_bias,
-                w_dist,
                 pos_bins,
                 mask=mask,
             )
@@ -124,7 +120,6 @@ class TestTokenUOTBlockBatch:
         nu = torch.softmax(torch.randn(B, n_heads, N), dim=-1)
         log_u = torch.zeros(B, n_heads, N)
         log_v = torch.zeros(B, n_heads, N)
-        w_dist = torch.randn(n_heads)
         pos_bins = torch.randint(0, 68, (B, N, N))
 
         from deepfold.model.position_encoding import PositionBias
@@ -140,7 +135,6 @@ class TestTokenUOTBlockBatch:
             log_u,
             log_v,
             pos_bias,
-            w_dist,
             pos_bins,
         )
         loss = h_out.sum() + x_out.sum()

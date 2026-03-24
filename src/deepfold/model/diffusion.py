@@ -129,8 +129,8 @@ class AtomBlock(nn.Module):
         self.adaln1 = AdaLN(d_atom, d_atom)
         self.adaln2 = AdaLN(d_atom, d_atom)
 
-        # Self-attention — after AdaLN, so bias=False (SPEC §0)
-        self.w_q = nn.Linear(d_atom, d_atom, bias=True)  # AF3: Linear with bias for Q
+        # Self-attention (AF3 Alg 24): Q has bias per AF3, K/V/G/O bias=False
+        self.w_q = nn.Linear(d_atom, d_atom, bias=True)
         self.w_k = nn.Linear(d_atom, d_atom, bias=False)
         self.w_v = nn.Linear(d_atom, d_atom, bias=False)
         self.w_g = nn.Linear(d_atom, d_atom, bias=False)
