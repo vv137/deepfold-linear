@@ -288,8 +288,8 @@ g_i, g_j: global residue indices, preserved after cropping.
 ### 4.3 Parameters
 
 ```
-w_rel_res:  (H_res, 68)  — Residue UOT position bias.    Init: zeros. AdamW decay.
-w_rel_msa:  (H_msa, 68)  — MSA attention position bias.   Init: zeros. AdamW decay.
+w_rel_res:  (H_res, 68)  — Residue UOT position bias.    Init: zeros. No decay (bounded).
+w_rel_msa:  (H_msa, 68)  — MSA attention position bias.   Init: zeros. No decay (bounded).
 ```
 
 ### 4.4 Branchless Online Computation
@@ -515,7 +515,7 @@ def msa_block(m, h_res, mu, nu, block_idx):
 
     # ---- 5. Marginal update (per-layer, per-head gated) ----
     # alpha_coevol: (4, H_res) — per MSA block, per head scalar coefficients
-    # Zero-init + AdamW decay: co-evolution bias must earn its influence
+    # Zero-init, no decay (feeds softmax): co-evolution bias must earn its influence
     # Marginals computed over ALL tokens; co-evolution bias only for protein tokens
     mu_logit = Lin(512 → H_res)(h_res)                         # (N, H_res)
     nu_logit = Lin(512 → H_res)(h_res)                         # (N, H_res)
@@ -579,7 +579,7 @@ where d_ij = ||x_res_i − x_res_j||₂.
 **Scale budget** (all terms O(1)):
 
 - Content: LN → approximately [−3, 3]
-- w_rel[bin]: AdamW decay → approximately [−1, 1]
+- w_rel[bin]: no decay, zeros init → approximately [−1, 1]
 - w_dist · f: sigmoid(logit) · f ∈ [0,1) → [0, 1)
 
 ### 7.2 Transport Problem
@@ -632,7 +632,7 @@ self.register_buffer('eps', torch.tensor([
 
 **No warm/cold distinction**: With K=20, all blocks converge fully regardless of initialization quality. Warm-starting from the previous block's log_u, log_v still helps (convergence may be reached by K=10–14 with warm start), but K=20 provides a safe ceiling. At inference, adaptive early stopping with tol=1e-4 typically terminates at K≈14.
 
-**Why fixed, not learned**: Learnable ε creates gradient complications — ε enters both the kernel scaling (log_K = -C/ε) and the damping factor (κ = λ/(λ+ε)), producing competing gradient components. Per-head κ varies with ε, making convergence analysis ε-dependent. Fixed ε avoids all of this while still providing multi-scale transport. The network adapts through its existing per-head parameters (W_Q, W_K, W_V, W_G, W_O, γ, w_dist) — ample capacity for head specialization.
+**Why fixed, not learned**: Learnable ε creates gradient complications — ε enters both the kernel scaling (log_K = -C/ε) and the damping factor (κ = λ/(λ+ε)), producing competing gradient components. Per-head κ varies with ε, making convergence analysis ε-dependent. Fixed ε avoids all of this while still providing multi-scale transport. The network adapts through its existing per-head parameters (W_Q, W_K, W_V, W_G, W_O, γ, w_dist_logit) — ample capacity for head specialization.
 
 **Why λ=1.0 uniform**: At K=20, convergence is not a constraint — all ε values converge fully. λ=1.0 gives κ ranging from 0.67 (sparse heads, strong marginal enforcement) to 0.2 (diffuse heads, weak enforcement). This is the right physical behavior.
 
@@ -841,7 +841,7 @@ The update is: `x_new = x + Σ_h γ_h · (x − T_norm^(h) @ x)`.
 
 Different heads learn different signs. The multi-head combination produces complex force fields from 16 scalar parameters per block.
 
-Zeros init: coordinates don't move initially — EGNN must earn its influence. AdamW decay: step sizes stay small. **768 total scalars** (48 blocks × 16 heads) for the entire trunk's coordinate refinement.
+Zeros init: coordinates don't move initially — EGNN must earn its influence. AdamW decay pulls γ toward zero (= no coordinate update). tanh bounds effective γ to (-1, 1), preventing oscillation. **768 total scalars** (48 blocks × 16 heads) for the entire trunk's coordinate refinement.
 
 ### 8.3 Flash Kernel Integration
 
@@ -1224,22 +1224,25 @@ for i in range(steps)
 ### 13.1 Optimizer
 
 ```python
+# Post-LN projection names — scale-invariant under LayerNorm, no decay
+POST_LN = {'w_q', 'w_k', 'w_v', 'w_g', 'w_o', 'swiglu'}
+# Bounded or zeros-init gating params — no decay
+BOUNDED = {'w_dist_logit', 'alpha_coevol', 'pos_bias'}
+
 param_groups = [
-    {   # Weight matrices: weight decay
-        'params': [p for n, p in model.named_parameters()
-                   if 'layernorm' not in n.lower()
-                   and 'bias' not in n
-                   and 'gamma' not in n],       # EGNN γ handled separately
+    {   # Standalone weight matrices (not post-LN): weight decay
+        'params': [...],  # input embed, atom encoder, cond_proj, loss heads, AdaLN gates
         'weight_decay': 0.01
     },
-    {   # LayerNorm γ,β and standalone biases: no weight decay
-        'params': [p for n, p in model.named_parameters()
-                   if 'layernorm' in n.lower() or 'bias' in n],
+    {   # No decay: LN γ/β, biases, post-LN projections (scale-invariant),
+        #           bounded params (sigmoid/softmax-bounded)
+        'params': [...],  # layernorm, ln, bias, w_q/k/v/g/o, swiglu,
+                          # w_dist_logit, alpha_coevol, pos_bias
         'weight_decay': 0.0
     },
     {   # EGNN γ: weight decay (pull toward zero = no coordinate update)
         'params': [p for n, p in model.named_parameters()
-                   if 'gamma' in n],
+                   if 'gamma' in n and 'layernorm' not in n.lower()],
         'weight_decay': 0.01
     },
 ]
@@ -1312,19 +1315,19 @@ class EMA:
 | Length bias | Transport-weighted average | Division by T_sum |
 | Transport output overflow | Running-max subtraction | Same trick as FlashAttention |
 | EGNN coordinate collapse | Per-head signed γ | Repulsive heads counteract attractive heads |
-| EGNN coordinate explosion | γ zeros init + AdamW decay | Step sizes stay small; must earn influence |
+| EGNN coordinate explosion | γ zeros init + AdamW decay + tanh bound | Step sizes bounded (-1,1); must earn influence |
 | EGNN last-block dead gradient | L_trunk_coord on final x_res | Direct gradient to all γ through EGNN chain |
 | EGNN float32 centroid drift | Re-center once per cycle | Not per-block; EGNN is exactly translation-equivariant |
 | Geometry bias at high noise (trunk) | Per-head w_dist diversity | Some heads geometry-sensitive, others robust |
 | Geometry bias at high noise (diffusion) | σ-conditioned geo_gate | Learned suppression at high σ |
-| Geometry bias domination | w_dist zeros init + AdamW decay | Starts at zero, regularized |
-| Position bias scale | w_rel zeros init + AdamW decay | Starts at zero, regularized |
+| Geometry bias domination | w_dist sigmoid-bounded (0,1), init ≈0.12 | Per-block per-head; can't exceed 1.0 |
+| Position bias scale | w_rel zeros init, no decay | Starts at zero; bounded by bin count |
 | Co-evolution noise | Per-layer per-head α_coevol zeros init + decay | Must earn influence; per-head specialization |
 | Marginal reset across cycles | Log-space geometric blend with previous cycle | Preserves transport patterns |
 | SE(3) equivariance (trunk) | EGNN: relative vectors only | No augmentation needed |
 | SE(3) equivariance (diffusion) | AF3-style augmentation | Standard, lightweight |
 | MSA overfitting | Row dropout p=0.15 | Drop entire sequences |
-| Gradient bias (Sinkhorn) | Unrolled backprop through K iterations | Exact gradient for actual computation; IFT gives biased gradients on Q,K,w_dist |
+| Gradient bias (Sinkhorn) | Unrolled backprop through K iterations | Exact gradient for actual computation; IFT gives biased gradients on Q,K,w_dist_logit |
 | Parameter oscillation | EMA decay=0.999 | Smoothed parameters |
 | Crop boundary | UOT unbalanced marginals | Natural mass adjustment |
 | Diffusion output at init | Zero-init final Linear | Identity prediction initially |
@@ -1377,7 +1380,7 @@ Iteration K → K-1 → ... → 1 → 0:
     ∂L/∂C chains to:
         ∂L/∂W_Q, ∂L/∂W_K    via content term (-LN(Q)^T LN(K)/√d_h)
         ∂L/∂w_rel             via position bias
-        ∂L/∂w_dist            via geometry term
+        ∂L/∂w_dist_logit      via geometry term (through sigmoid)
         ∂L/∂x_res             via distance in geometry term
         ∂L/∂μ, ∂L/∂ν         via marginal terms in Sinkhorn update
 ```
@@ -1403,7 +1406,7 @@ No custom backward needed — standard autograd through the Sinkhorn loop. The K
 ```
 L_trunk_coord → x_res^(48) → EGNN^(48) → γ^(48) ✓
                                 ↓
-                            T_norm^(48) → Sinkhorn^(48) unrolled → C^(48) → W_Q,W_K,w_dist,w_rel
+                            T_norm^(48) → Sinkhorn^(48) unrolled → C^(48) → W_Q,W_K,w_dist_logit,w_rel
                                                                      ↓
                                                                   x_res^(47) → EGNN^(47) → γ^(47) ✓
                                                                      ↓
@@ -1495,7 +1498,7 @@ def init_model(model, num_blocks=48):
 3. L_disto provides strong gradients (random predictions, high loss) → h_res rapidly learns distance-relevant features
 4. As h_res improves → content cost becomes informative → transport plans sharpen → EGNN centroids become meaningful
 5. L_trunk_coord gradient pushes γ away from zero → coordinates begin to refine
-6. Better coordinates → w_dist grows from zero → geometry cost activates → positive feedback loop
+6. Better coordinates → w_dist grows from ≈0.12 → geometry cost strengthens → positive feedback loop
 
 This ordering emerges naturally from the initialization without any explicit curriculum.
 
