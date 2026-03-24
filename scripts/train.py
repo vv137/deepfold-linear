@@ -102,8 +102,15 @@ def main():
 
     rank0 = local_rank == 0
 
-    # ---- Output directory setup (rank 0 only) ----
-    run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ---- Output directory setup (rank 0 generates name, broadcast to all) ----
+    if rank0:
+        run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        run_name = ""
+    if use_ddp:
+        name_list = [run_name]
+        dist.broadcast_object_list(name_list, src=0)
+        run_name = name_list[0]
     run_dir = Path(args.output_dir) / run_name
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else run_dir / "checkpoints"
 
@@ -231,10 +238,6 @@ def main():
     if use_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    # Checkpoint dir already created by rank 0 above; non-rank-0 needs the path
-    if not rank0:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     # ---- Data loaders ----
     data_dir = Path(args.data_dir)
     train_paths = sorted(data_dir.glob("*.npz"))
@@ -356,6 +359,7 @@ def main():
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
+            drop_last=True,
         )
 
     if rank0:
