@@ -46,6 +46,7 @@ def compute_bins(
         + 67 * (bond & ~same_chain).long()
     )
 
+    bins = bins.to(torch.int32)
     if unbatched:
         return bins.squeeze(0)
     return bins

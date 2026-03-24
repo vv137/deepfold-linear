@@ -10,7 +10,7 @@ Supports both unbatched (H, N, d_h) and batched (B, H, N, d_h) inputs.
 Forward: Triton kernels (from sinkhorn_kernel.py)
 Backward: Python-tiled O(N) memory (correct, debuggable; Triton port later)
 
-Memory budget (excluding pos_bias input):
+Memory budget (excluding pos_weight/pos_bins input):
   Forward saved: Q_ln, K_ln, V, x_res, eps, w_dist, log_u, log_v,
                  O_avg, x_centroid = O(N·d)
   Backward temp: g_v, z_u, z_v, row_lse, col_lse, D,
@@ -25,9 +25,14 @@ TILE = 64  # tile size for backward tiling
 
 
 def _compute_cost_tile_py(
-    Q_ln, K_ln, x_res, pos_bias, w_dist, r_0, i_slice, j_slice, eps_h
+    Q_ln, K_ln, x_res, pos_weight, pos_bins, w_dist, r_0, i_slice, j_slice, eps_h
 ):
-    """Compute cost tile C[i, j] and log_K tile in Python. Returns (ti, tj)."""
+    """Compute cost tile C[i, j] and log_K tile in Python. Returns (ti, tj).
+
+    Args:
+        pos_weight: (68,) weight vector for the current head h
+        pos_bins:   (N, N) int32 bin indices
+    """
     Q_i = Q_ln[i_slice]  # (ti, d_h)
     K_j = K_ln[j_slice]  # (tj, d_h)
     d_h = Q_i.shape[-1]
@@ -40,7 +45,8 @@ def _compute_cost_tile_py(
     dist = (diff**2).sum(-1).sqrt().clamp(min=1e-8)  # (ti, tj)
     geo = w_dist * dist / (r_0 + dist)
 
-    pos = pos_bias[i_slice, :][:, j_slice]  # (ti, tj)
+    bins_tile = pos_bins[i_slice, :][:, j_slice].long()
+    pos = pos_weight[bins_tile]  # (ti, tj)
 
     C_tile = content + pos + geo
     log_K_tile = -C_tile / eps_h
@@ -52,13 +58,14 @@ class FlashSinkhornAttn(torch.autograd.Function):
     O(N) memory Sinkhorn attention: forward (Triton) + backward (tiled Python).
 
     Always expects batched inputs (unbatched handling is in flash_sinkhorn_attn wrapper):
-        Q_ln:     (B, H, N, d_h)
-        x_res:    (B, N, 3)
-        pos_bias: (B, H, N, N)
-        eps:      (H,)
-        w_dist:   (H,)
-        log_mu:   (B, H, N)
-        log_nu:   (B, H, N)
+        Q_ln:       (B, H, N, d_h)
+        x_res:      (B, N, 3)
+        pos_weight: (H, 68)
+        pos_bins:   (B, N, N) int32
+        eps:        (H,)
+        w_dist:     (H,)
+        log_mu:     (B, H, N)
+        log_nu:     (B, H, N)
 
     Outputs:
         o_gated:    (B, N, H*d_h) — gated transport-weighted output
@@ -75,7 +82,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
         V,
         G,
         x_res,
-        pos_bias,
+        pos_weight,
+        pos_bins,
         eps,
         w_dist,
         log_mu,
@@ -95,7 +103,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
         V = V.contiguous().float()
         G = G.contiguous().float()
         x_res = x_res.contiguous().float()
-        pos_bias = pos_bias.contiguous().float()
+        pos_weight = pos_weight.contiguous().float()
+        pos_bins = pos_bins.contiguous().to(torch.int32)
         eps = eps.contiguous().float()
         w_dist = w_dist.contiguous().float()
         log_mu = log_mu.contiguous().float()
@@ -119,7 +128,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                 K_ln,
                 V,
                 x_res,
-                pos_bias,
+                pos_weight,
+                pos_bins,
                 eps,
                 w_dist,
                 log_mu,
@@ -145,7 +155,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                     content = -(Q_ln[b, h] @ K_ln[b, h].T) / (d_h**0.5)
                     dist = torch.cdist(x_res[b], x_res[b])
                     geo = w_dist[h] * dist / (r_0 + dist)
-                    C[h] = content + pos_bias[b, h] + geo
+                    pb_h = pos_weight[h][pos_bins[b].long()]  # (N, N)
+                    C[h] = content + pb_h + geo
 
                 log_K = -C / eps[:, None, None]
                 lu = (
@@ -207,7 +218,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -233,7 +245,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -293,7 +306,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             Q_ln[b, h],
                             K_ln[b, h],
                             x_res[b],
-                            pos_bias[b, h],
+                            pos_weight[h],
+                            pos_bins[b],
                             w_dist_h,
                             r_0,
                             i_sl,
@@ -342,7 +356,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             Q_ln[b, h],
                             K_ln[b, h],
                             x_res[b],
-                            pos_bias[b, h],
+                            pos_weight[h],
+                            pos_bins[b],
                             w_dist_h,
                             r_0,
                             i_sl,
@@ -397,7 +412,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             Q_ln[b, h],
                             K_ln[b, h],
                             x_res[b],
-                            pos_bias[b, h],
+                            pos_weight[h],
+                            pos_bins[b],
                             w_dist_h,
                             r_0,
                             i_sl,
@@ -428,7 +444,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                             Q_ln[b, h],
                             K_ln[b, h],
                             x_res[b],
-                            pos_bias[b, h],
+                            pos_weight[h],
+                            pos_bins[b],
                             w_dist_h,
                             r_0,
                             i_sl,
@@ -523,7 +540,7 @@ class FlashSinkhornAttn(torch.autograd.Function):
         grad_K_ln = torch.zeros_like(K_ln)
         grad_x_cost = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
         grad_w_dist = torch.zeros(H, device=device)
-        grad_pos_bias = torch.zeros_like(pos_bias)
+        grad_pos_weight = torch.zeros_like(pos_weight)
 
         for b in range(B):
             for h in range(H):
@@ -545,7 +562,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                                 Q_ln[b, h],
                                 K_ln[b, h],
                                 x_res[b],
-                                pos_bias[b, h],
+                                pos_weight[h],
+                                pos_bins[b],
                                 w_dist_h,
                                 r_0,
                                 i_sl,
@@ -607,7 +625,8 @@ class FlashSinkhornAttn(torch.autograd.Function):
                         f_dist_tile = dist_tile / (r_0 + dist_tile)
                         grad_w_dist[h] += (grad_C_total * f_dist_tile).sum()
 
-                        grad_pos_bias[b, h, i_sl, j_sl] = grad_C_total
+                        bins_tile = pos_bins[b, i_sl, j_sl].long().reshape(-1)
+                        grad_pos_weight[h].scatter_add_(0, bins_tile, grad_C_total.reshape(-1))
 
         # ====================================================================
         # Step 5: Combine x_res gradients
@@ -625,8 +644,9 @@ class FlashSinkhornAttn(torch.autograd.Function):
             grad_V,
             grad_G,
             grad_x_res,
-            grad_pos_bias,
-            None,
+            grad_pos_weight,
+            None,  # pos_bins (int, no grad)
+            None,  # eps
             grad_w_dist,
             grad_log_mu,
             grad_log_nu,
@@ -645,7 +665,8 @@ def flash_sinkhorn_attn(
     V: torch.Tensor,
     G: torch.Tensor,
     x_res: torch.Tensor,
-    pos_bias: torch.Tensor,
+    pos_weight: torch.Tensor,
+    pos_bins: torch.Tensor,
     eps: torch.Tensor,
     w_dist: torch.Tensor,
     log_mu: torch.Tensor,
@@ -665,10 +686,10 @@ def flash_sinkhorn_attn(
 
     Accepts both unbatched and batched inputs:
     Unbatched:
-        Q_ln: (H, N, d_h), x_res: (N, 3), pos_bias: (H, N, N), etc.
+        Q_ln: (H, N, d_h), x_res: (N, 3), pos_weight: (H, 68), pos_bins: (N, N), etc.
         Returns: o_flat (N, H*d_h), x_centroid (H, N, 3), log_u (H, N), log_v (H, N)
     Batched:
-        Q_ln: (B, H, N, d_h), x_res: (B, N, 3), pos_bias: (B, H, N, N), etc.
+        Q_ln: (B, H, N, d_h), x_res: (B, N, 3), pos_weight: (H, 68), pos_bins: (B, N, N), etc.
         Returns: o_flat (B, N, H*d_h), x_centroid (B, H, N, 3), log_u (B, H, N), log_v (B, H, N)
 
     mask: (B, N) or (N,) float, 1=real 0=pad. None means all valid.
@@ -680,7 +701,7 @@ def flash_sinkhorn_attn(
         V = V.unsqueeze(0)
         G = G.unsqueeze(0)
         x_res = x_res.unsqueeze(0)
-        pos_bias = pos_bias.unsqueeze(0)
+        pos_bins = pos_bins.unsqueeze(0)
         log_mu = log_mu.unsqueeze(0)
         log_nu = log_nu.unsqueeze(0)
         if log_u_init is not None:
@@ -706,7 +727,8 @@ def flash_sinkhorn_attn(
             K_ln,
             V,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -726,7 +748,8 @@ def flash_sinkhorn_attn(
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,

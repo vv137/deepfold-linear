@@ -174,8 +174,8 @@ class Trunk(nn.Module):
         else:
             msa_bins = torch.zeros(B, 0, 0, device=device, dtype=torch.long)
 
-        # Precompute UOT position bias — batched
-        uot_pos_bias = self.pos_bias(pos_bins)  # (B, H, N, N)
+        # Pass pos_weight (H, 68) and pos_bins (B, N, N) directly — no O(B*H*N²) materialization
+        uot_pos_weight = self.pos_bias.weight  # (H, 68)
 
         # ---- Sample cycle count (SPEC §5.3) ----
         # Use a device tensor + broadcast so all DDP ranks get the same
@@ -250,7 +250,7 @@ class Trunk(nn.Module):
                         nu,
                         log_u_prev,
                         log_v_prev,
-                        uot_pos_bias,
+                        uot_pos_weight,
                         pos_bins,
                         mask=token_pad_mask,
                     )
@@ -263,7 +263,7 @@ class Trunk(nn.Module):
                             nu,
                             log_u_prev,
                             log_v_prev,
-                            uot_pos_bias,
+                            uot_pos_weight,
                             pos_bins,
                             mask=token_pad_mask,
                         )

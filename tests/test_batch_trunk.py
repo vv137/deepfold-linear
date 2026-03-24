@@ -29,12 +29,12 @@ class TestTokenUOTBlockBatch:
         from deepfold.model.position_encoding import PositionBias
 
         pb = PositionBias(n_heads, 68)
-        pos_bias = pb(pos_bins)  # (H, N, N)
+        pos_weight = pb.weight  # (H, 68)
 
         # Unbatched
         with torch.no_grad():
             h_ub, x_ub, lu_ub, lv_ub = block(
-                h, x_res, mu, nu, log_u, log_v, pos_bias, pos_bins
+                h, x_res, mu, nu, log_u, log_v, pos_weight, pos_bins
             )
 
         # Batched B=1
@@ -46,7 +46,7 @@ class TestTokenUOTBlockBatch:
                 nu.unsqueeze(0),
                 log_u.unsqueeze(0),
                 log_v.unsqueeze(0),
-                pos_bias.unsqueeze(0),
+                pos_weight,
                 pos_bins.unsqueeze(0),
             )
 
@@ -76,7 +76,7 @@ class TestTokenUOTBlockBatch:
         from deepfold.model.position_encoding import PositionBias
 
         pb = PositionBias(n_heads, 68)
-        pos_bias = pb(pos_bins)  # (B, H, N, N)
+        pos_weight = pb.weight  # (H, 68)
 
         mask = torch.ones(B, N)
         mask[1, N_real[1] :] = 0  # pad positions 6-9 for sample 1
@@ -89,7 +89,7 @@ class TestTokenUOTBlockBatch:
                 nu,
                 log_u,
                 log_v,
-                pos_bias,
+                pos_weight,
                 pos_bins,
                 mask=mask,
             )
@@ -125,7 +125,7 @@ class TestTokenUOTBlockBatch:
         from deepfold.model.position_encoding import PositionBias
 
         pb = PositionBias(n_heads, 68)
-        pos_bias = pb(pos_bins)
+        pos_weight = pb.weight
 
         h_out, x_out, _, _ = block(
             h,
@@ -134,7 +134,7 @@ class TestTokenUOTBlockBatch:
             nu,
             log_u,
             log_v,
-            pos_bias,
+            pos_weight,
             pos_bins,
         )
         loss = h_out.sum() + x_out.sum()

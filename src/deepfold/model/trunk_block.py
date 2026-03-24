@@ -125,13 +125,13 @@ class TokenUOTBlock(nn.Module):
         Q_ln = F.layer_norm(Q, [d_h])
         K_ln = F.layer_norm(K, [d_h])
 
-        # Position bias — precomputed (B, H, N, N) tensor or PositionBias module
+        # Position bias — extract weight (H, 68) and pass bins directly
         if isinstance(w_rel_res, torch.Tensor):
-            pos_bias = w_rel_res if w_rel_res.dim() == 4 else w_rel_res.unsqueeze(0)
+            # w_rel_res is the pos_weight (H, 68) tensor directly
+            pos_weight = w_rel_res
         else:
-            pos_bias = w_rel_res(pos_bins)
-            if pos_bias.dim() == 3:
-                pos_bias = pos_bias.unsqueeze(0)
+            # w_rel_res is a PositionBias module — extract its weight
+            pos_weight = w_rel_res.weight
 
         w_dist = self.w_dist_logit.sigmoid()  # (H,) bounded (0, 1)
         effective_w_dist = w_dist
@@ -152,6 +152,9 @@ class TokenUOTBlock(nn.Module):
             dist = torch.cdist(x_res, x_res)
             f_dist = dist / (self.r_0 + dist)
             geo_bias = effective_w_dist[None, :, None, None] * f_dist[:, None, :, :]
+            # Materialize pos_bias locally for the dense N×N cost matrix
+            pos_bias = pos_weight[:, pos_bins.long()]  # (H, B, N, N)
+            pos_bias = pos_bias.permute(1, 0, 2, 3)  # (B, H, N, N)
             C = content + pos_bias + geo_bias
 
             eps_fp32 = self.eps.float()
@@ -186,7 +189,8 @@ class TokenUOTBlock(nn.Module):
                 V,
                 G,
                 x_res,
-                pos_bias,
+                pos_weight,
+                pos_bins,
                 self.eps,
                 effective_w_dist,
                 log_mu,

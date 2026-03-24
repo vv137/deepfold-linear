@@ -56,7 +56,7 @@ class TestTokenUOTBlock:
         bond_matrix = torch.zeros(N, N, dtype=torch.bool)
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
         pos_bias_mod = PositionBias(H, 68)
-        pos_bias = pos_bias_mod(pos_bins)
+        pos_weight = pos_bias_mod.weight
         h_out, x_out, log_u, log_v = block(
             h,
             x_res,
@@ -64,7 +64,7 @@ class TestTokenUOTBlock:
             nu,
             None,
             None,
-            pos_bias,
+            pos_weight,
             pos_bins,
         )
 
@@ -89,12 +89,12 @@ class TestTokenUOTBlock:
         bond_matrix = torch.zeros(N, N, dtype=torch.bool)
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
         pos_bias_mod = PositionBias(H, 68)
-        pos_bias = pos_bias_mod(pos_bins)
+        pos_weight = pos_bias_mod.weight
         x_res = torch.randn(N, 3)
 
         # Forward pass 1: original
         _, x_out1, _, _ = block(
-            h, x_res, mu, nu, None, None, pos_bias, pos_bins
+            h, x_res, mu, nu, None, None, pos_weight, pos_bins
         )
 
         # Forward pass 2: rotated input
@@ -107,7 +107,7 @@ class TestTokenUOTBlock:
 
         x_rotated = x_res @ R.T + t
         _, x_out2, _, _ = block(
-            h, x_rotated, mu, nu, None, None, pos_bias, pos_bins
+            h, x_rotated, mu, nu, None, None, pos_weight, pos_bins
         )
 
         # x_out2 should be x_out1 @ R.T + t

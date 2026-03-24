@@ -11,7 +11,8 @@ def _make_flash_inputs(B, H, N, d_h, seed=42):
     V = torch.randn(B, H, N, d_h, generator=g)
     G = torch.randn(B, H, N, d_h, generator=g)
     x_res = torch.randn(B, N, 3, generator=g)
-    pos_bias = torch.randn(B, H, N, N, generator=g)
+    pos_weight = torch.randn(H, 68, generator=g)
+    pos_bins = torch.randint(0, 68, (B, N, N), generator=g, dtype=torch.int32)
     eps = torch.tensor(
         [0.5] * (H // 4) + [1.0] * (H // 4) + [2.0] * (H // 4) + [4.0] * (H // 4),
         dtype=torch.float32,
@@ -19,7 +20,7 @@ def _make_flash_inputs(B, H, N, d_h, seed=42):
     w_dist = torch.rand(H, generator=g) * 0.5
     log_mu = torch.log_softmax(torch.randn(B, H, N, generator=g), dim=-1)
     log_nu = torch.log_softmax(torch.randn(B, H, N, generator=g), dim=-1)
-    return Q_ln, K_ln, V, G, x_res, pos_bias, eps, w_dist, log_mu, log_nu
+    return Q_ln, K_ln, V, G, x_res, pos_weight, pos_bins, eps, w_dist, log_mu, log_nu
 
 
 class TestFlashSinkhornBatch:
@@ -29,7 +30,7 @@ class TestFlashSinkhornBatch:
         B, H, N, d_h = 2, 4, 16, 8
         K_iter = 3
 
-        Q_ln, K_ln, V, G, x_res, pos_bias, eps, w_dist, log_mu, log_nu = (
+        Q_ln, K_ln, V, G, x_res, pos_weight, pos_bins, eps, w_dist, log_mu, log_nu = (
             _make_flash_inputs(B, H, N, d_h)
         )
 
@@ -42,7 +43,8 @@ class TestFlashSinkhornBatch:
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -65,7 +67,8 @@ class TestFlashSinkhornBatch:
                 V[b],
                 G[b],
                 x_res[b],
-                pos_bias[b],
+                pos_weight,
+                pos_bins[b],
                 eps,
                 w_dist,
                 log_mu[b],
@@ -114,7 +117,8 @@ class TestFlashSinkhornBatch:
         V = torch.randn(H, N, d_h, generator=g)
         G = torch.randn(H, N, d_h, generator=g)
         x_res = torch.randn(N, 3, generator=g)
-        pos_bias = torch.randn(H, N, N, generator=g)
+        pos_weight = torch.randn(H, 68, generator=g)
+        pos_bins = torch.randint(0, 68, (N, N), generator=g, dtype=torch.int32)
         eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
         w_dist = torch.rand(H, generator=g) * 0.5
         log_mu = torch.log_softmax(torch.randn(H, N, generator=g), dim=-1)
@@ -128,7 +132,8 @@ class TestFlashSinkhornBatch:
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -152,7 +157,8 @@ class TestFlashSinkhornBatch:
         V = torch.randn(H, N, d_h, generator=g)
         G = torch.randn(H, N, d_h, generator=g)
         x_res = torch.randn(N, 3, generator=g)
-        pos_bias = torch.randn(H, N, N, generator=g)
+        pos_weight = torch.randn(H, 68, generator=g)
+        pos_bins = torch.randint(0, 68, (N, N), generator=g, dtype=torch.int32)
         eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
         w_dist = torch.rand(H) * 0.5
         log_mu = torch.log_softmax(torch.randn(H, N), dim=-1)
@@ -167,7 +173,8 @@ class TestFlashSinkhornBatch:
             V,
             G,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_mu,
@@ -182,7 +189,8 @@ class TestFlashSinkhornBatch:
             V.unsqueeze(0),
             G.unsqueeze(0),
             x_res.unsqueeze(0),
-            pos_bias.unsqueeze(0),
+            pos_weight,
+            pos_bins.unsqueeze(0),
             eps,
             w_dist,
             log_mu.unsqueeze(0),

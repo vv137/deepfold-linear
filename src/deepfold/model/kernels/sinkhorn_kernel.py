@@ -15,7 +15,7 @@ Key optimizations over naive version:
   - Distances computed on-the-fly per tile (no O(N²) storage)
   - Separate row/col update kernels (avoid serial bottleneck)
 
-All per-batch tensors (Q_ln, K_ln, V, x_res, pos_bias, log_u, log_v, etc.)
+All per-batch tensors (Q_ln, K_ln, V, x_res, pos_bins, log_u, log_v, etc.)
 have shape (B, H, N, ...) or (B, N, ...). Shared tensors (eps, w_dist) remain (H,).
 grad_x_transport and grad_x_cost are (B, N, 3) to avoid cross-batch atomic contention.
 """
@@ -26,9 +26,14 @@ import triton.language as tl
 
 
 def _compute_cost_tile_py(
-    Q_ln, K_ln, x_res, pos_bias, w_dist_h, r_0, i_slice, j_slice, eps_h
+    Q_ln, K_ln, x_res, pos_weight, pos_bins, w_dist_h, r_0, i_slice, j_slice, eps_h
 ):
-    """Python cost tile computation for backward. Returns (C, log_K, dist, diff)."""
+    """Python cost tile computation for backward. Returns (C, log_K, dist, diff).
+
+    Args:
+        pos_weight: (68,) weight vector for the current head h
+        pos_bins:   (N, N) int32 bin indices
+    """
     Q_i = Q_ln[i_slice]
     K_j = K_ln[j_slice]
     d_h = Q_i.shape[-1]
@@ -38,7 +43,8 @@ def _compute_cost_tile_py(
     diff = xi[:, None, :] - xj[None, :, :]
     dist = (diff**2).sum(-1).sqrt().clamp(min=1e-8)
     geo = w_dist_h * dist / (r_0 + dist)
-    pos = pos_bias[i_slice, :][:, j_slice]
+    bins_tile = pos_bins[i_slice, :][:, j_slice].long()
+    pos = pos_weight[bins_tile]  # (ti, tj)
     C_tile = content + pos + geo
     log_K_tile = -C_tile / eps_h
     return C_tile, log_K_tile, dist, diff
@@ -54,7 +60,8 @@ def _compute_cost_tile(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     w_dist_h,
     r_0,
     i_idx,
@@ -67,14 +74,16 @@ def _compute_cost_tile(
     stride_qh,
     stride_qn,
     stride_xn,
-    stride_ph,
-    stride_pn,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_J: tl.constexpr,
 ):
     """Compute cost tile C[i, j] = content + pos + geo. Returns (BLOCK_I, BLOCK_J).
 
     Pointers must already be batch-offset by the caller.
+    POS_WEIGHT_ptr: pointer to (H, NUM_BINS) — no batch offset needed.
+    POS_BINS_ptr: pointer to (N, N) int32 — already batch-offset by caller.
     """
     # Load Q tile: (BLOCK_I, D_H)
     q_ptrs = (
@@ -111,11 +120,10 @@ def _compute_cost_tile(
     dist = tl.sqrt(dx * dx + dy * dy + dz * dz + 1e-8)
     geo = w_dist_h * dist / (r_0 + dist)
 
-    # Position bias: (BLOCK_I, BLOCK_J)
-    pos_ptrs = (
-        POS_BIAS_ptr + pid_h * stride_ph + i_idx[:, None] * stride_pn + j_idx[None, :]
-    )
-    pos = tl.load(pos_ptrs, mask=i_mask[:, None] & j_mask[None, :], other=0.0)
+    # Position bias via gather: load bin indices, then gather from weight
+    bin_ptrs = POS_BINS_ptr + i_idx[:, None] * stride_bins_n + j_idx[None, :]
+    bins_tile = tl.load(bin_ptrs, mask=i_mask[:, None] & j_mask[None, :], other=0).to(tl.int32)
+    pos = tl.load(POS_WEIGHT_ptr + pid_h * NUM_BINS + bins_tile, mask=i_mask[:, None] & j_mask[None, :], other=0.0)
 
     return content + pos + geo
 
@@ -139,7 +147,8 @@ def _compute_log_Z(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_U_ptr,
@@ -155,9 +164,9 @@ def _compute_log_Z(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,  # stride for log_u/log_v/log_Z batch dim
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -176,7 +185,7 @@ def _compute_log_Z(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -199,7 +208,8 @@ def _compute_log_Z(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -212,8 +222,8 @@ def _compute_log_Z(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -244,7 +254,8 @@ def _backward_gv_grad_V_kernel(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     V_ptr,
     EPS_ptr,
     W_DIST_ptr,
@@ -267,9 +278,9 @@ def _backward_gv_grad_V_kernel(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_vb,
     stride_vh,
     stride_vn,
@@ -292,7 +303,7 @@ def _backward_gv_grad_V_kernel(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     V_b = V_ptr + pid_b * stride_vb
     GRAD_O_b = GRAD_O_ptr + pid_b * stride_vb
     GRAD_XC_b = GRAD_XC_ptr + pid_b * H * N * 3
@@ -334,7 +345,8 @@ def _backward_gv_grad_V_kernel(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -347,8 +359,8 @@ def _backward_gv_grad_V_kernel(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -421,7 +433,8 @@ def _cost_gradient_kernel(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     V_ptr,
     EPS_ptr,
     W_DIST_ptr,
@@ -441,7 +454,7 @@ def _cost_gradient_kernel(
     GRAD_K_ptr,
     GRAD_X_COST_ptr,  # (B, N, 3)
     GRAD_W_DIST_ptr,  # (H,)
-    GRAD_POS_BIAS_ptr,  # (B, H, N, N) — direct store
+    GRAD_POS_WEIGHT_ptr,  # (H, NUM_BINS) — atomic add
     MASK_BIAS_ptr,  # (B, N) float, 0 for valid, -1e9 for pad
     N: tl.constexpr,
     D_H: tl.constexpr,
@@ -452,9 +465,9 @@ def _cost_gradient_kernel(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_vb,
     stride_vh,
     stride_vn,
@@ -479,7 +492,7 @@ def _cost_gradient_kernel(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     V_b = V_ptr + pid_b * stride_vb
     GRAD_O_b = GRAD_O_ptr + pid_b * stride_vb
     GRAD_XC_b = GRAD_XC_ptr + pid_b * H * N * 3
@@ -546,7 +559,8 @@ def _cost_gradient_kernel(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -559,8 +573,8 @@ def _cost_gradient_kernel(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -637,15 +651,10 @@ def _cost_gradient_kernel(
         f_dist_tile = dist / (R_0 + dist)
         acc_grad_w_dist += tl.sum(grad_C_total * f_dist_tile)
 
-        # --- Store grad_pos_bias directly ---
-        gp_ptrs = (
-            GRAD_POS_BIAS_ptr
-            + pid_b * stride_pb
-            + pid_h * stride_ph
-            + i_idx[:, None] * stride_pn
-            + j_idx[None, :]
-        )
-        tl.store(gp_ptrs, grad_C_total, mask=i_mask[:, None] & j_mask[None, :])
+        # --- Scatter grad_C_total into grad_pos_weight via atomic_add ---
+        bin_ptrs = BINS_b + i_idx[:, None] * stride_bins_n + j_idx[None, :]
+        bins_tile = tl.load(bin_ptrs, mask=i_mask[:, None] & j_mask[None, :], other=0).to(tl.int32)
+        tl.atomic_add(GRAD_POS_WEIGHT_ptr + pid_h * NUM_BINS + bins_tile, grad_C_total, mask=i_mask[:, None] & j_mask[None, :])
 
     # Store accumulated gradients
     gq_ptrs = (
@@ -677,7 +686,8 @@ def _sinkhorn_row_update(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_MU_ptr,
@@ -694,9 +704,9 @@ def _sinkhorn_row_update(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -715,7 +725,7 @@ def _sinkhorn_row_update(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -741,7 +751,8 @@ def _sinkhorn_row_update(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -754,8 +765,8 @@ def _sinkhorn_row_update(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -786,7 +797,8 @@ def _sinkhorn_col_update(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_NU_ptr,
@@ -803,9 +815,9 @@ def _sinkhorn_col_update(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -824,7 +836,7 @@ def _sinkhorn_col_update(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -849,7 +861,8 @@ def _sinkhorn_col_update(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -862,8 +875,8 @@ def _sinkhorn_col_update(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -895,7 +908,8 @@ def _transport_output_kernel(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     V_ptr,
     EPS_ptr,
     W_DIST_ptr,
@@ -914,9 +928,9 @@ def _transport_output_kernel(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_vb,
     stride_vh,
     stride_vn,
@@ -943,7 +957,7 @@ def _transport_output_kernel(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     V_b = V_ptr + pid_b * stride_vb
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
@@ -972,7 +986,8 @@ def _transport_output_kernel(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -985,8 +1000,8 @@ def _transport_output_kernel(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -1065,7 +1080,8 @@ def _compute_row_lse(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_V_ptr,
@@ -1080,9 +1096,9 @@ def _compute_row_lse(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -1100,7 +1116,7 @@ def _compute_row_lse(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -1122,7 +1138,8 @@ def _compute_row_lse(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -1135,8 +1152,8 @@ def _compute_row_lse(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -1162,7 +1179,8 @@ def _compute_col_lse(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_U_ptr,
@@ -1177,9 +1195,9 @@ def _compute_col_lse(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -1197,7 +1215,7 @@ def _compute_col_lse(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -1219,7 +1237,8 @@ def _compute_col_lse(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -1232,8 +1251,8 @@ def _compute_col_lse(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -1265,7 +1284,8 @@ def _ift_z_u_update(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_U_ptr,
@@ -1284,9 +1304,9 @@ def _ift_z_u_update(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -1305,7 +1325,7 @@ def _ift_z_u_update(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -1331,7 +1351,8 @@ def _ift_z_u_update(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -1344,8 +1365,8 @@ def _ift_z_u_update(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -1369,7 +1390,8 @@ def _ift_z_v_update(
     Q_ptr,
     K_ptr,
     X_ptr,
-    POS_BIAS_ptr,
+    POS_WEIGHT_ptr,
+    POS_BINS_ptr,
     EPS_ptr,
     W_DIST_ptr,
     LOG_V_ptr,
@@ -1388,9 +1410,9 @@ def _ift_z_v_update(
     stride_qn,
     stride_xb,
     stride_xn,
-    stride_pb,
-    stride_ph,
-    stride_pn,
+    stride_bins_b,
+    stride_bins_n,
+    NUM_BINS: tl.constexpr,
     stride_uvb,
     stride_mb,  # batch stride for mask_bias
     BLOCK: tl.constexpr,
@@ -1409,7 +1431,7 @@ def _ift_z_v_update(
     Q_b = Q_ptr + pid_b * stride_qb
     K_b = K_ptr + pid_b * stride_qb
     X_b = X_ptr + pid_b * stride_xb
-    POS_b = POS_BIAS_ptr + pid_b * stride_pb
+    BINS_b = POS_BINS_ptr + pid_b * stride_bins_b
     uv_off = pid_b * stride_uvb
     MB_b = MASK_BIAS_ptr + pid_b * stride_mb
 
@@ -1435,7 +1457,8 @@ def _ift_z_v_update(
             Q_b,
             K_b,
             X_b,
-            POS_b,
+            POS_WEIGHT_ptr,
+            BINS_b,
             w_dist_h,
             R_0,
             i_idx,
@@ -1448,8 +1471,8 @@ def _ift_z_v_update(
             stride_qh,
             stride_qn,
             stride_xn,
-            stride_ph,
-            stride_pn,
+            stride_bins_n,
+            NUM_BINS,
             BLOCK,
             BLOCK,
         )
@@ -1481,7 +1504,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
         K_ln,
         V,
         x_res,
-        pos_bias,
+        pos_weight,
+        pos_bins,
         eps,
         w_dist,
         log_mu,
@@ -1502,7 +1526,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
         K_ln = K_ln.contiguous().float()
         V = V.contiguous().float()
         x_res = x_res.contiguous().float()
-        pos_bias = pos_bias.contiguous().float()
+        pos_weight = pos_weight.contiguous().float()
+        pos_bins = pos_bins.contiguous().to(torch.int32)
         eps = eps.contiguous().float()
         w_dist = w_dist.contiguous().float()
         log_mu = log_mu.contiguous().float()
@@ -1520,7 +1545,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
         n_tiles = (N + BLOCK - 1) // BLOCK
         grid = (B * H, n_tiles)
 
-        common = (Q_ln, K_ln, x_res, pos_bias, eps, w_dist)
+        NUM_BINS = 68
+        common = (Q_ln, K_ln, x_res, pos_weight, pos_bins, eps, w_dist)
         dim_args = (N, d_h, lam, r_0, H)
         stride_args = (
             Q_ln.stride(0),
@@ -1528,9 +1554,9 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln.stride(2),
             x_res.stride(0),
             x_res.stride(1),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            pos_bias.stride(2),
+            pos_bins.stride(0),
+            pos_bins.stride(1),
+            NUM_BINS,
             log_mu.stride(0),  # stride_uvb = H * N
             mask_bias.stride(0),  # stride_mb
             BLOCK,
@@ -1571,7 +1597,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln,
             K_ln,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             V,
             eps,
             w_dist,
@@ -1590,9 +1617,9 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln.stride(2),
             x_res.stride(0),
             x_res.stride(1),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            pos_bias.stride(2),
+            pos_bins.stride(0),
+            pos_bins.stride(1),
+            NUM_BINS,
             V.stride(0),
             V.stride(1),
             V.stride(2),
@@ -1612,7 +1639,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             K_ln,
             V,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_u,
@@ -1628,7 +1656,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
         ctx.BLOCK = BLOCK
         ctx.lam = lam
         ctx.r_0 = r_0
-        ctx.N_saved_base = 13  # number of tensors before history
+        ctx.N_saved_base = 14  # number of tensors before history (added pos_bins)
 
         return O_avg, x_centroid, log_u, log_v
 
@@ -1636,8 +1664,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
     def backward(ctx, grad_O, grad_xc, _grad_lu, _grad_lv):
         saved = ctx.saved_tensors
         N_base = ctx.N_saved_base
-        Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist = saved[:7]
-        log_u, log_v, log_mu, log_nu, row_sum, mask_bias = saved[7:N_base]
+        Q_ln, K_ln, V, x_res, pos_weight, pos_bins, eps, w_dist = saved[:8]
+        log_u, log_v, log_mu, log_nu, row_sum, mask_bias = saved[8:N_base]
         K_back = ctx.K_iter
         list(saved[N_base : N_base + K_back])
         log_v_hist = list(saved[N_base + K_back : N_base + 2 * K_back])
@@ -1657,15 +1685,16 @@ class FlashSinkhornFunction(torch.autograd.Function):
         stride_uvb = log_u.stride(0)  # H * N
         stride_mb = mask_bias.stride(0)
 
+        NUM_BINS = 68
         stride_args_bwd = (
             Q_ln.stride(0),
             Q_ln.stride(1),
             Q_ln.stride(2),
             x_res.stride(0),
             x_res.stride(1),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            pos_bias.stride(2),
+            pos_bins.stride(0),
+            pos_bins.stride(1),
+            NUM_BINS,
             stride_uvb,
             stride_mb,
             BLOCK_BWD,
@@ -1686,7 +1715,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln,
             K_ln,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             eps,
             w_dist,
             log_u,
@@ -1708,7 +1738,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln,
             K_ln,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             V,
             eps,
             w_dist,
@@ -1727,9 +1758,9 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln.stride(2),
             x_res.stride(0),
             x_res.stride(1),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            pos_bias.stride(2),
+            pos_bins.stride(0),
+            pos_bins.stride(1),
+            NUM_BINS,
             V.stride(0),
             V.stride(1),
             V.stride(2),
@@ -1758,7 +1789,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln,
             K_ln,
             x_res,
-            pos_bias,
+            pos_weight,
+            pos_bins,
             V,
             eps,
             w_dist,
@@ -1781,9 +1813,9 @@ class FlashSinkhornFunction(torch.autograd.Function):
             Q_ln.stride(2),
             x_res.stride(0),
             x_res.stride(1),
-            pos_bias.stride(0),
-            pos_bias.stride(1),
-            pos_bias.stride(2),
+            pos_bins.stride(0),
+            pos_bins.stride(1),
+            NUM_BINS,
             V.stride(0),
             V.stride(1),
             V.stride(2),
@@ -1816,7 +1848,7 @@ class FlashSinkhornFunction(torch.autograd.Function):
         grad_K_ln = torch.zeros_like(K_ln)
         grad_x_cost = torch.zeros(B, N, 3, device=device, dtype=torch.float32)
         grad_w_dist = torch.zeros(H, device=device, dtype=torch.float32)
-        grad_pos_bias = torch.zeros_like(pos_bias)
+        grad_pos_weight = torch.zeros_like(pos_weight)
 
         for k in reversed(range(K_back)):
             # Saved states: log_u_hist[k], log_v_hist[k] = states BEFORE iteration k
@@ -1831,7 +1863,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                 Q_ln,
                 K_ln,
                 x_res,
-                pos_bias,
+                pos_weight,
+                pos_bins,
                 eps,
                 w_dist,
                 log_mu,
@@ -1868,7 +1901,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 Q_ln[b_idx, h_idx],
                                 K_ln[b_idx, h_idx],
                                 x_res[b_idx],
-                                pos_bias[b_idx, h_idx],
+                                pos_weight[h_idx],
+                                pos_bins[b_idx],
                                 w_h,
                                 r_0,
                                 slice(i0, ie),
@@ -1896,7 +1930,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 Q_ln[b_idx, h_idx],
                                 K_ln[b_idx, h_idx],
                                 x_res[b_idx],
-                                pos_bias[b_idx, h_idx],
+                                pos_weight[h_idx],
+                                pos_bins[b_idx],
                                 w_h,
                                 r_0,
                                 slice(i0, ie),
@@ -1939,7 +1974,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 grad_w_dist[h_idx] += (
                                     gc.T * dist_t / (r_0 + dist_t)
                                 ).sum()
-                            grad_pos_bias[b_idx, h_idx, i0:ie, j0:je] += gc.T
+                            bins_t = pos_bins[b_idx, i0:ie, j0:je].long().reshape(-1)
+                            grad_pos_weight[h_idx].scatter_add_(0, bins_t, gc.T.reshape(-1))
 
                         grad_log_nu[b_idx, h_idx, j0:je] += kappa_h * gl_v
 
@@ -1961,7 +1997,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 Q_ln[b_idx, h_idx],
                                 K_ln[b_idx, h_idx],
                                 x_res[b_idx],
-                                pos_bias[b_idx, h_idx],
+                                pos_weight[h_idx],
+                                pos_bins[b_idx],
                                 w_h,
                                 r_0,
                                 slice(i0, ie),
@@ -1988,7 +2025,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 Q_ln[b_idx, h_idx],
                                 K_ln[b_idx, h_idx],
                                 x_res[b_idx],
-                                pos_bias[b_idx, h_idx],
+                                pos_weight[h_idx],
+                                pos_bins[b_idx],
                                 w_h,
                                 r_0,
                                 slice(i0, ie),
@@ -2029,7 +2067,8 @@ class FlashSinkhornFunction(torch.autograd.Function):
                                 grad_w_dist[h_idx] += (
                                     gc * dist_t / (r_0 + dist_t)
                                 ).sum()
-                            grad_pos_bias[b_idx, h_idx, i0:ie, j0:je] += gc
+                            bins_t = pos_bins[b_idx, i0:ie, j0:je].long().reshape(-1)
+                            grad_pos_weight[h_idx].scatter_add_(0, bins_t, gc.reshape(-1))
 
                         grad_log_mu[b_idx, h_idx, i0:ie] += kappa_h * gl_u
 
@@ -2043,15 +2082,16 @@ class FlashSinkhornFunction(torch.autograd.Function):
         # Combine x_res gradients
         grad_x_res = grad_x_transport + grad_x_cost
 
-        # Return gradients for: Q_ln, K_ln, V, x_res, pos_bias, eps, w_dist,
+        # Return gradients for: Q_ln, K_ln, V, x_res, pos_weight, pos_bins, eps, w_dist,
         #   log_mu, log_nu, K_iter, lam, r_0, log_u_init, log_v_init, BLOCK, mask_bias
         return (
             grad_Q_ln,
             grad_K_ln,
             grad_V,
             grad_x_res,
-            grad_pos_bias,
-            None,
+            grad_pos_weight,
+            None,  # pos_bins (int, no grad)
+            None,  # eps
             grad_w_dist,
             grad_log_mu,
             grad_log_nu,
@@ -2070,7 +2110,8 @@ def flash_sinkhorn(
     K_ln: torch.Tensor,
     V: torch.Tensor,
     x_res: torch.Tensor,
-    pos_bias: torch.Tensor,
+    pos_weight: torch.Tensor,
+    pos_bins: torch.Tensor,
     eps: torch.Tensor,
     w_dist: torch.Tensor,
     log_mu: torch.Tensor,
@@ -2089,6 +2130,8 @@ def flash_sinkhorn(
     Accepts both unbatched (H, N, d_h) and batched (B, H, N, d_h) inputs.
 
     Args:
+        pos_weight: (H, 68) learnable position bias weights
+        pos_bins:   (B, N, N) or (N, N) int32 bin indices
         mask: (B, N) or (N,) float tensor, 1=valid, 0=pad. None means all valid.
 
     Returns:
@@ -2107,7 +2150,7 @@ def flash_sinkhorn(
         K_ln = K_ln.unsqueeze(0)
         V = V.unsqueeze(0)
         x_res = x_res.unsqueeze(0)
-        pos_bias = pos_bias.unsqueeze(0)
+        pos_bins = pos_bins.unsqueeze(0)
         log_mu = log_mu.unsqueeze(0)
         log_nu = log_nu.unsqueeze(0)
         if log_u_init is not None:
@@ -2128,7 +2171,8 @@ def flash_sinkhorn(
         K_ln,
         V,
         x_res,
-        pos_bias,
+        pos_weight,
+        pos_bins,
         eps,
         w_dist,
         log_mu,
