@@ -311,3 +311,123 @@ class TestTritonVsPythonFallback:
         torch.testing.assert_close(lv_py, lv_tr, atol=atol, rtol=rtol, msg="log_v mismatch")
         torch.testing.assert_close(o_py, o_tr, atol=atol, rtol=rtol, msg="output mismatch")
         torch.testing.assert_close(xc_py, xc_tr, atol=atol, rtol=rtol, msg="centroid mismatch")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestTritonBackward:
+    """Verify Triton unrolled backward gradients against PyTorch autograd (dense)."""
+
+    def _dense_forward(self, Q_ln, K_ln, V, x_res, pos_weight, pos_bins,
+                       eps, w_dist, log_mu, log_nu, K_iter, lam, r_0, mask):
+        """Dense Python Sinkhorn with autograd for reference gradients."""
+        B, H, N, d_h = Q_ln.shape
+        kappa = lam / (lam + eps)
+
+        if mask is None:
+            mask_bias = torch.zeros(B, N, device=Q_ln.device, dtype=torch.float32)
+        else:
+            mask_bias = (1.0 - mask.float()) * (-1e9)
+
+        C = torch.zeros(B, H, N, N, device=Q_ln.device, dtype=torch.float32)
+        for b in range(B):
+            for h in range(H):
+                content = -(Q_ln[b, h] @ K_ln[b, h].T) / (d_h ** 0.5)
+                diff = x_res[b, :, None, :] - x_res[b, None, :, :]
+                dist = ((diff ** 2).sum(-1) + 1e-16).sqrt()
+                geo = w_dist[h] * dist / (r_0 + dist)
+                pb_h = pos_weight[h][pos_bins[b].long()]
+                C[b, h] = content + pb_h + geo
+
+        log_K = -C / eps[None, :, None, None]
+        log_u = torch.zeros(B, H, N, device=Q_ln.device, dtype=torch.float32)
+        log_v = torch.zeros(B, H, N, device=Q_ln.device, dtype=torch.float32)
+
+        for _ in range(K_iter):
+            log_u = kappa[None, :, None] * (
+                log_mu - torch.logsumexp(log_K + log_v[:, :, None, :] + mask_bias[:, None, None, :], dim=-1)
+            )
+            log_v = kappa[None, :, None] * (
+                log_nu - torch.logsumexp(log_K + log_u[:, :, :, None] + mask_bias[:, None, :, None], dim=-2)
+            )
+
+        log_T = log_u[:, :, :, None] + log_K + log_v[:, :, None, :] + mask_bias[:, None, None, :]
+        log_Z = torch.logsumexp(log_T, dim=-1, keepdim=True)
+        T_norm = torch.exp(log_T - log_Z)
+
+        O_avg = torch.einsum("bhij,bhjd->bhid", T_norm, V)
+        x_centroid = torch.einsum("bhij,bjc->bhic", T_norm, x_res)
+        return O_avg, x_centroid
+
+    def _make_inputs(self, B, H, N, d_h, seed=42):
+        torch.manual_seed(seed)
+        Q_ln = torch.randn(B, H, N, d_h, device="cuda", dtype=torch.float32)
+        K_ln = torch.randn(B, H, N, d_h, device="cuda", dtype=torch.float32)
+        V = torch.randn(B, H, N, d_h, device="cuda", dtype=torch.float32)
+        x_res = torch.randn(B, N, 3, device="cuda", dtype=torch.float32)
+        pos_weight = torch.randn(H, 68, device="cuda", dtype=torch.float32) * 0.1
+        pos_bins = torch.randint(0, 68, (B, N, N), dtype=torch.int32, device="cuda")
+        eps = torch.tensor([0.5, 1.0][:H], device="cuda", dtype=torch.float32)
+        w_dist = torch.randn(H, device="cuda", dtype=torch.float32).sigmoid()
+        log_mu = torch.log(torch.softmax(torch.randn(B, H, N, device="cuda"), dim=-1).clamp(min=1e-8))
+        log_nu = torch.log(torch.softmax(torch.randn(B, H, N, device="cuda"), dim=-1).clamp(min=1e-8))
+        return Q_ln, K_ln, V, x_res, pos_weight, pos_bins, eps, w_dist, log_mu, log_nu
+
+    def _compare_grads(self, B, H, N, d_h, K_iter, lam, r_0, mask, seed=42):
+        from deepfold.model.kernels.sinkhorn_kernel import flash_sinkhorn
+
+        inputs = self._make_inputs(B, H, N, d_h, seed)
+        Q_ln, K_ln, V, x_res, pos_weight, pos_bins, eps, w_dist, log_mu, log_nu = inputs
+
+        grad_O = torch.randn(B, H, N, d_h, device="cuda", dtype=torch.float32)
+        grad_xc = torch.randn(B, H, N, 3, device="cuda", dtype=torch.float32)
+
+        # Dense autograd
+        Q_d = Q_ln.clone().requires_grad_(True)
+        K_d = K_ln.clone().requires_grad_(True)
+        V_d = V.clone().requires_grad_(True)
+        x_d = x_res.clone().requires_grad_(True)
+        pw_d = pos_weight.clone().requires_grad_(True)
+        wd_d = w_dist.clone().requires_grad_(True)
+
+        O_dense, xc_dense = self._dense_forward(
+            Q_d, K_d, V_d, x_d, pw_d, pos_bins, eps, wd_d,
+            log_mu, log_nu, K_iter, lam, r_0, mask,
+        )
+        loss = (O_dense * grad_O).sum() + (xc_dense * grad_xc).sum()
+        loss.backward()
+
+        # Triton flash backward
+        Q_t = Q_ln.clone().requires_grad_(True)
+        K_t = K_ln.clone().requires_grad_(True)
+        V_t = V.clone().requires_grad_(True)
+        x_t = x_res.clone().requires_grad_(True)
+        pw_t = pos_weight.clone().requires_grad_(True)
+        wd_t = w_dist.clone().requires_grad_(True)
+
+        O_flash, xc_flash, _, _ = flash_sinkhorn(
+            Q_t, K_t, V_t, x_t, pw_t, pos_bins, eps, wd_t,
+            log_mu, log_nu, K_iter=K_iter, lam=lam, r_0=r_0, mask=mask,
+        )
+        loss_f = (O_flash * grad_O).sum() + (xc_flash * grad_xc).sum()
+        loss_f.backward()
+
+        return [
+            ("grad_Q_ln", Q_d.grad, Q_t.grad),
+            ("grad_K_ln", K_d.grad, K_t.grad),
+            ("grad_V", V_d.grad, V_t.grad),
+            ("grad_x_res", x_d.grad, x_t.grad),
+            ("grad_pos_weight", pw_d.grad, pw_t.grad),
+            ("grad_w_dist", wd_d.grad, wd_t.grad),
+        ]
+
+    def test_backward_unbatched(self):
+        grads = self._compare_grads(B=1, H=2, N=16, d_h=32, K_iter=3, lam=1.0, r_0=10.0, mask=None)
+        for name, gd, gt in grads:
+            torch.testing.assert_close(gd, gt, atol=5e-3, rtol=5e-3, msg=f"{name} mismatch")
+
+    def test_backward_batched_masked(self):
+        mask = torch.ones(2, 16, device="cuda")
+        mask[1, 12:] = 0
+        grads = self._compare_grads(B=2, H=2, N=16, d_h=32, K_iter=3, lam=1.0, r_0=10.0, mask=mask, seed=99)
+        for name, gd, gt in grads:
+            torch.testing.assert_close(gd, gt, atol=5e-3, rtol=5e-3, msg=f"{name} mismatch (masked)")
