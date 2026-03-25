@@ -180,8 +180,8 @@ class MSABlock(nn.Module):
 
         h_coevol = self.coevol_value(h_res)  # (B, N, d_model)
 
-        # Triton path: inference only, CUDA only, fuses sigmoid+matmul
-        use_triton = _HAS_TRITON and not training and h_res.is_cuda
+        # Triton path: CUDA only, supports both training (autograd) and inference
+        use_triton = _HAS_TRITON and h_res.is_cuda
 
         h_agg = torch.zeros_like(h_res)  # (B, N, d_model)
         c_bar_accum = torch.zeros(
@@ -189,20 +189,18 @@ class MSABlock(nn.Module):
         )
 
         if use_triton:
-            # Triton kernel does not apply msa_pad_mask (assumes no padding at inference).
-            # Gather h_coevol to protein-only subset for the kernel.
             h_coevol_prot = _gather_at_indices(h_coevol, prot_indices)  # (B, N_prot, D)
 
-            with torch.no_grad():
-                h_agg_prot, c_bar_prot = triton_coevol(
-                    U,  # (B, S, N_prot, R)
-                    V_,  # (B, S, N_prot, R)
-                    h_coevol_prot,  # (B, N_prot, D)
-                    self.coevol_weight.weight.squeeze(
-                        0
-                    ),  # (R,) — Lin(R→1).weight is (1,R)
-                    self.coevol_weight.bias,  # (1,)
-                )
+            h_agg_prot, c_bar_prot = triton_coevol(
+                U,  # (B, S, N_prot, R)
+                V_,  # (B, S, N_prot, R)
+                h_coevol_prot,  # (B, N_prot, D)
+                self.coevol_weight.weight.squeeze(
+                    0
+                ),  # (R,) — Lin(R->1).weight is (1,R)
+                self.coevol_weight.bias,  # (1,)
+                mask=msa_pad_mask,  # (B, N_prot) or None
+            )
             # Scatter protein results back to full token dimension
             _scatter_add_at_indices(h_agg, h_agg_prot.to(h_agg.dtype), prot_indices)
             _scatter_add_at_indices(
