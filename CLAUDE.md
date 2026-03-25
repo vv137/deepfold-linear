@@ -41,8 +41,8 @@
 | Flash diffusion attn | `kernels/flash_diffusion_attn.py` | ✅ (B*H, n_tiles) | ✅ fwd+bwd | ✅ |
 | Windowed atom attn | `kernels/flash_atom_attn.py` | ✅ (B*H, n_windows) | ✅ fwd+bwd | ✅ |
 | Cross-attention | `kernels/cross_attn_kernel.py` | ✅ | ✅ fwd+bwd | ✅ |
-| Co-evolution | `kernels/coevol_kernel.py` | ✅ (B, n_tiles) | ❌ (no autograd) | ✅ |
-| Distogram loss | `kernels/distogram_kernel.py` | ✅ (B, n_i, n_j) | ❌ (no autograd) | ✅ |
+| Co-evolution | `kernels/coevol_kernel.py` | ✅ (B, n_tiles) | ✅ fwd+bwd (cached w_tile) | ✅ |
+| Distogram loss | `kernels/distogram_kernel.py` | ✅ (B, n_i, n_j) | ✅ fwd+bwd (recompute from x_true) | ✅ |
 
 ## Training Infrastructure
 

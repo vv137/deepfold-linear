@@ -338,16 +338,19 @@ class DistogramLoss(nn.Module):
         U = self.w_u(h)  # (B, N, d_low)
         V = self.w_v(h)  # (B, N, d_low)
 
-        # Triton fast path: eval/inference only (kernel fuses atomic_add,
-        # which breaks autograd for w_u/w_v/to_bins gradients).
-        # Only used when no valid_mask (no padding) for simplicity.
-        if not self.training and _HAS_TRITON and h_res.is_cuda and valid_mask is None:
+        # Triton path: training (autograd via x_true recomputation) and inference.
+        # Training needs x_true for O(N) backward; inference uses precomputed target_bins.
+        if _HAS_TRITON and h_res.is_cuda:
             return triton_distogram_loss(
                 U,
                 V,
                 self.to_bins.weight,
                 self.to_bins.bias,
                 target_bins,
+                x_true=x_true if self.training else None,
+                mask=token_pad_mask,
+                dist_min=self.dist_min,
+                bin_width=self.bin_width,
             )
 
         # Accumulate per-sample losses
