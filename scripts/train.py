@@ -551,6 +551,32 @@ def main():
             if use_wandb and step % args.extra_log_every == 0:
                 _log_gamma_heatmap(model, step, wandb)
 
+        # Checkpointing (before validation — save consistent state)
+        if step % args.save_every == 0:
+            if use_ddp:
+                dist.barrier()
+        if rank0 and step % args.save_every == 0:
+            raw_model = model.module if use_ddp else model
+            path = os.path.join(checkpoint_dir, f"step_{step}.pt")
+            ckpt_data = {
+                "step": step,
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "ema": ema.state_dict(),
+                "rng_state": torch.get_rng_state(),
+                "np_rng_state": np.random.get_state(),
+            }
+            if scaler is not None:
+                ckpt_data["scaler"] = scaler.state_dict()
+            if torch.cuda.is_available():
+                ckpt_data["cuda_rng_state"] = torch.cuda.get_rng_state()
+            torch.save(ckpt_data, path)
+            latest = os.path.join(checkpoint_dir, "latest.pt")
+            tmp_link = latest + ".tmp"
+            os.symlink(os.path.basename(path), tmp_link)
+            os.replace(tmp_link, latest)
+            logger.info("Saved checkpoint: %s", path)
+
         # Validation
         if val_loader and step % args.val_every == 0:
             gc.collect()
@@ -593,33 +619,6 @@ def main():
                         {f"val/{k}": v for k, v in val_avg.items()},
                         step=step,
                     )
-
-        # Checkpointing (barrier ensures all ranks finished the step)
-        if step % args.save_every == 0:
-            if use_ddp:
-                dist.barrier()
-        if rank0 and step % args.save_every == 0:
-            raw_model = model.module if use_ddp else model
-            path = os.path.join(checkpoint_dir, f"step_{step}.pt")
-            ckpt_data = {
-                "step": step,
-                "model": raw_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "ema": ema.state_dict(),
-                "rng_state": torch.get_rng_state(),
-                "np_rng_state": np.random.get_state(),
-            }
-            if scaler is not None:
-                ckpt_data["scaler"] = scaler.state_dict()
-            if torch.cuda.is_available():
-                ckpt_data["cuda_rng_state"] = torch.cuda.get_rng_state()
-            torch.save(ckpt_data, path)
-            # Symlink latest.pt for easy resume
-            latest = os.path.join(checkpoint_dir, "latest.pt")
-            tmp_link = latest + ".tmp"
-            os.symlink(os.path.basename(path), tmp_link)
-            os.replace(tmp_link, latest)
-            logger.info("Saved checkpoint: %s", path)
 
     if rank0 and oom_count > 0:
         logger.info("Total OOM skips: %d", oom_count)
