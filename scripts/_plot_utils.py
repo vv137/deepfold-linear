@@ -92,17 +92,17 @@ def print_stats(stats, step, name="param"):
 
     print(f"  Step {step} [{name}]  total: mean={stats['total_mean']:+.4f} std={stats['total_std']:.4f}")
     head_parts = [f"h{h}={stats['head_mean'][h]:+.4f}±{stats['head_std'][h]:.4f}" for h in range(n_heads)]
-    print(f"    per head:  {', '.join(head_parts)}")
+    for i in range(0, n_heads, 8):
+        prefix = "    per head:  " if i == 0 else "               "
+        print(f"{prefix}{', '.join(head_parts[i:i+8])}")
 
     def _fmt_layer(i):
         return f"L{i}={stats['layer_mean'][i]:+.4f}±{stats['layer_std'][i]:.4f}"
-    if n_layers <= 12:
-        layer_parts = [_fmt_layer(i) for i in range(n_layers)]
-        print(f"    per layer: {', '.join(layer_parts)}")
-    else:
-        first = [_fmt_layer(i) for i in range(6)]
-        last = [_fmt_layer(i) for i in range(n_layers - 6, n_layers)]
-        print(f"    per layer: {', '.join(first)}, ..., {', '.join(last)}")
+    layer_parts = [_fmt_layer(i) for i in range(n_layers)]
+    # Wrap at 6 per line for readability
+    for i in range(0, n_layers, 6):
+        prefix = "    per layer: " if i == 0 else "               "
+        print(f"{prefix}{', '.join(layer_parts[i:i+6])}")
 
 
 def plot_heatmap(data, step, out_path, stats, *, vmin, vmax, cmap="RdBu_r",
