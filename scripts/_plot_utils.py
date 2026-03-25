@@ -105,6 +105,23 @@ def print_stats(stats, step, name="param"):
         print(f"{prefix}{', '.join(layer_parts[i:i+6])}")
 
 
+def print_table(data, step, name="param"):
+    """Print full (layers x heads) values as a tab-separated table.
+
+    Header row: step, L, h0, h1, ..., mean
+    One row per layer, plus a 'mean' footer row.
+    """
+    n_layers, n_heads = data.shape
+    heads = [f"h{h}" for h in range(n_heads)]
+    print(f"  Step {step} [{name}]  {n_layers} layers x {n_heads} heads")
+    print(f"  {'L':>4s}  " + "  ".join(f"{h:>8s}" for h in heads) + f"  {'mean':>8s}")
+    for i in range(n_layers):
+        vals = "  ".join(f"{data[i, h]:+8.4f}" for h in range(n_heads))
+        print(f"  {i:4d}  {vals}  {data[i].mean():+8.4f}")
+    means = "  ".join(f"{data[:, h].mean():+8.4f}" for h in range(n_heads))
+    print(f"  {'mean':>4s}  {means}  {data.mean():+8.4f}")
+
+
 def plot_heatmap(data, step, out_path, stats, *, vmin, vmax, cmap="RdBu_r",
                  title_expr, cb_label):
     """Save a heatmap with marginal mean/std bar charts.

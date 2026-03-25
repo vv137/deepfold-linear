@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from _plot_utils import extract_param, compute_stats, print_stats, plot_heatmap, iter_checkpoints
+from _plot_utils import extract_param, compute_stats, print_stats, print_table, plot_heatmap, iter_checkpoints
 
 
 def extract_w_dist(ckpt_path):
@@ -27,9 +27,19 @@ def main():
                         help="Use a single shared color limit across all steps")
     parser.add_argument("--skip", action="store_true",
                         help="Skip checkpoints whose output PNG already exists")
+    parser.add_argument("--table", action="store_true",
+                        help="Print values as a table instead of generating plots")
     args = parser.parse_args()
 
     ckpt_files = iter_checkpoints(args.run_dir)
+
+    if args.table:
+        for path in ckpt_files:
+            step, w_dist_map = extract_w_dist(path)
+            print_table(w_dist_map, step, name="w_dist")
+            print()
+        return
+
     out_dir = args.output_dir or args.run_dir / "w_dist_plots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
