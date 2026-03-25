@@ -30,9 +30,13 @@ def main():
                         help="Skip checkpoints whose output PNG already exists")
     parser.add_argument("--table", action="store_true",
                         help="Print values as a table instead of generating plots")
+    parser.add_argument("--latest", action="store_true",
+                        help="Only process the latest checkpoint")
     args = parser.parse_args()
 
     ckpt_files = iter_checkpoints(args.run_dir)
+    if args.latest:
+        ckpt_files = ckpt_files[-1:]
 
     if args.table:
         for path in ckpt_files:
