@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v4.6
+# Protein Complex Structure Prediction Model: Full Design Specification v5
 
 ---
 
@@ -851,13 +851,13 @@ Zeros init: coordinates don't move initially — EGNN must earn its influence. A
 
 ---
 
-## 9. Diffusion Module (v5 — Boltz-1 style, no pair representation)
+## 9. Diffusion Module (v5 — AF3 style, no pair representation)
 
 ### 9.1 Design Intent
 
-The diffusion module is an encoder-transformer-decoder that refines noisy atom coordinates. It adopts Boltz-1's architecture — atom encoder aggregates atom features to token level, a token-level transformer reasons globally, then an atom decoder broadcasts back and predicts coordinate updates.
+The diffusion module is an encoder-transformer-decoder that refines noisy atom coordinates. It adopts AF3's architecture — atom encoder aggregates atom features to token level, a token-level transformer reasons globally, then an atom decoder broadcasts back and predicts coordinate updates. Diffusion multiplicity follows Boltz-1 (16 samples) rather than AF3 (48 samples).
 
-**Key divergence from Boltz-1**: No O(N²) pair representation z. The 68-bin PositionBias (same as trunk) replaces Boltz's pair attention bias. All attention uses custom Triton kernels for O(N) memory.
+**Key divergence from AF3**: No O(N²) pair representation z. The 68-bin PositionBias (same as trunk) replaces AF3's pair attention bias. All attention uses custom Triton kernels for O(N) memory.
 
 **End-to-end gradient**: h_res is NOT detached. L_diff, L_lddt backpropagate through the full diffusion module → SingleConditioning → h_res → trunk.
 
@@ -984,7 +984,7 @@ x_aligned = weighted_rigid_align(x_true, x_pred, atom_weights, resolved_mask)  #
 L_diff = ((σ² + σ_data²) / (σ · σ_data)²) · ||D_θ(x_σ; σ) − x_aligned||²
 ```
 
-**Weighted rigid alignment** (Kabsch/SVD): Before computing MSE, the ground truth coordinates are rigidly aligned to the prediction via weighted SVD. This removes the rotational/translational degrees of freedom that the SE(3)-invariant model cannot control. The alignment is computed under `no_grad` with `.detach()` — gradients flow only through `x_pred` in the MSE, not through the SVD. Boltz-1 and AF3 both do this.
+**Weighted rigid alignment** (Kabsch/SVD): Before computing MSE, the ground truth coordinates are rigidly aligned to the prediction via weighted SVD. This removes the rotational/translational degrees of freedom that the SE(3)-invariant model cannot control. The alignment is computed under `no_grad` with `.detach()` — gradients flow only through `x_pred` in the MSE, not through the SVD. AF3 does this.
 
 EDM preconditioning:
 
@@ -997,20 +997,20 @@ EDM preconditioning:
 
 The network predicts the denoised signal. The EDM weighting ensures equal contribution across noise levels.
 
-### 11.2 Smooth LDDT Loss (Boltz-1 convention)
+### 11.2 Smooth LDDT Loss (AF3 convention)
 
 ```
 L_lddt = 1 − (1/|P|) Σ_{(i,j)∈P} (1/4) Σ_{δ∈{0.5,1,2,4}} sigmoid(δ − |d_ij^pred − d_ij^true|)
 ```
 
-**Slope = 1** (no scaling factor). Boltz-1 uses implicit slope=1 in `sigmoid(t - dev)`. A steeper slope (e.g. 10) causes sigmoid saturation at both extremes, killing gradients early in training when predictions are poor.
+**Slope = 1** (no scaling factor). AF3 uses implicit slope=1 in `sigmoid(t - dev)`. A steeper slope (e.g. 10) causes sigmoid saturation at both extremes, killing gradients early in training when predictions are poor.
 
-**Per-type pair cutoff** (Boltz-1 convention):
+**Per-type pair cutoff** (AF3 convention):
 - Nucleotide atom pairs: d_ij^true < 30 Å (nucleic acids have larger inter-residue spacing)
 - All other pairs: d_ij^true < 15 Å
 - A pair is "nucleotide" if either atom belongs to a DNA/RNA chain
 
-**No σ-weighting**: Unlike L_diff, L_lddt is not weighted by σ. Boltz-1 adds it to the total loss with weight 1.0 at all noise levels.
+**No σ-weighting**: Unlike L_diff, L_lddt is not weighted by σ. AF3 adds it to the total loss with weight 1.0 at all noise levels.
 
 **Zero-pair fallback**: When no valid pairs exist for a sample (e.g. all atoms masked), the loss returns 1.0 (worst case), not 0.0.
 
@@ -1159,7 +1159,7 @@ where L_bond penalizes deviations from ideal bond lengths and angles (standard f
 | σ_max | 160 Å |
 | σ_min | 0.002 Å |
 | P_mean | −1.2 |
-| P_std | 1.5 (Boltz-1 aligned) |
+| P_std | 1.5 (AF3 aligned) |
 | Training | σ = σ_data · exp(N(−1.2, 1.5²)), median ≈ 4.8 Å |
 | Inference steps | 200 (development: 50) |
 | Sampler | Heun 2nd order |
@@ -1682,7 +1682,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 
 ### Engineering (Priority Order)
 
-0. ~~**Diffusion module stability (AF3/Boltz-1 alignment)**~~ ✅ v4.6
+0. ~~**Diffusion module stability (AF3 alignment)**~~ ✅ v4.6
    - FourierEmbedding (frozen random), AdaLN (sigmoid-bounded), AdaLN-Zero output gates
    - c_in coordinate scaling, c_noise formula, LayerNorm on Fourier/pair features, LinearNoBias
 
@@ -1758,12 +1758,12 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 
 | Change | Section | Rationale |
 |---|---|---|
-| FourierEmbedding: frozen random projection replaces deterministic sinusoidal | §9.2 | AF3 Algorithm 22: `cos(2π(t·w + b))` with w,b~N(0,1) frozen. Incoherent basis uniformly represents all noise levels. Boltz-1 identical. |
+| FourierEmbedding: frozen random projection replaces deterministic sinusoidal | §9.2 | AF3 Algorithm 22: `cos(2π(t·w + b))` with w,b~N(0,1) frozen. Incoherent basis uniformly represents all noise levels. |
 | AdaLN: sigmoid-bounded scale replaces unbounded (1+γ) | §9.3 | AF3 Algorithm 26: `sigmoid(Lin(s)) * LN(a, affine=False) + LinNoBias(s)`. Scale bounded [0,1], conditioning LN'd. Prevents scale explosion. |
 | AdaLN-Zero output gates on attention + transition | §9.3 | AF3 Algorithm 24: `sigmoid(Lin(s, w=0, b=-2)) ⊙ output`. Each block starts as near-identity (sigmoid(-2)≈0.12). Critical for training stability. |
-| c_noise = log(σ/σ_data)·0.25 (was log(σ)/4) | §9.2, §12 | Boltz-1 `c_noise`: `log(sigma/sigma_data) * 0.25`. Matches AF3 Algorithm 21 line 8. |
+| c_noise = log(σ/σ_data)·0.25 (was log(σ)/4) | §9.2, §12 | AF3 Algorithm 21 line 8: `c_noise = log(sigma/sigma_data) * 0.25`. |
 | Coordinate input scaling: c_in = 1/√(σ²+σ_data²) (was 1/σ_data) | §9.2 | AF3 Algorithm 20 line 2: `r_noisy = x_noisy / √(t̂²+σ_data²)`. Normalizes to unit variance at all noise levels. Was leaving high-σ inputs unnormalized (std≈σ/σ_data≈10 at σ=160). |
-| LayerNorm on Fourier features before t_proj | §9.2 | AF3 Algorithm 21 line 9: `s += LinNoBias(LN(n))`. Boltz-1 `norm_fourier`. Stabilizes conditioning injection. |
+| LayerNorm on Fourier features before t_proj | §9.2 | AF3 Algorithm 21 line 9: `s += LinNoBias(LN(n))`. Stabilizes conditioning injection. |
 | LayerNorm on pair features before pair_bias_proj | §9.3 | AF3 Algorithm 24 line 8: `b_ij = LinNoBias(LN(z_ij))`. Normalizes frozen pair features. |
 | t_proj and pair_bias_proj → LinearNoBias | §9.2, §9.3 | AF3 uses LinearNoBias for Fourier-to-single and pair bias projections. |
 
