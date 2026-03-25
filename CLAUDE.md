@@ -36,11 +36,11 @@
 
 | Kernel | File | Batch | Training | Inference |
 |--------|------|-------|----------|-----------|
-| Flash Sinkhorn (fwd+bwd) | `kernels/sinkhorn_kernel.py` | ✅ (B*H, n_tiles) | ✅ CG-IFT backward | ✅ |
-| Flash Sinkhorn wrapper | `kernels/flash_sinkhorn_attn.py` | ✅ | ✅ | ✅ |
+| Flash Sinkhorn (fwd+bwd) | `kernels/sinkhorn_kernel.py` | ✅ (B*H, n_tiles) | ✅ exact unrolled backward | ✅ |
+| Flash Sinkhorn wrapper | `kernels/flash_sinkhorn_attn.py` | ✅ | ✅ (training+inference) | ✅ |
 | Flash diffusion attn | `kernels/flash_diffusion_attn.py` | ✅ (B*H, n_tiles) | ✅ fwd+bwd | ✅ |
 | Windowed atom attn | `kernels/flash_atom_attn.py` | ✅ (B*H, n_windows) | ✅ fwd+bwd | ✅ |
-| Cross-attention | `kernels/cross_attn_kernel.py` | ✅ | ✅ fwd+bwd | ✅ |
+| Cross-attention | `kernels/cross_attn_kernel.py` | ✅ | ✅ fwd+bwd (kernel LSE) | ✅ |
 | Co-evolution | `kernels/coevol_kernel.py` | ✅ (B, n_tiles) | ✅ fwd+bwd (cached w_tile) | ✅ |
 | Distogram loss | `kernels/distogram_kernel.py` | ✅ (B, n_i, n_j) | ✅ fwd+bwd (recompute from x_true) | ✅ |
 

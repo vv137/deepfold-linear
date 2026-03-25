@@ -204,6 +204,7 @@ def _token_to_atom_fwd_kernel(
     K_ptr,              # (B, H, N, D) token keys
     V_ptr,              # (B, H, N, D) token values
     O_ptr,              # (B, H, M, D) output
+    LSE_ptr,            # (B*H, M) log-sum-exp for backward
     ATOM_MASK_ptr,      # (B, M) float
     TOKEN_MASK_ptr,     # (B, N) float
     scale,
@@ -273,6 +274,11 @@ def _token_to_atom_fwd_kernel(
 
     o_ptrs = O_ptr + q_offset + q_idx[:, None] * stride_qn + tl.arange(0, D)[None, :]
     tl.store(o_ptrs, acc.to(tl.bfloat16), mask=q_mask[:, None])
+
+    # Store LSE for backward: lse = m_i + log(l_i)
+    lse = m_i + tl.log(l_i + 1e-8)
+    lse = tl.where(q_mask, lse, float("-inf"))
+    tl.store(LSE_ptr + pid_bh * M + q_idx, lse, mask=q_mask)
 
 
 @triton.jit
@@ -557,19 +563,12 @@ class TokenToAtomAttnFn(torch.autograd.Function):
         scale = D ** -0.5
 
         TILE_Q = 64
-        # Triton requires power-of-2 tile sizes
-        TILE_K = min(64, 1 << (N - 1).bit_length())  # next power of 2
-
-        # Need to store LSE for backward — compute in forward via a modified kernel
-        # For now, use the ref-based approach: materialize for small N
-        # Actually, let's just use the tiled fwd kernel and compute LSE separately
-        # The forward kernel uses online softmax internally but doesn't output LSE.
-        # We'll compute LSE from re-running scores in backward (recomputation approach).
+        TILE_K = min(64, 1 << (N - 1).bit_length())
 
         grid = (B * H, triton.cdiv(M, TILE_Q))
 
         _token_to_atom_fwd_kernel[grid](
-            Q, K, V, O,
+            Q, K, V, O, LSE,
             atom_mask, token_mask,
             scale,
             B, H, M, N, D,
@@ -579,15 +578,6 @@ class TokenToAtomAttnFn(torch.autograd.Function):
             token_mask.stride(0),
             TILE_Q, TILE_K,
         )
-
-        # Compute LSE for backward by recomputing scores
-        # (This is cheap since N is small — typically ≤384)
-        with torch.no_grad():
-            scores = torch.einsum("bhid,bhjd->bhij",
-                                   Q.float(), K.float()) * scale  # (B, H, M, N)
-            scores = scores + (1 - token_mask[:, None, None, :].float()) * (-1e9)
-            lse = torch.logsumexp(scores, dim=-1)  # (B, H, M)
-            LSE = lse.reshape(B * H, M).contiguous()
 
         ctx.save_for_backward(Q, K, V, O, LSE, atom_mask, token_mask)
         ctx.scale = scale

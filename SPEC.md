@@ -1690,12 +1690,12 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
    - All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
    - Mask support: `-1e9` bias on padded positions in all score computations
    - Flash forward (Triton): N=384 in 0.6ms, O(N) memory
-   - Training backward: dense unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
+   - Training backward: Triton exact unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
    - IFT backward (CG-based): implemented but gives incorrect gradients for UOT with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
    - FP32 marginal fix: mu.float() before log() prevents BF16 underflow in softmax Jacobian backward
    - Kabsch alignment: disable autocast for SVD/det (BF16 not supported)
    - Coevol kernel wired into MSA (training + inference), distogram kernel wired into losses (eval)
-   - trunk_block.py: dense unrolled for training, flash for inference
+   - trunk_block.py: flash Sinkhorn for both training and inference (O(N) memory)
 
 1. **Flash-Sinkhorn kernel — further optimization from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
 
@@ -1736,8 +1736,8 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 4. **Mixed precision strategy** (BF16 for most, FP32 for Sinkhorn log-domain)
 
 **Current memory profile** (no checkpointing, crop=384, B200 192GB):
-- Cost matrix per block: `(B, H, N, N)` = `(1, 16, 384, 384)` × 4B = 9.4MB
-- Autograd stores 48 blocks' intermediates: ~450MB total
+- Flash Sinkhorn: O(N) per block, cost tiles computed on the fly in Triton kernels
+- No O(N²) cost matrix stored; autograd saves only O(N) dual variables (log_u, log_v) per iteration
 - At crop=1024: ~3.2GB — still fits comfortably in 192GB
 - Checkpointing removed for DDP compatibility; B200 has sufficient memory
 
