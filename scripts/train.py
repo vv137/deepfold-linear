@@ -48,7 +48,7 @@ def _log_gamma_heatmap(model, step, wandb):
 
     raw_model = model.module if hasattr(model, "module") else model
     gamma_map = (
-        torch.stack([b.gamma for b in raw_model.trunk.blocks])
+        torch.stack([b.gamma for b in raw_model.trunk.uot_blocks])
         .detach().cpu().tanh().numpy()
     )  # (n_layers, n_heads)
 
