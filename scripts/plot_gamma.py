@@ -94,7 +94,7 @@ def plot_gamma(gamma_map, step, vlim, out_path):
     total_mean, total_std = gamma_map.mean(), gamma_map.std()
 
     with plt.rc_context({"mathtext.fontset": "cm"}):
-        fig = plt.figure(figsize=(10, 13))
+        fig = plt.figure(figsize=(10, 13), layout="constrained")
         gs = fig.add_gridspec(2, 2, width_ratios=[6, 1.5], height_ratios=[1.5, 6],
                               hspace=0.05, wspace=0.05)
 
@@ -134,7 +134,6 @@ def plot_gamma(gamma_map, step, vlim, out_path):
         ax_cb.axis("off")
         fig.colorbar(im, ax=ax_cb, fraction=0.9, label=r"$\tanh(\gamma)$")
 
-        fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
