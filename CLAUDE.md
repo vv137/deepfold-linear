@@ -67,6 +67,7 @@
 
 ## Known Boltz-1 Divergences
 
+**Trunk:**
 * No pair representation (O(N²) → O(N) persistent state)
 * UOT-Sinkhorn replaces softmax attention in trunk
 * CG-IFT backward (not unrolled autograd through Sinkhorn iterations)
@@ -75,3 +76,11 @@
 * Random cycle count 1-5 (Boltz uses fixed recycling)
 * Low-rank co-evolution (rank 16) instead of full outer product
 * 68-bin position encoding instead of RoPE
+
+**Diffusion (v5, mostly aligned):**
+* 68-bin PositionBias replaces Boltz's O(N²) pair bias z in transformer
+* Cross-attention (learnable) replaces scatter_mean/gather (hard) for atom↔token
+* Single conditioning track (s = features AND conditioning) vs Boltz's separate s/a tracks
+* dim=512 (vs Boltz 768), ~155M params (vs Boltz ~445M)
+* Atom pair bias p_lm not used in v2 atom blocks (TODO)
+* Custom Triton kernels for all attention (Boltz uses PyTorch SDPA)

@@ -1159,8 +1159,8 @@ where L_bond penalizes deviations from ideal bond lengths and angles (standard f
 | σ_max | 160 Å |
 | σ_min | 0.002 Å |
 | P_mean | −1.2 |
-| P_std | 1.2 |
-| Training | ln σ ~ N(−1.2, 1.2²) |
+| P_std | 1.5 (Boltz-1 aligned) |
+| Training | σ = σ_data · exp(N(−1.2, 1.5²)), median ≈ 4.8 Å |
 | Inference steps | 200 (development: 50) |
 | Sampler | Heun 2nd order |
 | ρ (schedule curvature) | 7 |
