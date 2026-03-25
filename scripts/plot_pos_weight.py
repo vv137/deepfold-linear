@@ -17,9 +17,10 @@ from _plot_utils import load_checkpoint, iter_checkpoints, print_table
 
 
 BIN_LABELS = {
-    0: "-32", 8: "-24", 16: "-16", 24: "-8", 32: "0", 40: "+8", 48: "+16", 56: "+24", 64: "+32",
-    65: "diff\nchain", 66: "bond", 67: "bond\ncross",
+    0: "-32", 16: "-16", 32: "0", 48: "+16", 64: "+32",
+    65: "X", 66: "B", 67: "BX",
 }
+# X=cross-chain, B=bonded, BX=bonded cross-chain
 
 
 def extract_pos_weight(ckpt_path):
