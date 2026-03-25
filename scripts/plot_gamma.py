@@ -145,6 +145,8 @@ def main():
                         help="Output directory (default: <run_dir>/gamma_plots)")
     parser.add_argument("--global-vlim", action="store_true",
                         help="Use a single shared color limit across all steps")
+    parser.add_argument("--skip", action="store_true",
+                        help="Skip checkpoints whose output PNG already exists")
     args = parser.parse_args()
 
     ckpt_dir = args.run_dir / "checkpoints"
@@ -171,19 +173,26 @@ def main():
         print(f"Global vlim=±{global_vlim:.4f}")
 
     # Plot one checkpoint at a time
-    count = 0
+    count, skipped = 0, 0
     for path in ckpt_files:
+        step_from_name = int(path.stem.split("_")[1])
+        out_path = out_dir / f"gamma_step_{step_from_name}.png"
+        if args.skip and out_path.exists():
+            skipped += 1
+            continue
         step, gamma_map = extract_gamma(path)
         vlim = global_vlim if global_vlim is not None else float(np.abs(gamma_map).max())
         if vlim == 0:
             vlim = 1.0
-        out_path = out_dir / f"gamma_step_{step}.png"
         print_gamma_stats(gamma_map, step)
         plot_gamma(gamma_map, step, vlim, out_path)
         print(f"    → {out_path.name}  (vlim=±{vlim:.4f})")
         count += 1
 
-    print(f"\nDone — {count} plots in {out_dir}")
+    msg = f"\nDone — {count} plots in {out_dir}"
+    if skipped:
+        msg += f" ({skipped} skipped)"
+    print(msg)
 
 
 if __name__ == "__main__":
