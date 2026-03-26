@@ -22,6 +22,16 @@ msa:
   max_depth: 128 # max MSA rows after subsampling (uniform random [min_depth, max_depth])
   min_depth: 1 # minimum random depth during training
 
+data:
+  num_workers: 4
+  release_cutoff: "2019-09-30" # only train on structures before this date (YYYY-MM-DD)
+  seed: 42
+
+logging:
+  save_every: 100 # checkpoint every N steps
+  log_every: 1 # console/wandb log every N steps
+  extra_log_every: 50 # expensive logs (heatmaps) every N steps
+
 training:
   batch_size: 1
   # AF3 LR schedule: warmup → plateau → exponential decay

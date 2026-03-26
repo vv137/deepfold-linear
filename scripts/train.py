@@ -205,15 +205,14 @@ def main():
     parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
     )
-    parser.add_argument("--save-every", type=int, default=10_000)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--extra-log-every", type=int, default=1_000,
-                        help="Interval for expensive wandb logs (gamma heatmap, etc.)")
-    parser.add_argument("--val-every", type=int, default=None,
-                        help="Validate every N steps (default: from config)")
+    parser.add_argument("--save-every", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument("--extra-log-every", type=int, default=None,
+                        help="Interval for expensive wandb logs (heatmaps, etc.)")
+    parser.add_argument("--val-every", type=int, default=None)
     parser.add_argument("--val-batches", type=int, default=None,
-                        help="Max batches per validation run, 0=all (default: from config)")
-    parser.add_argument("--num-workers", type=int, default=4)
+                        help="Max batches per validation run (0=all)")
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--local-rank", type=int, default=0)
     # CLI overrides for config values
     parser.add_argument("--lr", type=float, default=None)
@@ -221,18 +220,17 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
-        "--release-cutoff",
-        type=str,
-        default=None,
-        help="Only train on structures released before this date (YYYY-MM-DD)",
+        "--release-cutoff", type=str, default=None,
+        help="Only train on structures before this date (YYYY-MM-DD)",
     )
     parser.add_argument("--validate-first", action="store_true", default=None,
-                        help="Run full validation before training starts (logged + wandb)")
-    parser.add_argument("--seed", type=int, default=42)
+                        help="Run full validation before training starts")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     # Load config from YAML
     cfg = load_config(args.config)
+    # CLI overrides for training
     if args.lr is not None:
         cfg.training.lr = args.lr
     if args.total_steps is not None:
@@ -242,7 +240,23 @@ def main():
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
 
-    # Validation: CLI overrides config
+    # CLI overrides for data
+    if args.num_workers is not None:
+        cfg.data.num_workers = args.num_workers
+    if args.release_cutoff is not None:
+        cfg.data.release_cutoff = args.release_cutoff
+    if args.seed is not None:
+        cfg.data.seed = args.seed
+
+    # CLI overrides for logging
+    if args.save_every is not None:
+        cfg.logging.save_every = args.save_every
+    if args.log_every is not None:
+        cfg.logging.log_every = args.log_every
+    if args.extra_log_every is not None:
+        cfg.logging.extra_log_every = args.extra_log_every
+
+    # CLI overrides for validation
     if args.val_every is not None:
         cfg.validation.val_every = args.val_every
     if args.val_batches is not None:
@@ -251,9 +265,10 @@ def main():
         cfg.validation.validate_first = True
 
     # Reproducibility
-    torch.manual_seed(args.seed)
+    seed = cfg.data.seed
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(seed)
 
     # Set crop schedule from config
     set_crop_schedule(cfg.training.crop_schedule)
@@ -298,14 +313,21 @@ def main():
         # Save resolved config for reproducibility
         import yaml as _yaml
 
+        def _section(obj):
+            return {k: getattr(obj, k) for k in vars(obj)}
+
         config_snapshot = {
-            "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
-            "init": {k: getattr(cfg.init, k) for k in vars(cfg.init)},
-            "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
+            "model": _section(cfg.model),
+            "data": _section(cfg.data),
+            "logging": _section(cfg.logging),
+            "init": _section(cfg.init),
+            "training": _section(cfg.training),
+            "validation": _section(cfg.validation),
             "loss_weights": cfg.loss_weights.to_dict(),
-            "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
-            "diffusion": {k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)},
-            "msa": {k: getattr(cfg.msa, k) for k in vars(cfg.msa)},
+            "sampler": _section(cfg.sampler),
+            "diffusion": _section(cfg.diffusion),
+            "msa": _section(cfg.msa),
+            "wandb": _section(cfg.wandb),
         }
         with open(run_dir / "config.yaml", "w") as f:
             _yaml.dump(config_snapshot, f, default_flow_style=False, sort_keys=False)
@@ -327,17 +349,7 @@ def main():
             entity=cfg.wandb.entity,
             name=cfg.wandb.name or run_name,
             tags=cfg.wandb.tags,
-            config={
-                "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
-                "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
-                "loss_weights": cfg.loss_weights.to_dict(),
-                "diffusion": {
-                    k: getattr(cfg.diffusion, k) for k in vars(cfg.diffusion)
-                },
-                "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
-                "msa": {k: getattr(cfg.msa, k) for k in vars(cfg.msa)},
-                "args": vars(args),
-            },
+            config=config_snapshot,
             dir=str(run_dir),
         )
         logger.info("WandB initialized: %s/%s", cfg.wandb.project, wandb.run.name)
@@ -417,7 +429,7 @@ def main():
             np.random.set_state(ckpt["np_rng_state"])
         elif use_ddp:
             # DDP: seed deterministically from step + rank for reproducibility
-            resume_seed = args.seed + start_step * 1000 + local_rank
+            resume_seed = seed + start_step * 1000 + local_rank
             torch.manual_seed(resume_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(resume_seed)
@@ -447,7 +459,7 @@ def main():
     # Filter by release date cutoff if manifest + cutoff provided
     # Structures <= cutoff → train, structures > cutoff → auto val (if no --val-data-dir)
     val_paths_from_cutoff = []
-    if args.release_cutoff and args.manifest:
+    if cfg.data.release_cutoff and args.manifest:
         import json
 
         with open(args.manifest) as f:
@@ -459,17 +471,17 @@ def main():
         val_paths_from_cutoff = [
             p
             for p in train_paths
-            if p.stem in release_by_id and release_by_id[p.stem] > args.release_cutoff
+            if p.stem in release_by_id and release_by_id[p.stem] > cfg.data.release_cutoff
         ]
         train_paths = [
             p
             for p in train_paths
-            if p.stem in release_by_id and release_by_id[p.stem] <= args.release_cutoff
+            if p.stem in release_by_id and release_by_id[p.stem] <= cfg.data.release_cutoff
         ]
         if rank0:
             logger.info(
                 "Release cutoff %s: %d → %d train, %d val (%.1f%% train)",
-                args.release_cutoff,
+                cfg.data.release_cutoff,
                 before,
                 len(train_paths),
                 len(val_paths_from_cutoff),
@@ -477,7 +489,7 @@ def main():
             )
         if not train_paths:
             raise FileNotFoundError(
-                f"No structures before cutoff {args.release_cutoff}"
+                f"No structures before cutoff {cfg.data.release_cutoff}"
             )
 
     train_dataset = DeepFoldDataset(
@@ -487,7 +499,7 @@ def main():
         min_msa_seqs=cfg.msa.min_depth,
         msa_dir=args.msa_dir,
         training=True,
-        seed=args.seed,
+        seed=seed,
     )
 
     # Build sampler: cluster-weighted (if manifest provided) or random
@@ -508,10 +520,10 @@ def main():
             min_msa_seqs=cfg.msa.min_depth,
             msa_dir=args.msa_dir,
             training=True,
-            seed=args.seed,
+            seed=seed,
         )
         # Offset seed by rank so DDP ranks sample different structures
-        sampler_seed = args.seed + (local_rank if use_ddp else 0)
+        sampler_seed = seed + (local_rank if use_ddp else 0)
         train_sampler = ClusterWeightedSampler(
             records=records,
             alpha_prot=cfg.sampler.alpha_prot,
@@ -524,13 +536,13 @@ def main():
         if rank0:
             logger.info("Using cluster-weighted sampler (%d records)", len(records))
     elif use_ddp:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=args.seed)
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed)
         if rank0:
             logger.info("Using DistributedSampler")
 
     def _worker_init_fn(worker_id):
         """Seed each DataLoader worker uniquely to avoid duplicate augmentations."""
-        np.random.seed(args.seed + worker_id + local_rank * 1000)
+        np.random.seed(seed + worker_id + local_rank * 1000)
 
     batch_size = cfg.training.batch_size
     train_loader = torch.utils.data.DataLoader(
@@ -538,13 +550,13 @@ def main():
         batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=args.num_workers,
+        num_workers=cfg.data.num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
         drop_last=True,
-        prefetch_factor=4 if args.num_workers > 0 else None,
-        persistent_workers=args.num_workers > 0,
-        worker_init_fn=_worker_init_fn if args.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.data.num_workers > 0 else None,
+        persistent_workers=cfg.data.num_workers > 0,
+        worker_init_fn=_worker_init_fn if cfg.data.num_workers > 0 else None,
     )
 
     val_loader = None
@@ -564,7 +576,7 @@ def main():
             batch_size=batch_size,
             shuffle=(val_sampler is None),
             sampler=val_sampler,
-            num_workers=args.num_workers,
+            num_workers=cfg.data.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
             drop_last=True,
@@ -663,7 +675,7 @@ def main():
 
         ema.update(model.module if use_ddp else model)
 
-        if rank0 and step % args.log_every == 0:
+        if rank0 and step % cfg.logging.log_every == 0:
             logger.info(
                 "step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f "
                 "grad_norm=%.4f lr=%.6f crop=%d",
@@ -691,14 +703,14 @@ def main():
                     },
                     step=step,
                 )
-            if use_wandb and step % args.extra_log_every == 0:
+            if use_wandb and step % cfg.logging.extra_log_every == 0:
                 _log_extra(model, step, wandb)
 
         # Checkpointing (before validation — save consistent state)
-        if step % args.save_every == 0:
+        if step % cfg.logging.save_every == 0:
             if use_ddp:
                 dist.barrier()
-        if rank0 and step % args.save_every == 0:
+        if rank0 and step % cfg.logging.save_every == 0:
             raw_model = model.module if use_ddp else model
             path = os.path.join(checkpoint_dir, f"step_{step}.pt")
             ckpt_data = {

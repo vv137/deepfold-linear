@@ -30,6 +30,20 @@ class ModelConfig:
 
 
 @dataclass
+class DataConfig:
+    num_workers: int = 4
+    release_cutoff: str | None = None  # YYYY-MM-DD or None
+    seed: int = 42
+
+
+@dataclass
+class LoggingConfig:
+    save_every: int = 10_000
+    log_every: int = 100
+    extra_log_every: int = 1_000
+
+
+@dataclass
 class InitConfig:
     gamma_std: float = 1e-4       # EGNN gamma N(0, std) noise init
     w_dist_logit: float = -2.0    # geometry bias init; sigmoid(-2.0) ≈ 0.12
@@ -126,6 +140,8 @@ class WandbConfig:
 @dataclass
 class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     init: InitConfig = field(default_factory=InitConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
@@ -158,6 +174,10 @@ def load_config(path: Optional[str | Path] = None) -> Config:
 
     if "model" in raw:
         _apply_dict(cfg.model, raw["model"])
+    if "data" in raw:
+        _apply_dict(cfg.data, raw["data"])
+    if "logging" in raw:
+        _apply_dict(cfg.logging, raw["logging"])
     if "init" in raw:
         _apply_dict(cfg.init, raw["init"])
     if "training" in raw:
