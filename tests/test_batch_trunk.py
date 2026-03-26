@@ -203,8 +203,8 @@ class TestMSABlockBatch:
         msa_token_mask[0, :6] = True  # sample 0: 6 protein
         msa_token_mask[1, :4] = True  # sample 1: 4 protein (padded to 6)
 
-        msa_pad_mask = torch.ones(B, N_prot)
-        msa_pad_mask[1, 4:] = 0  # sample 1 has only 4 real MSA positions
+        msa_mask = torch.ones(B, S, N_prot)
+        msa_mask[1, :, 4:] = 0  # sample 1 has only 4 real MSA positions
 
         msa_bins = torch.randint(0, 68, (B, N_prot, N_prot))
 
@@ -219,7 +219,7 @@ class TestMSABlockBatch:
                 h,
                 msa_token_mask,
                 pos_bias,
-                msa_pad_mask=msa_pad_mask,
+                msa_mask=msa_mask,
                 training=False,
             )
 

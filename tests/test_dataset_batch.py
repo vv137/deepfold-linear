@@ -39,6 +39,7 @@ def _make_sample(
         "token_pad_mask": torch.ones(N, dtype=torch.float32),
         "atom_pad_mask": torch.ones(N_atom, dtype=torch.float32),
         "pair_valid_mask": torch.ones(n_pairs, dtype=torch.float32),
+        "msa_mask": torch.ones(1, 1, N_prot, dtype=torch.float32),  # (C, S, N_prot)
     }
 
     if training:
@@ -174,19 +175,19 @@ class TestCollateBatch:
         assert result["token_pad_mask"].sum() == 20.0
         assert result["atom_pad_mask"].sum() == 80.0
 
-    def test_msa_pad_mask_generated(self):
-        """msa_pad_mask is generated for batches with different MSA sizes."""
+    def test_msa_mask_padded(self):
+        """msa_mask is padded correctly for batches with different N_prot."""
         s1 = _make_sample(N=8, N_atom=20, n_pairs=5, N_prot=6)
         s2 = _make_sample(N=12, N_atom=35, n_pairs=10, N_prot=10)
         result = collate_fn([s1, s2])
 
-        assert "msa_pad_mask" in result
-        # Shape: (B, max_N_prot)
-        assert result["msa_pad_mask"].shape == (2, 10)
-        # s1 has N_prot=6, s2 has N_prot=10
-        assert result["msa_pad_mask"][0, :6].sum() == 6.0
-        assert result["msa_pad_mask"][0, 6:].sum() == 0.0
-        assert result["msa_pad_mask"][1, :10].sum() == 10.0
+        assert "msa_mask" in result
+        # Shape: (B, C, S, max_N_prot) — featurize produces (C, S, N_prot)
+        assert result["msa_mask"].shape == (2, 1, 1, 10)
+        # s1 has N_prot=6, padded to 10 along last dim
+        assert result["msa_mask"][0, 0, 0, :6].sum() == 6.0
+        assert result["msa_mask"][0, 0, 0, 6:].sum() == 0.0
+        assert result["msa_mask"][1, 0, 0, :10].sum() == 10.0
 
     def test_three_samples(self):
         """Batching 3 samples of different sizes works."""

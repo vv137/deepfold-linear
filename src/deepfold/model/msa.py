@@ -55,6 +55,7 @@ class MSABlock(nn.Module):
         # 3. Column weighted mean — after ln_col, so bias=False
         self.ln_col = nn.LayerNorm(d_msa)
         self.col_weight = nn.Linear(d_msa, 1, bias=False)
+        self.col_query = nn.Linear(d_model, 1, bias=False)  # h_res conditions which MSA rows to attend
         self.col_to_single = nn.Linear(d_msa, d_model, bias=False)
 
         # 4. Low-rank co-evolution — after ln_coevol, so bias=False
@@ -75,7 +76,7 @@ class MSABlock(nn.Module):
         h_res: torch.Tensor,
         msa_token_mask: torch.Tensor,
         pos_bias: torch.Tensor,
-        msa_pad_mask: torch.Tensor | None = None,
+        msa_mask: torch.Tensor | None = None,
         training: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -84,7 +85,7 @@ class MSABlock(nn.Module):
             h_res:        (N, d_model) or (B, N, d_model) all tokens
             msa_token_mask: (N,) or (B, N) bool — True for tokens with MSA data
             pos_bias:     (H_msa, N_prot, N_prot) or (B, H_msa, N_prot, N_prot) position bias
-            msa_pad_mask: (B, N_prot) bool/float, 1=real 0=pad. Only for batched.
+            msa_mask:     (S, N_prot) or (B, S, N_prot) float, 1=real 0=pad.
             training:     bool
 
         Returns:
@@ -97,6 +98,8 @@ class MSABlock(nn.Module):
             h_res = h_res.unsqueeze(0)
             msa_token_mask = msa_token_mask.unsqueeze(0)
             pos_bias = pos_bias.unsqueeze(0)
+            if msa_mask is not None:
+                msa_mask = msa_mask.unsqueeze(0)
 
         B, S, N_prot, _ = m.shape
         N = h_res.shape[1]
@@ -104,8 +107,8 @@ class MSABlock(nn.Module):
         d_h = self.d_head
         device = h_res.device
 
-        if msa_pad_mask is None:
-            msa_pad_mask = m.new_ones(B, N_prot)
+        if msa_mask is None:
+            msa_mask = m.new_ones(B, S, N_prot)
 
         # Skip MSA processing if no protein/RNA tokens.
         if N_prot == 0:
@@ -133,9 +136,10 @@ class MSABlock(nn.Module):
         scores = torch.einsum("bsihd,bsjhd->bshij", Q, K) / (d_h**0.5)
         scores = scores + pos_bias.unsqueeze(1)  # (B, 1, H, N_prot, N_prot)
 
-        # Mask padded MSA positions
-        msa_mask_f = msa_pad_mask.float()  # (B, N_prot)
-        col_mask_bias = (1 - msa_mask_f)[:, None, None, None, :] * (-1e9)
+        # Mask padded MSA positions (N_prot axis)
+        # msa_mask: (B, S, N_prot) → use any-row for N_prot padding
+        pos_mask = msa_mask.amax(dim=1)  # (B, N_prot) — 1 if position is real in any row
+        col_mask_bias = (1 - pos_mask)[:, None, None, None, :] * (-1e9)
         scores = scores + col_mask_bias
 
         attn = F.softmax(scores, dim=-1)
@@ -144,11 +148,18 @@ class MSABlock(nn.Module):
         G_flat = G.reshape(B, S, N_prot, -1)
         m = m + torch.sigmoid(G_flat) * self.w_o_row(att_out)
 
-        # ---- 3. Column weighted mean ----
+        # ---- 3. Column weighted mean (h_res-conditioned, mask padded S rows) ----
         m_n = self.ln_col(m)  # (B, S, N_prot, d_msa)
-        alpha = F.softmax(
-            self.col_weight(m_n), dim=1
-        )  # (B, S, N_prot, 1) softmax over S
+        col_scores = self.col_weight(m_n)  # (B, S, N_prot, 1)
+        # h_res conditions which MSA rows are important per position
+        h_prot_score = self.col_query(
+            _gather_at_indices(h_res, prot_indices)
+        )  # (B, N_prot, 1)
+        col_scores = col_scores + h_prot_score.unsqueeze(1)  # broadcast over S
+        # Mask padded rows with -inf before softmax over S
+        row_mask = msa_mask.unsqueeze(-1)  # (B, S, N_prot, 1)
+        col_scores = col_scores + (1 - row_mask) * (-1e9)
+        alpha = F.softmax(col_scores, dim=1)  # (B, S, N_prot, 1)
         col_agg = (alpha * m_n).sum(dim=1)  # (B, N_prot, d_msa)
         h_prot_update = self.col_to_single(col_agg)  # (B, N_prot, d_model)
 
@@ -157,8 +168,12 @@ class MSABlock(nn.Module):
 
         # ---- 4. Low-rank co-evolution (tiled) ----
         m_n = self.ln_coevol(m)  # (B, S, N_prot, d_msa)
+        # Mask padded S rows so they don't contribute to co-evolution
+        m_n = m_n * msa_mask.unsqueeze(-1)  # (B, S, N_prot, d_msa)
         U = self.u_proj(m_n)  # (B, S, N_prot, r)
         V_ = self.v_proj(m_n)  # (B, S, N_prot, r)
+        # Real sequence count per position for normalization
+        S_real = msa_mask.sum(dim=1).clamp(min=1)  # (B, N_prot)
 
         h_coevol = self.coevol_value(h_res)  # (B, N, d_model)
 
@@ -181,7 +196,7 @@ class MSABlock(nn.Module):
                     0
                 ),  # (R,) — Lin(R->1).weight is (1,R)
                 self.coevol_weight.bias,  # (1,)
-                mask=msa_pad_mask,  # (B, N_prot) or None
+                mask=pos_mask,  # (B, N_prot)
             )
             # Scatter protein results back to full token dimension
             _scatter_add_at_indices(h_agg, h_agg_prot.to(h_agg.dtype), prot_indices)
@@ -198,8 +213,13 @@ class MSABlock(nn.Module):
                     je = min(j0 + TILE, N_prot)
                     V_j = V_[:, :, j0:je, :]  # (B, S, tj, r)
 
+                    # S_real normalization: per-position real count
+                    # Use geometric mean of i and j positions' real counts
+                    S_real_i = S_real[:, i0:ie]  # (B, ti)
+                    S_real_j = S_real[:, j0:je]  # (B, tj)
+                    S_norm = (S_real_i.unsqueeze(2) * S_real_j.unsqueeze(1)).sqrt().unsqueeze(-1)  # (B, ti, tj, 1)
                     c_tile = (
-                        torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S
+                        torch.einsum("bsir,bsjr->bijr", U_i, V_j) / S_norm.clamp(min=1)
                     )  # (B, ti, tj, r)
 
                     w_tile = torch.sigmoid(
@@ -207,7 +227,7 @@ class MSABlock(nn.Module):
                     )  # (B, ti, tj)
 
                     # Mask padded positions in j dimension
-                    w_tile = w_tile * msa_pad_mask[:, j0:je].unsqueeze(1)
+                    w_tile = w_tile * pos_mask[:, j0:je].unsqueeze(1)
 
                     h_j = _gather_at_indices(
                         h_coevol, prot_indices[:, j0:je]
@@ -216,7 +236,7 @@ class MSABlock(nn.Module):
                     _scatter_add_at_indices(h_agg, tile_out, prot_indices[:, i0:ie])
 
                     c_bar_tile = c_tile.sum(dim=2)  # (B, ti, r)
-                    c_bar_tile = c_bar_tile * msa_pad_mask[:, i0:ie].unsqueeze(-1)
+                    c_bar_tile = c_bar_tile * pos_mask[:, i0:ie].unsqueeze(-1)
                     _scatter_add_at_indices(
                         c_bar_accum, c_bar_tile, prot_indices[:, i0:ie]
                     )
@@ -317,7 +337,7 @@ class MSAModule(nn.Module):
         h_res: torch.Tensor,
         msa_token_mask: torch.Tensor,
         msa_bins: torch.Tensor,
-        msa_pad_mask: torch.Tensor | None = None,
+        msa_mask: torch.Tensor | None = None,
         training: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -326,7 +346,7 @@ class MSAModule(nn.Module):
             h_res:        (N, 512) or (B, N, 512)
             msa_token_mask: (N,) or (B, N) bool
             msa_bins:     (N_prot, N_prot) or (B, N_prot, N_prot) int
-            msa_pad_mask: (B, N_prot) bool/float or None
+            msa_mask:     (S, N_prot) or (B, S, N_prot) float, 1=real 0=pad
             training:     bool
 
         Returns:
@@ -340,7 +360,7 @@ class MSAModule(nn.Module):
                 h_res,
                 msa_token_mask=msa_token_mask,
                 pos_bias=pos_bias,
-                msa_pad_mask=msa_pad_mask,
+                msa_mask=msa_mask,
                 training=training,
             )
 

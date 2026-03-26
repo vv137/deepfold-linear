@@ -86,7 +86,7 @@ class Trunk(nn.Module):
         bond_matrix: torch.Tensor,
         msa_token_mask: torch.Tensor,
         token_pad_mask: torch.Tensor | None = None,
-        msa_pad_mask: torch.Tensor | None = None,
+        msa_mask: torch.Tensor | None = None,
         num_cycles: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -95,7 +95,7 @@ class Trunk(nn.Module):
             profile:        (N, 32) or (B, N, 32)
             del_mean:       (N, 1) or (B, N, 1)
             has_msa:        (N, 1) or (B, N, 1)
-            msa_feat:       (S, N_prot, 34) or (B, S, N_prot, 34)
+            msa_feat:       (C, S, N_prot, 34) or (B, C, S, N_prot, 34)
             c_atom:         (N_atom, 128) or (B, N_atom, 128)
             p_lm:           (n_pairs, 16) or (B, n_pairs, 16)
             p_lm_idx:       (n_pairs, 2) or (B, n_pairs, 2)
@@ -105,7 +105,7 @@ class Trunk(nn.Module):
             bond_matrix:    (N, N) or (B, N, N) bool
             msa_token_mask:   (N,) or (B, N) bool
             token_pad_mask: (B, N) bool/float or None (1=real, 0=pad)
-            msa_pad_mask:   (B, N_prot) bool/float or None (1=real, 0=pad)
+            msa_mask:       (B, C, S, N_prot) float or None (1=real, 0=pad)
             num_cycles:     int, number of recycling cycles to run.
 
         Returns:
@@ -188,6 +188,11 @@ class Trunk(nn.Module):
             cycle_msa_feat = msa_feat[:, cycle % n_msa_cycles]  # (B, S, N_prot, 34)
             m = self.msa_embed(cycle_msa_feat)  # (B, S, N_prot, 64)
 
+            # Per-cycle MSA mask
+            cycle_msa_mask = None
+            if msa_mask is not None:
+                cycle_msa_mask = msa_mask[:, cycle % n_msa_cycles]  # (B, S, N_prot)
+
             # ---- MSA module: 4 blocks + coevol bias (SPEC §6) ----
             if is_last:
                 m, h_res, coevol_bias = self.msa_module(
@@ -195,7 +200,7 @@ class Trunk(nn.Module):
                     h_res,
                     msa_token_mask,
                     msa_bins,
-                    msa_pad_mask=msa_pad_mask,
+                    msa_mask=cycle_msa_mask,
                     training=self.training,
                 )
             else:
@@ -205,7 +210,7 @@ class Trunk(nn.Module):
                         h_res,
                         msa_token_mask,
                         msa_bins,
-                        msa_pad_mask=msa_pad_mask,
+                        msa_mask=cycle_msa_mask,
                         training=self.training,
                     )
 

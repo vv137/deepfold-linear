@@ -64,6 +64,7 @@
 | 12 | SPEC v4.6: AF3 alignment (AdaLN-Zero, FourierEmbed, c_in scaling, Kabsch) |
 | 13 | Flash Sinkhorn: Triton fwd+CG-IFT bwd, batch dims, mask support, kernel wiring |
 | 14 | SPEC v5: AF3 diffusion (encoder-transformer-decoder), Triton flash/windowed/cross-attn kernels, proper c_skip, ~375M total |
+| 15 | SPEC v5.4: per-layer marginals, per-cycle MSA subsampling, h_res-conditioned column scoring |
 
 ## Known AF3 Divergences
 

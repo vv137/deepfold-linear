@@ -249,8 +249,10 @@ def featurize(
                     axis=-1,
                 )
             ).unsqueeze(0).unsqueeze(0)  # (1, 1, N_prot, 34)
+            msa_mask = torch.ones(1, 1, N_prot)  # (1, 1, N_prot)
         else:
             msa_feat = torch.zeros(1, 1, 0, 34)
+            msa_mask = torch.zeros(1, 1, 0)
 
     # ------------------------------------------------------------------
     # 5. c_atom (N_atom, D_ref) — reference conformer features
@@ -345,6 +347,7 @@ def featurize(
         "del_mean": del_mean,  # (N, 1) float
         "has_msa": has_msa,  # (N, 1) float
         "msa_feat": msa_feat,  # (C, S_max, N_prot, 34) float — per-cycle MSA
+        "msa_mask": msa_mask,  # (C, S_max, N_prot) float — 1=real, 0=pad
         "c_atom": c_atom,  # (N_atom, 197) float
         "p_lm": p_lm,  # (n_pairs, 5) float — raw feats for AtomPairEmbedding
         "p_lm_idx": p_lm_idx,  # (n_pairs, 2) int

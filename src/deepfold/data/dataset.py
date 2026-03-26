@@ -742,7 +742,7 @@ class DeepFoldDataset(Dataset):
 
 # Keys whose padding value is 0.0 (marks padding positions in masks).
 # These are float mask tensors where 1.0 = real, 0.0 = padding.
-_MASK_KEYS = {"token_pad_mask", "atom_pad_mask", "pair_valid_mask", "msa_pad_mask"}
+_MASK_KEYS = {"token_pad_mask", "atom_pad_mask", "pair_valid_mask", "msa_mask"}
 
 
 def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
@@ -780,17 +780,8 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
         collated[key] = _pad_and_stack(values, pad_value=pad_value)
 
-    # Generate msa_pad_mask if msa_feat is present and batched
-    # msa_feat: (B, C, S, N_msa, 34) — mask is (B, N_msa) for protein position padding
-    if "msa_feat" in collated and collated["msa_feat"].ndim == 5:
-        B = len(batch)
-        # N_msa dimension is -2 in each sample's (C, S, N_msa, 34)
-        msa_n_dims = [b["msa_feat"].shape[-2] for b in batch]
-        max_N_msa = max(msa_n_dims)
-        msa_mask = torch.zeros(B, max_N_msa, dtype=torch.float32)
-        for i, n in enumerate(msa_n_dims):
-            msa_mask[i, :n] = 1.0
-        collated["msa_pad_mask"] = msa_mask
+    # msa_mask (B, C, S, N_msa) is already produced by featurize and
+    # padded by _pad_and_stack — no additional generation needed here.
 
     return collated
 

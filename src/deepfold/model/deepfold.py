@@ -126,14 +126,14 @@ class DeepFoldLinear(nn.Module):
         token_pad_mask: torch.Tensor | None = None,
         atom_pad_mask: torch.Tensor | None = None,
         pair_valid_mask: torch.Tensor | None = None,
-        msa_pad_mask: torch.Tensor | None = None,
+        msa_mask: torch.Tensor | None = None,
         compute_losses: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Full forward pass: trunk -> diffusion (training) or trunk -> sampling (inference).
 
         Supports both unbatched (N, ...) and batched (B, N, ...) inputs.
-        Mask tensors (token_pad_mask, atom_pad_mask, pair_valid_mask, msa_pad_mask)
+        Mask tensors (token_pad_mask, atom_pad_mask, pair_valid_mask, msa_mask)
         are floats with 1.0=valid, 0.0=padding. They are only needed for batched
         inputs (B>1) where samples have been padded to the same length.
 
@@ -181,7 +181,7 @@ class DeepFoldLinear(nn.Module):
             bond_matrix,
             msa_token_mask,
             token_pad_mask=token_pad_mask,
-            msa_pad_mask=msa_pad_mask,
+            msa_mask=msa_mask,
             num_cycles=num_cycles,
         )
 
