@@ -26,15 +26,10 @@ class TestTokenUOTBlockBatch:
         log_v = torch.zeros(n_heads, N)
         pos_bins = torch.randint(0, 68, (N, N))
 
-        from deepfold.model.position_encoding import PositionBias
-
-        pb = PositionBias(n_heads, 68)
-        pos_weight = pb.weight  # (H, 68)
-
         # Unbatched
         with torch.no_grad():
             h_ub, x_ub, lu_ub, lv_ub = block(
-                h, x_res, mu, nu, log_u, log_v, pos_weight, pos_bins
+                h, x_res, mu, nu, log_u, log_v, pos_bins
             )
 
         # Batched B=1
@@ -46,7 +41,6 @@ class TestTokenUOTBlockBatch:
                 nu.unsqueeze(0),
                 log_u.unsqueeze(0),
                 log_v.unsqueeze(0),
-                pos_weight,
                 pos_bins.unsqueeze(0),
             )
 
@@ -73,11 +67,6 @@ class TestTokenUOTBlockBatch:
         log_v = torch.zeros(B, n_heads, N)
         pos_bins = torch.randint(0, 68, (B, N, N))
 
-        from deepfold.model.position_encoding import PositionBias
-
-        pb = PositionBias(n_heads, 68)
-        pos_weight = pb.weight  # (H, 68)
-
         mask = torch.ones(B, N)
         mask[1, N_real[1] :] = 0  # pad positions 6-9 for sample 1
 
@@ -89,7 +78,6 @@ class TestTokenUOTBlockBatch:
                 nu,
                 log_u,
                 log_v,
-                pos_weight,
                 pos_bins,
                 mask=mask,
             )
@@ -122,11 +110,6 @@ class TestTokenUOTBlockBatch:
         log_v = torch.zeros(B, n_heads, N)
         pos_bins = torch.randint(0, 68, (B, N, N))
 
-        from deepfold.model.position_encoding import PositionBias
-
-        pb = PositionBias(n_heads, 68)
-        pos_weight = pb.weight
-
         h_out, x_out, _, _ = block(
             h,
             x_res,
@@ -134,7 +117,6 @@ class TestTokenUOTBlockBatch:
             nu,
             log_u,
             log_v,
-            pos_weight,
             pos_bins,
         )
         loss = h_out.sum() + x_out.sum()

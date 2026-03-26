@@ -342,10 +342,11 @@ def subsample_msa(
     max_seqs: int,
     rng: np.random.RandomState,
     training: bool = True,
+    min_seqs: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Subsample MSA to max depth, always keeping query (row 0).
 
-    During training, randomly picks depth in [1, max_seqs] (Boltz convention).
+    During training, randomly picks depth in [min_seqs, max_seqs] (Boltz convention).
     During inference, uses full max_seqs.
     """
     S, L = msa_seqs.shape
@@ -353,8 +354,7 @@ def subsample_msa(
         return msa_seqs, msa_dels
 
     if training:
-        # Random depth between 1 and max_seqs (Boltz-1 convention)
-        target = rng.randint(1, max_seqs + 1)
+        target = rng.randint(min_seqs, max_seqs + 1)
     else:
         target = max_seqs
 
@@ -384,6 +384,7 @@ class DeepFoldDataset(Dataset):
         data_paths: list[Path],
         max_tokens: int = 256,
         max_msa_seqs: int = 128,
+        min_msa_seqs: int = 1,
         msa_dir: Optional[Union[str, Path]] = None,
         training: bool = True,
         seed: int = 42,
@@ -397,6 +398,8 @@ class DeepFoldDataset(Dataset):
             Crop size in tokens. Updated externally via ``set_crop_size()``.
         max_msa_seqs : int
             Maximum MSA depth.
+        min_msa_seqs : int
+            Minimum random MSA depth during training.
         msa_dir : str or Path, optional
             Directory with MSA NPZ files (named ``{pdb}_{chain}.npz``).
         training : bool
@@ -408,6 +411,7 @@ class DeepFoldDataset(Dataset):
         self.data_paths = list(data_paths)
         self.max_tokens = max_tokens
         self.max_msa_seqs = max_msa_seqs
+        self.min_msa_seqs = min_msa_seqs
         self.msa_dir = Path(msa_dir) if msa_dir else None
         self.training = training
         self.rng = np.random.RandomState(seed)
@@ -669,7 +673,8 @@ class DeepFoldDataset(Dataset):
 
             # Subsample to max depth
             msa_seqs, msa_dels = subsample_msa(
-                msa_seqs, msa_dels, self.max_msa_seqs, self.rng, self.training
+                msa_seqs, msa_dels, self.max_msa_seqs, self.rng, self.training,
+                min_seqs=self.min_msa_seqs,
             )
 
             S, L_msa = msa_seqs.shape

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
+from deepfold.model.position_encoding import PositionBias
 from deepfold.model.primitives import SwiGLU
 
 K_ITER = 20
@@ -41,8 +42,11 @@ class TokenUOTBlock(nn.Module):
         self.w_g = nn.Linear(d_model, d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
 
-        # EGNN: per-head signed geometry step size — zeros init (SPEC §8.2)
-        self.gamma = nn.Parameter(torch.zeros(n_heads))
+        # EGNN: per-head signed geometry step size — noise init (SPEC §8.2)
+        self.gamma = nn.Parameter(torch.randn(n_heads) * 1e-4)
+
+        # Per-layer position bias (SPEC §4.3)
+        self.pos_bias = PositionBias(n_heads, 68)
 
         # Per-head geometry weight for cost matrix — sigmoid bounded (0,1)
         # Init -2.0 → sigmoid ≈ 0.12 (weak geometry bias initially)
@@ -70,7 +74,6 @@ class TokenUOTBlock(nn.Module):
         nu: torch.Tensor,
         log_u_prev: torch.Tensor | None,
         log_v_prev: torch.Tensor | None,
-        w_rel_res: torch.Tensor,
         pos_bins: torch.Tensor,
         geo_gate: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
@@ -83,7 +86,6 @@ class TokenUOTBlock(nn.Module):
             nu:         (H, N) or (B, H, N) column marginals
             log_u_prev: (H, N) or (B, H, N) or None — warm-start
             log_v_prev: (H, N) or (B, H, N) or None
-            w_rel_res:  PositionBias module or (H, N, N) or (B, H, N, N) precomputed
             pos_bins:   (N, N) or (B, N, N) int, 68-bin position encoding
             geo_gate:   (H,) or None — sigma-gated for diffusion blocks
             mask:       (B, N) bool/float, 1=real 0=pad. Only for batched.
@@ -102,8 +104,6 @@ class TokenUOTBlock(nn.Module):
                 log_u_prev = log_u_prev.unsqueeze(0)
             if log_v_prev is not None:
                 log_v_prev = log_v_prev.unsqueeze(0)
-            if isinstance(w_rel_res, torch.Tensor) and w_rel_res.dim() == 3:
-                w_rel_res = w_rel_res.unsqueeze(0)
             pos_bins = pos_bins.unsqueeze(0)
 
         B, N, _ = h.shape
@@ -124,13 +124,7 @@ class TokenUOTBlock(nn.Module):
         Q_ln = F.layer_norm(Q, [d_h])
         K_ln = F.layer_norm(K, [d_h])
 
-        # Position bias — extract weight (H, 68) and pass bins directly
-        if isinstance(w_rel_res, torch.Tensor):
-            # w_rel_res is the pos_weight (H, 68) tensor directly
-            pos_weight = w_rel_res
-        else:
-            # w_rel_res is a PositionBias module — extract its weight
-            pos_weight = w_rel_res.weight
+        pos_weight = self.pos_bias.weight  # (H, 68)
 
         w_dist = self.w_dist_logit.sigmoid()  # (H,) bounded (0, 1)
         effective_w_dist = w_dist

@@ -4,7 +4,7 @@ Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
   2. Coordinate path (x_res): completely dormant at init.
-     gamma=0, w_dist_logit=-2.0, w_rel=0, alpha_coevol=0.
+     gamma~N(0,1e-4), w_dist_logit=-2.0, w_rel=0, alpha_coevol=0.
      Content-only attention first; geometry earns its influence.
 """
 
@@ -15,7 +15,12 @@ import torch.nn as nn
 
 def _is_zero_init(name: str) -> bool:
     """Parameters that must stay at zero (dormant at init)."""
-    return any(tag in name for tag in ("gamma", "alpha_coevol"))
+    return "alpha_coevol" in name
+
+
+def _is_gamma(name: str) -> bool:
+    """EGNN gamma — noise init for symmetry breaking."""
+    return "gamma" in name
 
 
 def _is_adaln_zero_gate(name: str) -> bool:
@@ -28,14 +33,20 @@ def _is_position_bias(name: str) -> bool:
     return "pos_bias.weight" in name
 
 
-def init_model(model: nn.Module) -> None:
+def init_model(
+    model: nn.Module,
+    gamma_std: float = 1e-4,
+    w_dist_logit_val: float = -2.0,
+    adaln_gate_bias: float = -2.0,
+) -> None:
     """Apply SPEC §14 initialization to a DeepFoldLinear model.
 
     - Xavier normal for all 2D weight matrices (except zero-init ones).
     - Attention output (w_o) scaled by 1/sqrt(L) for residual depth control.
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
-    - Zeros for gamma, w_rel, alpha_coevol, zero_init_linear outputs.
-    - w_dist_logit init -2.0 (sigmoid ≈ 0.12, weak geometry initially).
+    - Noise init (N(0, gamma_std)) for gamma (symmetry breaking across layers).
+    - Zeros for w_rel, alpha_coevol, zero_init_linear outputs.
+    - w_dist_logit init (sigmoid ≈ 0.12, weak geometry initially).
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
     - Biases: zeros (PyTorch default).
     """
@@ -47,8 +58,12 @@ def init_model(model: nn.Module) -> None:
     # atom_encoder -> 1 block (no depth scaling needed)
 
     for name, param in model.named_parameters():
-        # Skip AdaLN-Zero gates — already initialized in AtomBlock.__init__
+        # AdaLN-Zero gates: weight=0, bias from config
         if _is_adaln_zero_gate(name):
+            if "bias" in name:
+                nn.init.constant_(param, adaln_gate_bias)
+            else:
+                nn.init.zeros_(param)
             continue
 
         # Skip frozen Fourier embedding weights
@@ -57,7 +72,11 @@ def init_model(model: nn.Module) -> None:
 
         if param.dim() < 2:
             # Scalars and 1D params
-            if _is_zero_init(name) or _is_position_bias(name):
+            if _is_gamma(name):
+                param.data.normal_(0, gamma_std)
+            elif "w_dist_logit" in name:
+                nn.init.constant_(param, w_dist_logit_val)
+            elif _is_zero_init(name) or _is_position_bias(name):
                 nn.init.zeros_(param)
             elif (
                 "layernorm" in name.lower()

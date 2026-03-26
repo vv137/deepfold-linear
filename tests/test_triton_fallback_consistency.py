@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from deepfold.model.position_encoding import PositionBias, compute_bins
+from deepfold.model.position_encoding import compute_bins
 from deepfold.model.trunk_block import TokenUOTBlock
 
 
@@ -39,17 +39,15 @@ class TestTritonFallbackConsistency:
         bond_matrix = torch.zeros(1, N, N, dtype=torch.bool, device="cuda")
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
 
-        pb = PositionBias(n_heads, 68).cuda()
-        # Give it nonzero weights for a meaningful test
-        pb.weight.data = torch.randn_like(pb.weight) * 0.1
-        pos_weight = pb.weight
+        # Give block nonzero pos_bias weights for a meaningful test
+        block.pos_bias.weight.data = torch.randn_like(block.pos_bias.weight) * 0.1
 
         # Training path (dense Sinkhorn)
         block.train()
         with torch.no_grad():
             h_train, x_train, lu_train, lv_train = block(
                 h.clone(), x_res.clone(), mu, nu, log_u, log_v,
-                pos_weight, pos_bins,
+                pos_bins,
             )
 
         # Inference path (flash Sinkhorn / Triton)
@@ -57,7 +55,7 @@ class TestTritonFallbackConsistency:
         with torch.no_grad():
             h_eval, x_eval, lu_eval, lv_eval = block(
                 h.clone(), x_res.clone(), mu, nu, log_u, log_v,
-                pos_weight, pos_bins,
+                pos_bins,
             )
 
         # They won't be bit-exact (different computation order, FP32 accumulation),
@@ -114,9 +112,7 @@ class TestTritonFallbackConsistency:
         log_v = torch.zeros(B, n_heads, N, device="cuda")
         pos_bins = torch.randint(0, 68, (B, N, N), dtype=torch.int32, device="cuda")
 
-        pb = PositionBias(n_heads, 68).cuda()
-        pb.weight.data = torch.randn_like(pb.weight) * 0.1
-        pos_weight = pb.weight
+        block.pos_bias.weight.data = torch.randn_like(block.pos_bias.weight) * 0.1
 
         mask = torch.ones(B, N, device="cuda")
         mask[1, 8:] = 0  # pad last 4 positions in sample 1
@@ -125,14 +121,14 @@ class TestTritonFallbackConsistency:
         with torch.no_grad():
             h_train, x_train, _, _ = block(
                 h.clone(), x_res.clone(), mu, nu, log_u, log_v,
-                pos_weight, pos_bins, mask=mask,
+                pos_bins, mask=mask,
             )
 
         block.eval()
         with torch.no_grad():
             h_eval, x_eval, _, _ = block(
                 h.clone(), x_res.clone(), mu, nu, log_u, log_v,
-                pos_weight, pos_bins, mask=mask,
+                pos_bins, mask=mask,
             )
 
         atol, rtol = 1e-3, 1e-3

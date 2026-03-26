@@ -30,11 +30,12 @@ def _make_small_model():
 class TestZeroInit:
     """Params that must be exactly zero at init."""
 
-    def test_gamma_zero(self):
+    def test_gamma_noise_init(self):
         model = _make_small_model()
         for name, p in model.named_parameters():
             if "gamma" in name:
-                assert (p == 0).all(), f"{name} should be zero"
+                assert p.abs().max() < 1e-2, f"{name} should be near-zero (noise init)"
+                assert not (p == 0).all(), f"{name} should have nonzero noise"
 
     def test_w_dist_logit_init(self):
         model = _make_small_model()

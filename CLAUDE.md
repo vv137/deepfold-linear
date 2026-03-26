@@ -28,7 +28,7 @@
 | MSA module | `model/msa.py` | 4 blocks, low-rank co-evolution (rank 16), Triton coevol kernel (inference) |
 | Trunk | `model/trunk.py` | 48 UOT+EGNN blocks, random cycles 1-5, flash Sinkhorn attention |
 | Sinkhorn attention | `model/kernels/sinkhorn_kernel.py` | Triton fwd+bwd, O(N) memory, CG-based IFT backward |
-| EGNN | `model/trunk_block.py` | Transport-weighted centroid, per-head γ (zeros init) |
+| EGNN | `model/trunk_block.py` | Transport-weighted centroid, per-head γ (noise init 1e-4), per-layer pos_bias |
 | Diffusion | `model/diffusion_v2.py` | AF3 style: 3 encoder + 24 transformer + 3 decoder, c_skip EDM |
 | Losses | `model/losses.py` | EDM diffusion (Kabsch-aligned), smooth LDDT, distogram (Triton eval) |
 
@@ -48,7 +48,7 @@
 
 * Script: `scripts/train.py` (DDP, gradient accumulation, EMA)
 * Optimizer: AdamW, 3 param groups (decay, no-decay, EGNN γ)
-* LR: linear warmup 5000 steps + cosine decay
+* LR: AF3 schedule — linear warmup 1000 steps + plateau + exponential decay (0.95× every 50k)
 * Checkpoint: model + optimizer + EMA + scaler + RNG → `latest.pt` symlink
 * Resume: `--resume runs/.../checkpoints/latest.pt`
 * DDP: `find_unused_parameters=True`, OOM broadcast across ranks
@@ -73,7 +73,7 @@
 * CG-IFT backward (not unrolled autograd through Sinkhorn iterations)
 * EGNN replaces IPA for structure refinement
 * No triangle attention/updates
-* Random cycle count 1-5 (AF3 uses fixed recycling)
+* Random cycle count 1-3 (AF3 uses fixed recycling)
 * Low-rank co-evolution (rank 16) instead of full outer product
 * 68-bin position encoding instead of RoPE
 
@@ -84,4 +84,5 @@
 * Single conditioning track (s = features AND conditioning) vs AF3's separate s/a tracks
 * dim=512 (vs AF3 768), ~155M params (vs AF3 ~445M)
 * Atom pair bias p_lm not used in v2 atom blocks (TODO)
+* Diffusion transformer pos_bias may be redundant — s already inherits position from trunk h_res conditioning (TODO: ablation)
 * Custom Triton kernels for all attention (AF3 uses PyTorch SDPA)

@@ -1,7 +1,6 @@
 """Training loop (SPEC §13). Pure PyTorch, no Lightning."""
 
 import logging
-import math
 
 import torch
 import torch.distributed as dist
@@ -60,24 +59,6 @@ class EMA:
     def load_state_dict(self, state: dict):
         self.shadow = state["shadow"]
         self.step = state["step"]
-
-
-# ============================================================================
-# LR Schedule
-# ============================================================================
-
-
-def get_lr(
-    step: int,
-    warmup_steps: int = 5000,
-    total_steps: int = 500_000,
-    base_lr: float = 1e-4,
-) -> float:
-    """Linear warmup + cosine decay (SPEC §13.1)."""
-    if step < warmup_steps:
-        return base_lr * step / warmup_steps
-    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 # ============================================================================
@@ -164,9 +145,7 @@ def train_step(
     step: int,
     scaler: torch.amp.GradScaler | None = None,
     max_grad_norm: float = 1.0,
-    warmup_steps: int = 5000,
-    total_steps: int = 500_000,
-    base_lr: float = 1e-4,
+    scheduler: object | None = None,
     is_accumulating: bool = False,
     grad_accum_steps: int = 1,
 ) -> dict[str, float]:
@@ -179,12 +158,7 @@ def train_step(
     """
     model.train()
 
-    if not is_accumulating:
-        lr = get_lr(step, warmup_steps, total_steps, base_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-    else:
-        lr = optimizer.param_groups[0]["lr"]
+    lr = optimizer.param_groups[0]["lr"]
 
     device = next(model.parameters()).device
 
@@ -208,6 +182,9 @@ def train_step(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                if scheduler is not None:
+                    scheduler.step()
+                    lr = optimizer.param_groups[0]["lr"]
         else:
             loss.backward()
             if not is_accumulating:
@@ -216,6 +193,9 @@ def train_step(
                 ).item()
                 optimizer.step()
                 optimizer.zero_grad()
+                if scheduler is not None:
+                    scheduler.step()
+                    lr = optimizer.param_groups[0]["lr"]
 
     except torch.cuda.OutOfMemoryError:
         logger.warning("OOM at step %d — skipping batch, clearing cache", step)
@@ -254,8 +234,14 @@ def val_step(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, float]:
-    """Single validation step with mixed precision."""
-    model.eval()
+    """Single validation step with mixed precision.
+
+    Uses model.train() so the forward path computes losses (which are gated
+    on self.training). The @torch.no_grad() decorator prevents gradient
+    computation. MSA row dropout still fires but is harmless for validation
+    averaging.
+    """
+    model.train()
     device = next(model.parameters()).device
 
     with torch.amp.autocast(

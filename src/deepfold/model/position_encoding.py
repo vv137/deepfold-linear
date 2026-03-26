@@ -56,8 +56,8 @@ class PositionBias(nn.Module):
     """
     Learnable per-head position bias from 68-bin encoding.
 
-    w_rel_res: (H_res, 68) for token UOT blocks — zeros init, AdamW decay
-    w_rel_msa: (H_msa, 68) for MSA row attention — zeros init, AdamW decay
+    w_rel_res: (H_res, 68) per UOT block — zeros init, no decay
+    w_rel_msa: (H_msa, 68) for MSA row attention — zeros init, no decay
     """
 
     def __init__(self, num_heads: int, num_bins: int = 68):

@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v5
+# Protein Complex Structure Prediction Model: Full Design Specification v5.1
 
 ---
 
@@ -288,8 +288,8 @@ g_i, g_j: global residue indices, preserved after cropping.
 ### 4.3 Parameters
 
 ```
-w_rel_res:  (H_res, 68)  — Residue UOT position bias.    Init: zeros. No decay (bounded).
-w_rel_msa:  (H_msa, 68)  — MSA attention position bias.   Init: zeros. No decay (bounded).
+w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. No decay (bounded). Each of the 48 UOT blocks has its own w_rel_res.
+w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. No decay (bounded). Shared across MSA blocks.
 ```
 
 ### 4.4 Branchless Online Computation
@@ -314,7 +314,7 @@ No warp divergence. w_rel cached in shared memory for kernel fusion.
 
 The trunk runs a **randomly sampled** number of recycling passes (1 to max_cycles). Each cycle: (1) refine h_res and marginals with MSA blocks (invariant, sequence/co-evolution), (2) refine h_res (invariant) and x_res (equivariant) with UOT+EGNN blocks. Only the last cycle backpropagates; all earlier cycles run under `torch.no_grad()`.
 
-**Random cycle count** makes the architecture an anytime algorithm. The network must produce good output whether it gets 1 cycle (48 UOT+EGNN blocks from noise) or 5 cycles (240 blocks of refinement). Since γ is shared across cycles, the network learns step sizes that work for both aggressive folding and gentle refinement. At inference, the user chooses: 1 cycle (fast), 3 (standard), 5+ (difficult targets).
+**Random cycle count** makes the architecture an anytime algorithm. The network must produce good output whether it gets 1 cycle (48 UOT+EGNN blocks from noise) or 3 cycles (144 blocks of refinement). Since γ is shared across cycles, the network learns step sizes that work for both aggressive folding and gentle refinement. At inference, the user chooses: 1 cycle (fast), 3 (standard).
 
 **No coordinate embedding into h_res**: Geometry enters through UOT cost → T* → attention output.
 
@@ -340,7 +340,7 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
 
     # ---- Sample cycle count ----
     if training:
-        num_cycles = randint(1, max_cycles + 1)       # e.g., uniform over {1, 2, 3, 4, 5}
+        num_cycles = randint(1, max_cycles + 1)       # e.g., uniform over {1, 2, 3}
     else:
         num_cycles = inference_cycles                  # default 3, configurable
 
@@ -399,7 +399,7 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
 
 | Parameter | Value |
 |---|---|
-| max_cycles (training) | 5 |
+| max_cycles (training) | 3 |
 | Sampling distribution | Uniform over {1, 2, 3, 4, 5} |
 | inference_cycles (default) | 3 |
 | inference_cycles (fast) | 1 |
@@ -739,7 +739,7 @@ class TokenUOTBlock(nn.Module):
         self.W_O = Lin(d, d, bias=False)
 
         # EGNN: per-head signed geometry step size
-        self.gamma = nn.Parameter(torch.zeros(H))    # (16,) zeros init
+        self.gamma = nn.Parameter(torch.randn(H) * 1e-4)  # (16,) noise init — breaks symmetry across layers
 
         # Per-head entropic regularization (fixed, multi-scale transport)
         self.register_buffer('eps', torch.tensor([
@@ -1202,11 +1202,19 @@ param_groups = [
     },
 ]
 
-optimizer = AdamW(param_groups, lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
+optimizer = AdamW(param_groups, lr=0.0, betas=(0.9, 0.95), eps=1e-8)
 
-# Learning rate schedule: linear warmup + cosine decay
-warmup_steps = 5000
-total_steps = 500000
+# Learning rate schedule: AF3 warmup + plateau + exponential decay
+scheduler = AlphaFoldLRScheduler(
+    optimizer,
+    base_lr=0.0,              # start from zero
+    max_lr=1e-3,              # peak LR
+    warmup_steps=1000,        # linear warmup
+    start_decay_after=50000,  # plateau until this step
+    decay_every=50000,        # decay interval
+    decay_factor=0.95,        # multiplicative factor per interval
+)
+max_grad_norm = 10.0
 
 ema = EMA(model, decay=0.999)
 ```
@@ -1276,7 +1284,7 @@ class EMA:
 | Geometry bias at high noise (trunk) | Per-head w_dist diversity | Some heads geometry-sensitive, others robust |
 | Geometry bias at high noise (diffusion) | σ-conditioned geo_gate | Learned suppression at high σ |
 | Geometry bias domination | w_dist sigmoid-bounded (0,1), init ≈0.12 | Per-block per-head; can't exceed 1.0 |
-| Position bias scale | w_rel zeros init, no decay | Starts at zero; bounded by bin count |
+| Position bias scale | w_rel zeros init (per-layer), no decay | Starts at zero; per-layer allows specialization; bounded by bin count |
 | Co-evolution noise | Per-layer per-head α_coevol zeros init + decay | Must earn influence; per-head specialization |
 | Marginal reset across cycles | Log-space geometric blend with previous cycle | Preserves transport patterns |
 | SE(3) equivariance (trunk) | EGNN: relative vectors only | No augmentation needed |
@@ -1401,8 +1409,8 @@ def init_model(model, num_blocks=48):
     for name, param in model.named_parameters():
         if param.dim() < 2:
             # --- Scalars and vectors ---
-            if 'gamma' in name:                    # EGNN γ: dormant at init
-                nn.init.zeros_(param)
+            if 'gamma' in name:                    # EGNN γ: noise init for symmetry breaking
+                param.data.normal_(0, 1e-4)
             elif 'w_dist_logit' in name:             # geometry bias: sigmoid(-2.0) ≈ 0.12
                 nn.init.constant_(param, -2.0)
             elif 'w_rel' in name:                  # position bias: off at init
@@ -1433,9 +1441,9 @@ def init_model(model, num_blocks=48):
 | W_O (attention output) | Xavier / √48 | Residual depth scaling; prevents h_res magnitude growth |
 | SwiGLU gate, value | Xavier | SiLU(gate) × value product naturally self-suppresses at init |
 | SwiGLU output (ff_out) | Xavier (not scaled) | Product structure already suppresses; double-scaling would starve transitions |
-| γ (EGNN) | zeros | EGNN dormant at init; must earn influence via L_trunk_coord gradient |
+| γ (EGNN) | randn × 1e-4 | Near-dormant with symmetry-breaking noise; each layer starts with unique γ |
 | w_dist_logit | -2.0 (sigmoid ≈ 0.12) | Weak geometry at init; per-block per-head; sigmoid-bounded (0,1); no weight decay |
-| w_rel | zeros | Position bias off at init; learns sequence-distance priors during training |
+| w_rel | zeros (per-layer for trunk) | Position bias off at init; each UOT block learns its own sequence-distance priors |
 | α_coevol | zeros | Co-evolution bias off at init; MSA processing must stabilize first |
 | LN γ, β | (1, 0) | Identity normalization at init |
 | Input embedding Lin(38→512) | Xavier + bias=zeros | Standard; network adjusts column scales for different input features |
@@ -1449,7 +1457,7 @@ def init_model(model, num_blocks=48):
 **Staged activation dynamics**: At the start of training:
 
 1. Content cost (`-LN(Q)^T LN(K)/√d_h`) is the only active cost term → attention based on sequence/MSA features
-2. Transport plans are approximately uniform (all costs similar) → EGNN centroids ≈ global mean → γ=0 means no coordinate movement
+2. Transport plans are approximately uniform (all costs similar) → EGNN centroids ≈ global mean → γ≈0 (noise init) means minimal coordinate movement, with symmetry broken across layers
 3. L_disto provides strong gradients (random predictions, high loss) → h_res rapidly learns distance-relevant features
 4. As h_res improves → content cost becomes informative → transport plans sharpen → EGNN centroids become meaningful
 5. L_trunk_coord gradient pushes γ away from zero → coordinates begin to refine
@@ -1547,7 +1555,7 @@ All post-LN projections use `bias=False`. Standalone projections (input embed, c
 | Token UOT+EGNN: SwiGLU Lin(512→2048, bias=F)×2, Lin(2048→512, bias=F) | per block × 48 | 48 × 3.1M = 150M | Xavier | ✅ |
 | Token UOT+EGNN: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **zeros** | ✅ |
 | Token UOT+EGNN: ε (per-head, fixed) | buffer (16,), shared all blocks | 0 (not a parameter) | [1.0]×4+[2.0]×4+[4.0]×4+[8.0]×4 | N/A |
-| Token position: w_rel_res | (16, 68) | 1K | zeros | ✅ |
+| Token position: w_rel_res (×48) | (16, 68) per block | 52K | zeros | ✅ |
 | Geometry: w_dist_logit | per block × 48, (16,) each | 768 | **-2.0** (sigmoid ≈ 0.12) | ❌ (sigmoid-bounded) |
 | LN γ, β (attention + transition) | per block × 48, 2 × (512,) each | 48 × 2K = 98K | (1, 0) | ❌ |
 | **Token UOT+EGNN total** | | **~213M** | | |
@@ -1658,7 +1666,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 | Atom coordinate embed | c_atom = 128 per diffusion step | d_atom = 128 per diffusion step (same) |
 | Atom attention | Local window 32→128 | Local window 32 (same pattern) |
 | Atom pair bias | c_atompair = 16, intra-token | d_pair = 16, intra-token (same) |
-| Recycling | 3 fixed | 1–5 random (EGNN refines coords across 48 blocks/cycle) |
+| Recycling | 3 fixed | 1–3 random (EGNN refines coords across 48 blocks/cycle) |
 | Marginal handling | N/A (softmax) | Per-layer per-head α_coevol, log-blend across cycles |
 | Template | ✅ | ❌ (v1 excluded) |
 | Confidence heads | pLDDT, PAE, pTM | Planned (§18) |
@@ -1746,7 +1754,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 ### Inference Optimizations
 
 1. **Trunk-initialized diffusion**: Instead of starting diffusion from pure noise (σ_max=160Å), initialize atom coordinates from the trunk's refined x_res plus noise at σ_init ≈ 3–5Å (matching trunk's typical RMSD). Enter the Karras schedule at σ_init instead of σ_max, skipping ~30–40% of denoising steps. No training change — the model has trained to denoise at all σ levels. Pure inference speedup.
-2. **Adaptive cycle count**: Run 1 cycle for fast screening, 3 for standard, 5+ for difficult targets. The random-cycle training (§5) enables this.
+2. **Adaptive cycle count**: Run 1 cycle for fast screening, 3 for standard. The random-cycle training (§5) enables this.
 
 ### Validation Experiments
 

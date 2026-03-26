@@ -25,20 +25,31 @@ class ModelConfig:
     n_diff_heads: int = 16
     d_fourier: int = 256
     sigma_data: float = 16.0
-    max_cycles: int = 5
+    max_cycles: int = 3
     inference_cycles: int = 3
 
 
 @dataclass
+class InitConfig:
+    gamma_std: float = 1e-4       # EGNN gamma N(0, std) noise init
+    w_dist_logit: float = -2.0    # geometry bias init; sigmoid(-2.0) ≈ 0.12
+    adaln_gate_bias: float = -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
+
+
+@dataclass
 class TrainingConfig:
-    lr: float = 1e-4
+    lr: float = 1e-3           # max_lr (peak after warmup)
+    base_lr: float = 0.0       # starting LR for warmup
     weight_decay: float = 0.01
-    betas: list[float] = field(default_factory=lambda: [0.9, 0.999])
-    warmup_steps: int = 5000
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    warmup_steps: int = 1000
+    start_decay_after: int = 50_000
+    decay_every: int = 50_000
+    decay_factor: float = 0.95
     total_steps: int = 500_000
     ema_decay: float = 0.999
     ema_warmup_steps: int = 1000
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 10.0
     batch_size: int = 1
     grad_accum_steps: int = 1
     crop_schedule: list = field(
@@ -49,6 +60,13 @@ class TrainingConfig:
             [500_000, 768],
         ]
     )
+
+
+@dataclass
+class ValidationConfig:
+    val_every: int = 1_000      # validate every N steps
+    val_batches: int = 50       # max batches per validation run (0 = all)
+    validate_first: bool = False # run full validation before training starts
 
 
 @dataclass
@@ -70,6 +88,7 @@ class LossWeights:
 @dataclass
 class MSAConfig:
     max_depth: int = 128  # max MSA rows after uniform subsampling
+    min_depth: int = 1    # minimum random depth during training
 
 
 @dataclass
@@ -107,7 +126,9 @@ class WandbConfig:
 @dataclass
 class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
+    init: InitConfig = field(default_factory=InitConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     loss_weights: LossWeights = field(default_factory=LossWeights)
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
@@ -137,8 +158,12 @@ def load_config(path: Optional[str | Path] = None) -> Config:
 
     if "model" in raw:
         _apply_dict(cfg.model, raw["model"])
+    if "init" in raw:
+        _apply_dict(cfg.init, raw["init"])
     if "training" in raw:
         _apply_dict(cfg.training, raw["training"])
+    if "validation" in raw:
+        _apply_dict(cfg.validation, raw["validation"])
     if "loss_weights" in raw:
         _apply_dict(cfg.loss_weights, raw["loss_weights"])
     if "sampler" in raw:

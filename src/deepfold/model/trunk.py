@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from deepfold.model.msa import MSAModule
 from deepfold.model.trunk_block import TokenUOTBlock
-from deepfold.model.position_encoding import PositionBias, compute_bins
+from deepfold.model.position_encoding import compute_bins
 from deepfold.model.input_embedding import (
     TokenSingleEmbedding,
     MSAEmbedding,
@@ -62,10 +62,7 @@ class Trunk(nn.Module):
             ]
         )
 
-        # Shared position bias for UOT blocks (SPEC §4.3)
-        self.pos_bias = PositionBias(h_res, 68)
-
-        # w_dist is now per-block inside TokenUOTBlock
+        # w_dist and pos_bias are per-block inside TokenUOTBlock
 
     def forward(
         self,
@@ -174,9 +171,6 @@ class Trunk(nn.Module):
         else:
             msa_bins = torch.zeros(B, 0, 0, device=device, dtype=torch.long)
 
-        # Pass pos_weight (H, 68) and pos_bins (B, N, N) directly — no O(B*H*N²) materialization
-        uot_pos_weight = self.pos_bias.weight  # (H, 68)
-
         # ---- Sample cycle count (SPEC §5.3) ----
         # Use a device tensor + broadcast so all DDP ranks get the same
         # cycle count — prevents forward/backward desync.
@@ -250,7 +244,6 @@ class Trunk(nn.Module):
                         nu,
                         log_u_prev,
                         log_v_prev,
-                        uot_pos_weight,
                         pos_bins,
                         mask=token_pad_mask,
                     )
@@ -263,7 +256,6 @@ class Trunk(nn.Module):
                             nu,
                             log_u_prev,
                             log_v_prev,
-                            uot_pos_weight,
                             pos_bins,
                             mask=token_pad_mask,
                         )

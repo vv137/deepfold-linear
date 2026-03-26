@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v5)
+# DeepFold-Linear model configuration (SPEC v5.1)
 
 model:
   d_model: 512
@@ -15,22 +15,28 @@ model:
   n_diff_heads: 16
   d_fourier: 256
   sigma_data: 16.0
-  max_cycles: 5
+  max_cycles: 3 # training samples uniformly from [1, max_cycles]
   inference_cycles: 3
 
 msa:
-  max_depth: 128 # max MSA rows after subsampling (uniform random [1, max_depth])
+  max_depth: 128 # max MSA rows after subsampling (uniform random [min_depth, max_depth])
+  min_depth: 1 # minimum random depth during training
 
 training:
   batch_size: 1
-  lr: 1.0e-4
+  # AF3 LR schedule: warmup → plateau → exponential decay
+  lr: 1.0e-3 # max_lr (peak after warmup)
+  base_lr: 0.0 # starting LR for warmup
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  warmup_steps: 5000
+  warmup_steps: 1000
+  start_decay_after: 50000
+  decay_every: 50000
+  decay_factor: 0.95
   total_steps: 500000
   ema_decay: 0.999
   ema_warmup_steps: 1000
-  max_grad_norm: 1.0
+  max_grad_norm: 10.0
   grad_accum_steps: 128
   crop_schedule:
     - [0, 256]
@@ -38,6 +44,11 @@ training:
     # - [100000, 384]
     # - [300000, 512]
     # - [500000, 768]
+
+validation:
+  val_every: 1000 # validate every N steps
+  val_batches: 32 # max batches per validation run (0 = all)
+  validate_first: false # run full validation before training starts
 
 loss_weights:
   w_diff: 1.0
@@ -66,10 +77,15 @@ diffusion:
 wandb:
   enabled: false
   project: deepfold-linear
-  entity: null  # your wandb team/user; null = default
-  name: null    # run name; null = auto-generated
+  entity: null # your wandb team/user; null = default
+  name: null # run name; null = auto-generated
   tags: []
-  log_every: 1  # log every N optimizer steps
+  log_every: 1 # log every N optimizer steps
+
+init:
+  gamma_std: 1.0e-4 # EGNN gamma N(0, std) noise init for symmetry breaking
+  w_dist_logit: -2.0 # geometry bias init; sigmoid(-2.0) ≈ 0.12
+  adaln_gate_bias: -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
 
 sinkhorn:
   lambda: 1.0

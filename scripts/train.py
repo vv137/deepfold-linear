@@ -20,6 +20,7 @@ from deepfold.data.dataset import DeepFoldDataset, collate_fn
 from deepfold.data.sampler import ClusterWeightedSampler, load_manifest
 from deepfold.model.deepfold import DeepFoldLinear
 from deepfold.train.config import load_config
+from deepfold.train.scheduler import AlphaFoldLRScheduler
 from deepfold.train.trainer import (
     EMA,
     build_optimizer,
@@ -37,33 +38,132 @@ logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 
-def _log_gamma_heatmap(model, step, wandb):
-    """Log tanh(gamma) heatmap (48 layers × 16 heads) to wandb.
+def _run_validation(raw_model, ema, val_loader, device, max_batches):
+    """Run validation epoch with EMA weights, return averaged metrics or None."""
+    ema.apply(raw_model)
+    metrics_sum = {
+        k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
+    }
+    n_val = 0
+    max_val = max_batches if max_batches > 0 else len(val_loader)
+    for val_batch in val_loader:
+        if n_val >= max_val:
+            break
+        val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
+        vm = val_step(raw_model, val_batch)
+        for k in metrics_sum:
+            metrics_sum[k] += vm[k]
+        n_val += 1
+        del val_batch, vm
+    ema.restore(raw_model)
+    gc.collect()
+    torch.cuda.empty_cache()
+    if n_val > 0:
+        return {k: v / n_val for k, v in metrics_sum.items()}
+    return None
 
-    Blue = attraction (negative γ), Red = repulsion (positive γ).
-    """
+
+def _log_val_metrics(val_avg, step, label, wandb):
+    """Log validation metrics to console and optionally wandb."""
+    logger.info(
+        "[%s] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f",
+        label, step,
+        val_avg["loss"], val_avg["l_diff"], val_avg["l_lddt"],
+        val_avg["l_disto"], val_avg["l_trunk_coord"],
+    )
+    if wandb is not None:
+        wandb.log({f"val/{k}": v for k, v in val_avg.items()}, step=step)
+
+
+def _heatmap(data, title, xlabel, ylabel, cmap="RdBu_r", figsize=(8, 12)):
+    """Create a heatmap figure with adaptive symmetric range and stats annotation."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import numpy as np
 
-    raw_model = model.module if hasattr(model, "module") else model
-    gamma_map = (
-        torch.stack([b.gamma for b in raw_model.trunk.uot_blocks])
-        .detach().cpu().tanh().numpy()
-    )  # (n_layers, n_heads)
+    vmax = max(float(np.abs(data).max()), 1e-6)
+    stats = (f"min={data.min():.3e}  max={data.max():.3e}  "
+             f"mean={data.mean():.3e}  std={data.std():.3e}")
 
-    with plt.rc_context({"mathtext.fontset": "cm"}):
-        fig, ax = plt.subplots(figsize=(8, 12))
-        im = ax.imshow(
-            gamma_map, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1,
-            interpolation="nearest",
-        )
-        ax.set_xlabel(r"Head $h$")
-        ax.set_ylabel(r"Layer $\ell$")
-        ax.set_title(rf"$\tanh(\gamma_{{h,\ell}})$ — step {step}")
-        fig.colorbar(im, ax=ax, label=r"$\tanh(\gamma)$: $\leftarrow$ attraction | repulsion $\rightarrow$")
-        fig.tight_layout()
-    wandb.log({"gamma_heatmap": wandb.Image(fig)}, step=step)
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(data, aspect="auto", cmap=cmap, vmin=-vmax, vmax=vmax,
+                   interpolation="nearest")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{title}\n{stats}", fontsize=10)
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    return fig
+
+
+def _log_extra(model, step, wandb):
+    """Log per-head/per-layer scalar heatmaps and summary scalars."""
+    import numpy as np
+
+    raw = model.module if hasattr(model, "module") else model
+    blocks = raw.trunk.uot_blocks
+
+    # ---- Collect per-layer per-head arrays ----
+    gamma_map = torch.stack([b.gamma for b in blocks]).detach().cpu().tanh().numpy()
+    wdist_map = torch.stack([b.w_dist_logit for b in blocks]).detach().cpu().sigmoid().numpy()
+    # pos_bias: (n_layers, H, 68)
+    pos_map = torch.stack([b.pos_bias.weight for b in blocks]).detach().cpu().numpy()
+    # alpha_coevol: (n_msa_blocks, H_res)
+    alpha = raw.trunk.msa_module.alpha_coevol.detach().cpu().numpy()
+
+    # ---- Summary scalars (cheap trend lines) ----
+    wandb.log({
+        "params/gamma_abs_mean": float(np.abs(gamma_map).mean()),
+        "params/gamma_abs_max": float(np.abs(gamma_map).max()),
+        "params/w_dist_mean": float(wdist_map.mean()),
+        "params/w_dist_max": float(wdist_map.max()),
+        "params/alpha_coevol_abs_max": float(np.abs(alpha).max()),
+        "params/pos_bias_abs_max": float(np.abs(pos_map).max()),
+    }, step=step)
+
+    # ---- Heatmaps ----
+    # tanh(gamma): (n_layers, n_heads)
+    fig = _heatmap(gamma_map, f"tanh(γ) — step {step}", "Head", "Layer")
+    wandb.log({"heatmap/gamma": wandb.Image(fig)}, step=step)
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+    # sigmoid(w_dist_logit): (n_layers, n_heads)
+    fig = _heatmap(wdist_map, f"σ(w_dist) — step {step}", "Head", "Layer",
+                   cmap="viridis")
+    wandb.log({"heatmap/w_dist": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+    # alpha_coevol: (n_msa_blocks, H_res)
+    fig = _heatmap(alpha, f"α_coevol — step {step}", "Head", "MSA Block",
+                   figsize=(8, 3))
+    wandb.log({"heatmap/alpha_coevol": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+    # trunk pos_bias: per-head heatmap (n_layers, 68) × n_heads
+    n_heads = pos_map.shape[1]
+    cols = min(4, n_heads)
+    rows = (n_heads + cols - 1) // cols
+    vmax = max(float(np.abs(pos_map).max()), 1e-6)
+    stats = (f"min={pos_map.min():.3e}  max={pos_map.max():.3e}  "
+             f"std={pos_map.std():.3e}")
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 0.15 * len(blocks) + 2 * rows),
+                              sharex=True, sharey=True, layout="constrained")
+    if n_heads == 1:
+        axes = np.array([axes])
+    axes_flat = axes.flatten()
+    for h in range(n_heads):
+        ax = axes_flat[h]
+        ax.imshow(pos_map[:, h, :], aspect="auto", cmap="RdBu_r",
+                  vmin=-vmax, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"Head {h}", fontsize=9)
+        if h % cols == 0:
+            ax.set_ylabel("Layer")
+    for i in range(n_heads, len(axes_flat)):
+        axes_flat[i].set_visible(False)
+    fig.suptitle(f"trunk pos_bias — step {step}\n{stats}", fontsize=10)
+    wandb.log({"heatmap/trunk_pos_bias": wandb.Image(fig)}, step=step)
     plt.close(fig)
 
 
@@ -109,9 +209,10 @@ def main():
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--extra-log-every", type=int, default=1_000,
                         help="Interval for expensive wandb logs (gamma heatmap, etc.)")
-    parser.add_argument("--val-every", type=int, default=1_000)
-    parser.add_argument("--val-batches", type=int, default=50,
-                        help="Max batches per validation run (0=all)")
+    parser.add_argument("--val-every", type=int, default=None,
+                        help="Validate every N steps (default: from config)")
+    parser.add_argument("--val-batches", type=int, default=None,
+                        help="Max batches per validation run, 0=all (default: from config)")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--local-rank", type=int, default=0)
     # CLI overrides for config values
@@ -125,6 +226,8 @@ def main():
         default=None,
         help="Only train on structures released before this date (YYYY-MM-DD)",
     )
+    parser.add_argument("--validate-first", action="store_true", default=None,
+                        help="Run full validation before training starts (logged + wandb)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -138,6 +241,14 @@ def main():
         cfg.training.grad_accum_steps = args.grad_accum_steps
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
+
+    # Validation: CLI overrides config
+    if args.val_every is not None:
+        cfg.validation.val_every = args.val_every
+    if args.val_batches is not None:
+        cfg.validation.val_batches = args.val_batches
+    if args.validate_first:
+        cfg.validation.validate_first = True
 
     # Reproducibility
     torch.manual_seed(args.seed)
@@ -189,6 +300,7 @@ def main():
 
         config_snapshot = {
             "model": {k: getattr(cfg.model, k) for k in vars(cfg.model)},
+            "init": {k: getattr(cfg.init, k) for k in vars(cfg.init)},
             "training": {k: getattr(cfg.training, k) for k in vars(cfg.training)},
             "loss_weights": cfg.loss_weights.to_dict(),
             "sampler": {k: getattr(cfg.sampler, k) for k in vars(cfg.sampler)},
@@ -251,6 +363,9 @@ def main():
         inference_cycles=cfg.model.inference_cycles,
         diffusion_multiplicity=cfg.diffusion.multiplicity,
         loss_weights=cfg.loss_weights.to_dict(),
+        gamma_std=cfg.init.gamma_std,
+        w_dist_logit=cfg.init.w_dist_logit,
+        adaln_gate_bias=cfg.init.adaln_gate_bias,
     ).to(device)
 
     if rank0:
@@ -268,6 +383,15 @@ def main():
         model, decay=cfg.training.ema_decay, warmup_steps=cfg.training.ema_warmup_steps
     )
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    scheduler = AlphaFoldLRScheduler(
+        optimizer,
+        base_lr=cfg.training.base_lr,
+        max_lr=cfg.training.lr,
+        warmup_steps=cfg.training.warmup_steps,
+        start_decay_after=cfg.training.start_decay_after,
+        decay_every=cfg.training.decay_every,
+        decay_factor=cfg.training.decay_factor,
+    )
 
     # Resume from checkpoint
     start_step = 0
@@ -279,6 +403,11 @@ def main():
         start_step = ckpt["step"]
         if scaler is not None and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            # Fast-forward scheduler to match resumed step
+            scheduler.last_epoch = start_step
         # Restore RNG state on rank 0; other ranks get fresh seeds offset by
         # rank (same as initial setup) to maintain data diversity across GPUs.
         if "rng_state" in ckpt and not use_ddp:
@@ -355,6 +484,7 @@ def main():
         data_paths=train_paths,
         max_tokens=get_crop_size(start_step),
         max_msa_seqs=cfg.msa.max_depth,
+        min_msa_seqs=cfg.msa.min_depth,
         msa_dir=args.msa_dir,
         training=True,
         seed=args.seed,
@@ -375,6 +505,7 @@ def main():
             data_paths=train_paths,
             max_tokens=get_crop_size(start_step),
             max_msa_seqs=cfg.msa.max_depth,
+            min_msa_seqs=cfg.msa.min_depth,
             msa_dir=args.msa_dir,
             training=True,
             seed=args.seed,
@@ -453,6 +584,20 @@ def main():
         if val_loader:
             logger.info("Validation on %d structures", len(val_paths))
 
+    # ---- Validate first (optional) ----
+    if cfg.validation.validate_first and val_loader:
+        if rank0:
+            logger.info("Running pre-training validation...")
+        raw_model = model.module if use_ddp else model
+        val_avg = _run_validation(raw_model, ema, val_loader, device,
+                                  cfg.validation.val_batches)
+        if rank0 and val_avg:
+            _log_val_metrics(val_avg, start_step, "val-init",
+                             wandb if use_wandb else None)
+    elif cfg.validation.validate_first and not val_loader:
+        if rank0:
+            logger.warning("--validate-first requested but no validation data available")
+
     # ---- Training loop ----
     grad_accum = cfg.training.grad_accum_steps
     train_iter = iter(train_loader)
@@ -491,9 +636,7 @@ def main():
                 step,
                 scaler,
                 max_grad_norm=cfg.training.max_grad_norm,
-                warmup_steps=cfg.training.warmup_steps,
-                total_steps=cfg.training.total_steps,
-                base_lr=cfg.training.lr,
+                scheduler=scheduler,
                 is_accumulating=not is_last_micro,
                 grad_accum_steps=grad_accum,
             )
@@ -549,7 +692,7 @@ def main():
                     step=step,
                 )
             if use_wandb and step % args.extra_log_every == 0:
-                _log_gamma_heatmap(model, step, wandb)
+                _log_extra(model, step, wandb)
 
         # Checkpointing (before validation — save consistent state)
         if step % args.save_every == 0:
@@ -566,6 +709,7 @@ def main():
                 "rng_state": torch.get_rng_state(),
                 "np_rng_state": np.random.get_state(),
             }
+            ckpt_data["scheduler"] = scheduler.state_dict()
             if scaler is not None:
                 ckpt_data["scaler"] = scaler.state_dict()
             if torch.cuda.is_available():
@@ -578,47 +722,13 @@ def main():
             logger.info("Saved checkpoint: %s", path)
 
         # Validation
-        if val_loader and step % args.val_every == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
+        if val_loader and step % cfg.validation.val_every == 0:
             raw_model = model.module if use_ddp else model
-            ema.apply(raw_model)
-            val_metrics_sum = {
-                k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
-            }
-            n_val = 0
-            max_val = args.val_batches if args.val_batches > 0 else len(val_loader)
-            for val_batch in val_loader:
-                if n_val >= max_val:
-                    break
-                val_batch = {
-                    k: v.to(device, non_blocking=True) for k, v in val_batch.items()
-                }
-                vm = val_step(raw_model, val_batch)
-                for k in val_metrics_sum:
-                    val_metrics_sum[k] += vm[k]
-                n_val += 1
-                del val_batch, vm
-            ema.restore(raw_model)
-            del raw_model
-            gc.collect()
-            torch.cuda.empty_cache()
-            if rank0 and n_val > 0:
-                val_avg = {k: v / n_val for k, v in val_metrics_sum.items()}
-                logger.info(
-                    "[val] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f",
-                    step,
-                    val_avg["loss"],
-                    val_avg["l_diff"],
-                    val_avg["l_lddt"],
-                    val_avg["l_disto"],
-                    val_avg["l_trunk_coord"],
-                )
-                if use_wandb:
-                    wandb.log(
-                        {f"val/{k}": v for k, v in val_avg.items()},
-                        step=step,
-                    )
+            val_avg = _run_validation(raw_model, ema, val_loader, device,
+                                      cfg.validation.val_batches)
+            if rank0 and val_avg:
+                _log_val_metrics(val_avg, step, "val",
+                                 wandb if use_wandb else None)
 
     if rank0 and oom_count > 0:
         logger.info("Total OOM skips: %d", oom_count)

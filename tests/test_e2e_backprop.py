@@ -10,7 +10,8 @@ entire model:
 import torch
 
 from deepfold.model.deepfold import DeepFoldLinear
-from deepfold.train.trainer import build_optimizer, get_lr
+from deepfold.train.scheduler import AlphaFoldLRScheduler
+from deepfold.train.trainer import build_optimizer
 
 
 def _make_model(device="cpu", multiplicity=2):
@@ -211,6 +212,10 @@ class TestEndToEndBackprop:
         torch.manual_seed(42)
         model = _make_model()
         optimizer = build_optimizer(model, lr=1e-3)
+        scheduler = AlphaFoldLRScheduler(
+            optimizer, base_lr=0.0, max_lr=1e-3,
+            warmup_steps=1, start_decay_after=10, decay_every=10,
+        )
         batch = _make_batch()
 
         initial_params = {name: p.clone() for name, p in model.named_parameters()}
@@ -220,10 +225,6 @@ class TestEndToEndBackprop:
             model.train()
             optimizer.zero_grad()
 
-            lr = get_lr(step, warmup_steps=1, total_steps=10)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-
             outputs = model(**batch)
             loss = outputs["loss"]
             assert torch.isfinite(loss), f"Step {step}: loss={loss.item()}"
@@ -231,6 +232,7 @@ class TestEndToEndBackprop:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
 
             losses.append(loss.item())
 
