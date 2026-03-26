@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from deepfold.model.deepfold import DeepFoldLinear
-from deepfold.train.trainer import EMA, build_optimizer, train_step
+from deepfold.train.trainer import EMA, build_optimizer
 
 
 def _make_small_model():

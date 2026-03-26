@@ -11,11 +11,9 @@ Proper EDM preconditioning with c_skip.
 ~115M params (vs ~4.2M in v1).
 """
 
-import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from deepfold.model.primitives import SwiGLU, zero_init_linear, adaln_zero_gate
 from deepfold.model.position_encoding import PositionBias
@@ -23,11 +21,6 @@ from deepfold.model.diffusion import (
     FourierEmbedding,
     AdaLN,
     edm_preconditioning,
-    sample_training_sigma,
-    karras_schedule,
-    SIGMA_DATA,
-    SIGMA_MAX,
-    SIGMA_MIN,
 )
 
 try:

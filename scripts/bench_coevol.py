@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import torch
-import torch.nn.functional as F
 
 from deepfold.model.kernels.coevol_kernel import triton_coevol
 

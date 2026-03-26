@@ -9,7 +9,6 @@ Usage:
 
 import argparse
 import torch
-import torch.nn.functional as F
 
 # ============================================================================
 # 1. Cross-attention LSE optimization
