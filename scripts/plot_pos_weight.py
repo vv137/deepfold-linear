@@ -24,7 +24,7 @@ BIN_LABELS = {
 
 MODULE_KEYS = {
     "trunk": "trunk.pos_bias.weight",
-    "msa": "msa.pos_bias.weight",
+    "msa": "trunk.msa_module.pos_bias.weight",
     "diffusion": "diffusion.pos_bias.weight",
 }
 
