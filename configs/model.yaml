@@ -21,6 +21,8 @@ model:
 msa:
   max_depth: 128 # max MSA rows after subsampling (uniform random [min_depth, max_depth])
   min_depth: 1 # minimum random depth during training
+  max_paired: 8192 # max taxonomy-paired MSA rows across chains (Boltz default)
+  max_unpaired: 16384 # max unpaired MSA rows (Boltz default)
 
 data:
   num_workers: 4

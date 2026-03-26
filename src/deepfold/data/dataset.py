@@ -285,14 +285,15 @@ def tokenize_boltz_structure(struct: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
-    """Load Boltz-style MSA NPZ and return (residue_types, deletions) per sequence.
+def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Load Boltz-style MSA NPZ and return (residue_types, deletions, taxonomy).
 
     Returns
     -------
-    (msa_seqs, msa_dels) or None if loading fails.
+    (msa_seqs, msa_dels, taxonomy) or None if loading fails.
         msa_seqs: (S, L) int array of residue type IDs
         msa_dels: (S, L) float array of deletion counts
+        taxonomy: (S,) int array of species IDs (-1 = unknown)
     """
     try:
         data = np.load(path, allow_pickle=True)
@@ -333,7 +334,20 @@ def load_msa_npz(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
             if 0 <= ridx < L:
                 msa_dels[i, ridx] = float(d["deletion"])
 
-    return msa_seqs, msa_dels
+    # Taxonomy: (S,) int array of species IDs, -1 = unknown
+    if "taxonomy" in data:
+        taxonomy = data["taxonomy"].astype(np.int64)
+        if len(taxonomy) != S:
+            taxonomy = np.full(S, -1, dtype=np.int64)
+    elif (
+        sequences.dtype.names is not None
+        and "taxonomy" in sequences.dtype.names
+    ):
+        taxonomy = sequences["taxonomy"].astype(np.int64)
+    else:
+        taxonomy = np.full(S, -1, dtype=np.int64)
+
+    return msa_seqs, msa_dels, taxonomy
 
 
 def subsample_msa(
@@ -343,14 +357,19 @@ def subsample_msa(
     rng: np.random.RandomState,
     training: bool = True,
     min_seqs: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_indices: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Subsample MSA to max depth, always keeping query (row 0).
 
     During training, randomly picks depth in [min_seqs, max_seqs] (Boltz convention).
     During inference, uses full max_seqs.
+
+    If *return_indices* is True, also returns the row indices used.
     """
     S, L = msa_seqs.shape
     if S <= 1:
+        if return_indices:
+            return msa_seqs, msa_dels, np.arange(S)
         return msa_seqs, msa_dels
 
     if training:
@@ -359,12 +378,186 @@ def subsample_msa(
         target = max_seqs
 
     if S <= target:
+        if return_indices:
+            return msa_seqs, msa_dels, np.arange(S)
         return msa_seqs, msa_dels
 
     # Always keep query (row 0), subsample the rest
     other_idx = rng.choice(S - 1, size=min(target - 1, S - 1), replace=False) + 1
     idx = np.concatenate([[0], np.sort(other_idx)])
+    if return_indices:
+        return msa_seqs[idx], msa_dels[idx], idx
     return msa_seqs[idx], msa_dels[idx]
+
+
+def pair_chain_msas(
+    chain_msas: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    max_paired: int = 512,
+    max_unpaired: int = 512,
+    rng: np.random.RandomState | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
+    """Pair MSAs across chains by taxonomy, then add unpaired rows.
+
+    Each element of *chain_msas* is ``(msa_seqs, msa_dels, taxonomy)`` for one
+    chain, where:
+      - ``msa_seqs``: ``(S, L)`` int — residue type IDs (row 0 = query)
+      - ``msa_dels``: ``(S, L)`` float — deletion counts
+      - ``taxonomy``: ``(S,)`` int — species IDs (-1 = unknown)
+
+    Returns
+    -------
+    paired_seqs : list of (S_total, L_chain) int arrays per chain
+    paired_dels : list of (S_total, L_chain) float arrays per chain
+    is_paired   : (S_total,) bool — True for taxonomy-paired rows
+    """
+    GAP_TOKEN = 1  # gap residue type index
+
+    n_chains = len(chain_msas)
+    chain_lengths = [ms[0].shape[1] for ms in chain_msas]
+
+    if rng is None:
+        rng = np.random.RandomState(42)
+
+    # ------------------------------------------------------------------
+    # Single-chain fast path: no pairing possible
+    # ------------------------------------------------------------------
+    if n_chains <= 1:
+        seqs, dels, _tax = chain_msas[0]
+        is_paired = np.zeros(seqs.shape[0], dtype=bool)
+        is_paired[0] = True  # query row is always "paired" (it's the query)
+        return [seqs], [dels], is_paired
+
+    # ------------------------------------------------------------------
+    # Row 0: query sequences from every chain (always present)
+    # ------------------------------------------------------------------
+    row_seqs = [ms[0][[0]] for ms in chain_msas]   # list of (1, L_c)
+    row_dels = [ms[1][[0]] for ms in chain_msas]
+
+    paired_rows_seqs = [r.copy() for r in row_seqs]
+    paired_rows_dels = [r.copy() for r in row_dels]
+    is_paired_list = [True]  # query row counts as paired
+
+    # ------------------------------------------------------------------
+    # Build taxonomy → {chain_idx: [seq_indices]} map (skip row 0, skip -1)
+    # ------------------------------------------------------------------
+    taxonomy_map: dict[int, dict[int, list[int]]] = {}
+    for ci, (_, _, tax) in enumerate(chain_msas):
+        for si in range(1, len(tax)):
+            t = int(tax[si])
+            if t == -1:
+                continue
+            taxonomy_map.setdefault(t, {}).setdefault(ci, []).append(si)
+
+    # Keep only taxonomies shared by >= 2 chains, sort by chain coverage desc
+    shared_taxa = [
+        (t, chain_dict)
+        for t, chain_dict in taxonomy_map.items()
+        if len(chain_dict) >= 2
+    ]
+    shared_taxa.sort(key=lambda x: len(x[1]), reverse=True)
+
+    # Track which (chain, seq_idx) are used in pairing
+    used: set[tuple[int, int]] = set()
+
+    # ------------------------------------------------------------------
+    # Paired rows: one row per shared-taxonomy occurrence
+    # ------------------------------------------------------------------
+    for _taxon, chain_dict in shared_taxa:
+        max_occ = max(len(v) for v in chain_dict.values())
+        for occ_i in range(max_occ):
+            row_s = []
+            row_d = []
+            any_paired = False
+            for ci in range(n_chains):
+                if ci in chain_dict:
+                    idx = chain_dict[ci][occ_i % len(chain_dict[ci])]
+                    row_s.append(chain_msas[ci][0][[idx]])
+                    row_d.append(chain_msas[ci][1][[idx]])
+                    used.add((ci, idx))
+                    any_paired = True
+                else:
+                    # Gap row for this chain
+                    L = chain_lengths[ci]
+                    row_s.append(np.full((1, L), GAP_TOKEN, dtype=np.int64))
+                    row_d.append(np.zeros((1, L), dtype=np.float32))
+
+            if any_paired:
+                for ci in range(n_chains):
+                    paired_rows_seqs[ci] = np.concatenate(
+                        [paired_rows_seqs[ci], row_s[ci]], axis=0
+                    )
+                    paired_rows_dels[ci] = np.concatenate(
+                        [paired_rows_dels[ci], row_d[ci]], axis=0
+                    )
+                is_paired_list.append(True)
+
+            if len(is_paired_list) >= max_paired + 1:  # +1 for query row
+                break
+        if len(is_paired_list) >= max_paired + 1:
+            break
+
+    # ------------------------------------------------------------------
+    # Subsample paired rows to max_paired (keep query row 0)
+    # ------------------------------------------------------------------
+    n_paired = len(is_paired_list) - 1  # exclude query
+    if n_paired > max_paired:
+        keep = rng.choice(n_paired, size=max_paired, replace=False) + 1
+        keep = np.concatenate([[0], np.sort(keep)])
+        for ci in range(n_chains):
+            paired_rows_seqs[ci] = paired_rows_seqs[ci][keep]
+            paired_rows_dels[ci] = paired_rows_dels[ci][keep]
+        is_paired_list = [is_paired_list[i] for i in keep]
+
+    # ------------------------------------------------------------------
+    # Unpaired rows: remaining sequences, one chain at a time
+    # ------------------------------------------------------------------
+    unpaired_seqs = [[] for _ in range(n_chains)]
+    unpaired_dels = [[] for _ in range(n_chains)]
+    unpaired_count = 0
+
+    for ci in range(n_chains):
+        S_c = chain_msas[ci][0].shape[0]
+        for si in range(1, S_c):
+            if (ci, si) in used:
+                continue
+            if unpaired_count >= max_unpaired:
+                break
+            # Build a row: this chain has sequence, others get gap
+            for cj in range(n_chains):
+                if cj == ci:
+                    unpaired_seqs[cj].append(chain_msas[ci][0][[si]])
+                    unpaired_dels[cj].append(chain_msas[ci][1][[si]])
+                else:
+                    L = chain_lengths[cj]
+                    unpaired_seqs[cj].append(
+                        np.full((1, L), GAP_TOKEN, dtype=np.int64)
+                    )
+                    unpaired_dels[cj].append(
+                        np.zeros((1, L), dtype=np.float32)
+                    )
+            unpaired_count += 1
+        if unpaired_count >= max_unpaired:
+            break
+
+    # ------------------------------------------------------------------
+    # Concatenate paired + unpaired
+    # ------------------------------------------------------------------
+    result_seqs = []
+    result_dels = []
+    for ci in range(n_chains):
+        parts_s = [paired_rows_seqs[ci]]
+        parts_d = [paired_rows_dels[ci]]
+        if unpaired_seqs[ci]:
+            parts_s.append(np.concatenate(unpaired_seqs[ci], axis=0))
+            parts_d.append(np.concatenate(unpaired_dels[ci], axis=0))
+        result_seqs.append(np.concatenate(parts_s, axis=0))
+        result_dels.append(np.concatenate(parts_d, axis=0))
+
+    is_paired_arr = np.array(
+        is_paired_list + [False] * unpaired_count, dtype=bool
+    )
+
+    return result_seqs, result_dels, is_paired_arr
 
 
 class DeepFoldDataset(Dataset):
@@ -387,6 +580,8 @@ class DeepFoldDataset(Dataset):
         min_msa_seqs: int = 1,
         msa_dir: Optional[Union[str, Path]] = None,
         max_msa_cycles: int = 3,
+        max_paired: int = 512,
+        max_unpaired: int = 512,
         training: bool = True,
         seed: int = 42,
     ):
@@ -403,6 +598,10 @@ class DeepFoldDataset(Dataset):
             Minimum random MSA depth during training.
         msa_dir : str or Path, optional
             Directory with MSA NPZ files (named ``{pdb}_{chain}.npz``).
+        max_paired : int
+            Maximum taxonomy-paired MSA rows across chains.
+        max_unpaired : int
+            Maximum unpaired MSA rows (one chain at a time, others get gap).
         training : bool
             If True, include ground-truth coordinates and use random cropping.
         seed : int
@@ -415,6 +614,8 @@ class DeepFoldDataset(Dataset):
         self.min_msa_seqs = min_msa_seqs
         self.msa_dir = Path(msa_dir) if msa_dir else None
         self.max_msa_cycles = max_msa_cycles
+        self.max_paired = max_paired
+        self.max_unpaired = max_unpaired
         self.training = training
         self.rng = np.random.RandomState(seed)
 
@@ -589,8 +790,8 @@ class DeepFoldDataset(Dataset):
         full_del_np = None
 
         if self.msa_dir is not None:
-            msa_data_np, msa_del_np, full_msa_np, full_del_np = self._load_chain_msa(
-                struct, cropped_tokens, msa_mask
+            msa_data_np, msa_del_np, full_msa_np, full_del_np = (
+                self._load_chain_msa(struct, cropped_tokens, msa_mask)
             )
 
         # 5. Featurize
@@ -627,7 +828,7 @@ class DeepFoldDataset(Dataset):
         cropped_tokens: np.ndarray,
         msa_mask: np.ndarray,
     ) -> tuple:
-        """Load and subsample MSA for the first protein chain in the crop.
+        """Load MSA for ALL protein/RNA chains, pair by taxonomy, subsample.
 
         Returns (msa_crops, del_crops, full_msa_crop, full_del_crop):
           - msa_crops: list of (S_i, N_prot) subsampled MSA per cycle
@@ -640,35 +841,37 @@ class DeepFoldDataset(Dataset):
         if N_prot == 0 or self.msa_dir is None:
             return None, None, None, None
 
-        # Find chain info: get PDB ID from file path (e.g., "101m" from "101m.npz")
         chains = struct.get("chains", None)
         if chains is None:
             return None, None, None, None
 
-        # Get the first protein chain's MSA
-        # MSA files named {pdb}_{chain_letter}.npz (lowercase)
         pdb_id = None
-        for path in [struct.get("_source_path", None)]:
-            if path is not None:
-                pdb_id = Path(path).stem
-                break
-
+        src = struct.get("_source_path", None)
+        if src is not None:
+            pdb_id = Path(src).stem
         if pdb_id is None:
             return None, None, None, None
 
-        # Find unique protein chain IDs in the crop
+        # Find unique protein/RNA chain asym_ids in the crop
         prot_chain_ids = np.unique(cropped_tokens["asym_id"][msa_mask])
 
-        # Try to load MSA for the first protein chain
+        # ------------------------------------------------------------------
+        # Load per-chain MSAs and build column-alignment info
+        # ------------------------------------------------------------------
+        # Each entry: (msa_seqs, msa_dels, taxonomy, prot_local_indices)
+        # prot_local_indices: positions in the N_prot dimension for this chain
+        chain_infos: list[dict] = []
+        prot_positions = np.where(msa_mask)[0]
+
         for chain in chains:
-            if int(chain["asym_id"]) not in prot_chain_ids:
+            chain_asym = int(chain["asym_id"])
+            if chain_asym not in prot_chain_ids:
                 continue
-            if int(chain["mol_type"]) != const.MOL_PROTEIN:
+            mol = int(chain["mol_type"])
+            if mol != const.MOL_PROTEIN and mol != const.MOL_RNA:
                 continue
 
-            # Construct MSA filename: {pdb}_{chain_letter}.npz
             chain_letter = str(chain["name"]).strip().lower()
-            # Remove trailing digit (e.g., "A1" → "a")
             chain_letter = chain_letter.rstrip("0123456789")
             msa_path = self.msa_dir / f"{pdb_id}_{chain_letter}.npz"
 
@@ -679,61 +882,75 @@ class DeepFoldDataset(Dataset):
             if result is None:
                 continue
 
-            msa_seqs, msa_dels = result
-
+            msa_seqs, msa_dels, taxonomy = result
             L_msa = msa_seqs.shape[1]
 
-            # Align MSA to cropped protein positions:
-            # The MSA has L_msa residues (full chain length).
-            # The crop selects N_prot protein tokens with global res_idx.
-            # We need to extract the columns corresponding to cropped positions.
             chain_res_start = int(chain["res_idx"])
-            chain_asym = int(chain["asym_id"])
-
-            # Only align tokens from THIS chain (multi-chain crops mix chains)
             this_chain_mask = msa_mask & (cropped_tokens["asym_id"] == chain_asym)
             if not this_chain_mask.any():
                 continue
 
-            prot_global_idx = cropped_tokens["res_idx"][this_chain_mask].astype(
-                np.int64
-            )
-            local_idx = prot_global_idx - chain_res_start
+            prot_global_idx = cropped_tokens["res_idx"][this_chain_mask].astype(np.int64)
+            local_idx = np.clip(prot_global_idx - chain_res_start, 0, L_msa - 1)
 
-            # Clamp out-of-range (shouldn't happen but be safe)
-            local_idx = np.clip(local_idx, 0, L_msa - 1)
-
-            # Find positions of this chain within the protein-masked tokens
-            N_prot = int(msa_mask.sum())
-            prot_positions = np.where(msa_mask)[0]
             chain_positions = np.where(this_chain_mask)[0]
             prot_local = np.searchsorted(prot_positions, chain_positions)
 
-            # Full MSA crop (for profile/del_mean — computed before subsampling)
-            S_full = msa_seqs.shape[0]
-            full_msa_crop = np.full((S_full, N_prot), 1, dtype=np.int64)
-            full_del_crop = np.zeros((S_full, N_prot), dtype=np.float32)
-            full_msa_crop[:, prot_local] = msa_seqs[:, local_idx]
-            full_del_crop[:, prot_local] = msa_dels[:, local_idx]
+            chain_infos.append({
+                "msa_seqs": msa_seqs,
+                "msa_dels": msa_dels,
+                "taxonomy": taxonomy,
+                "local_idx": local_idx,     # columns in MSA NPZ
+                "prot_local": prot_local,   # columns in N_prot space
+            })
 
-            # Produce max_msa_cycles independent subsamplings
-            msa_crops, del_crops = [], []
-            for _ in range(self.max_msa_cycles):
-                sub_seqs, sub_dels = subsample_msa(
-                    msa_seqs, msa_dels, self.max_msa_seqs, self.rng,
-                    self.training, min_seqs=self.min_msa_seqs,
-                )
-                S = sub_seqs.shape[0]
-                crop = np.full((S, N_prot), 1, dtype=np.int64)
-                dcrop = np.zeros((S, N_prot), dtype=np.float32)
-                crop[:, prot_local] = sub_seqs[:, local_idx]
-                dcrop[:, prot_local] = sub_dels[:, local_idx]
-                msa_crops.append(crop)
-                del_crops.append(dcrop)
+        if not chain_infos:
+            return None, None, None, None
 
-            return msa_crops, del_crops, full_msa_crop, full_del_crop
+        # ------------------------------------------------------------------
+        # Pair MSAs across chains
+        # ------------------------------------------------------------------
+        chain_msas_for_pairing = [
+            (ci["msa_seqs"], ci["msa_dels"], ci["taxonomy"])
+            for ci in chain_infos
+        ]
+        paired_seqs, paired_dels, is_paired = pair_chain_msas(
+            chain_msas_for_pairing,
+            max_paired=self.max_paired,
+            max_unpaired=self.max_unpaired,
+            rng=self.rng,
+        )
+        # paired_seqs[k]: (S_total, L_chain_k) — full chain length
+        # We need to map to (S_total, N_prot) using each chain's alignment info
 
-        return None, None, None, None
+        S_total = paired_seqs[0].shape[0]
+
+        # ------------------------------------------------------------------
+        # Build full (pre-subsampled) MSA in N_prot space
+        # ------------------------------------------------------------------
+        full_msa_crop = np.full((S_total, N_prot), 1, dtype=np.int64)  # gap=1
+        full_del_crop = np.zeros((S_total, N_prot), dtype=np.float32)
+
+        for k, ci in enumerate(chain_infos):
+            local_idx = ci["local_idx"]
+            prot_local = ci["prot_local"]
+            # paired_seqs[k] has full chain-length columns; extract aligned ones
+            full_msa_crop[:, prot_local] = paired_seqs[k][:, local_idx]
+            full_del_crop[:, prot_local] = paired_dels[k][:, local_idx]
+
+        # ------------------------------------------------------------------
+        # Produce max_msa_cycles independent subsamplings
+        # ------------------------------------------------------------------
+        msa_crops, del_crops = [], []
+        for _ in range(self.max_msa_cycles):
+            sub_seqs, sub_dels = subsample_msa(
+                full_msa_crop, full_del_crop, self.max_msa_seqs, self.rng,
+                self.training, min_seqs=self.min_msa_seqs,
+            )
+            msa_crops.append(sub_seqs)
+            del_crops.append(sub_dels)
+
+        return msa_crops, del_crops, full_msa_crop, full_del_crop
 
 
 # ---------------------------------------------------------------------------

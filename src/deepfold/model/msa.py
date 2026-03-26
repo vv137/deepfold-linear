@@ -29,6 +29,7 @@ class MSABlock(nn.Module):
         d_model: int = 512,
         d_msa: int = 64,
         h_msa: int = 8,
+        h_col: int = 4,
         h_res: int = 16,
         coevol_rank: int = 16,
         tile_size: int = 64,
@@ -36,10 +37,14 @@ class MSABlock(nn.Module):
         super().__init__()
         self.d_msa = d_msa
         self.h_msa = h_msa
+        self.h_col = h_col
+        self.d_col_h = d_msa // h_col  # 16
         self.h_res = h_res
         self.d_head = d_msa // h_msa  # 8
         self.coevol_rank = coevol_rank
         self.tile_size = tile_size
+
+        assert d_msa % h_col == 0, f"d_msa={d_msa} not divisible by h_col={h_col}"
 
         # 1. Single -> MSA injection
         self.single_to_msa = nn.Linear(d_model, d_msa)
@@ -52,11 +57,14 @@ class MSABlock(nn.Module):
         self.w_g = nn.Linear(d_msa, d_msa, bias=False)
         self.w_o_row = nn.Linear(d_msa, d_msa, bias=False)
 
-        # 3. Column weighted mean — after ln_col, so bias=False
+        # 3. Column cross-attention: Q/G from h_res, K/V from MSA (over S dim)
         self.ln_col = nn.LayerNorm(d_msa)
-        self.col_weight = nn.Linear(d_msa, 1, bias=False)
-        self.col_query = nn.Linear(d_model, 1, bias=False)  # h_res conditions which MSA rows to attend
-        self.col_to_single = nn.Linear(d_msa, d_model, bias=False)
+        self.ln_col_q = nn.LayerNorm(d_model)
+        self.col_w_q = nn.Linear(d_model, d_msa, bias=False)
+        self.col_w_k = nn.Linear(d_msa, d_msa, bias=False)
+        self.col_w_v = nn.Linear(d_msa, d_msa, bias=False)
+        self.col_w_g = nn.Linear(d_model, d_msa, bias=False)
+        self.col_w_o = nn.Linear(d_msa, d_model, bias=False)
 
         # 4. Low-rank co-evolution — after ln_coevol, so bias=False
         self.ln_coevol = nn.LayerNorm(d_msa)
@@ -148,20 +156,30 @@ class MSABlock(nn.Module):
         G_flat = G.reshape(B, S, N_prot, -1)
         m = m + torch.sigmoid(G_flat) * self.w_o_row(att_out)
 
-        # ---- 3. Column weighted mean (h_res-conditioned, mask padded S rows) ----
+        # ---- 3. Column cross-attention (h_res queries MSA over S dim) ----
         m_n = self.ln_col(m)  # (B, S, N_prot, d_msa)
-        col_scores = self.col_weight(m_n)  # (B, S, N_prot, 1)
-        # h_res conditions which MSA rows are important per position
-        h_prot_score = self.col_query(
-            _gather_at_indices(h_res, prot_indices)
-        )  # (B, N_prot, 1)
-        col_scores = col_scores + h_prot_score.unsqueeze(1)  # broadcast over S
-        # Mask padded rows with -inf before softmax over S
-        row_mask = msa_mask.unsqueeze(-1)  # (B, S, N_prot, 1)
+        h_prot = _gather_at_indices(h_res, prot_indices)  # (B, N_prot, d_model)
+        h_prot_n = self.ln_col_q(h_prot)  # (B, N_prot, d_model)
+
+        H_c = self.h_col
+        d_c = self.d_col_h
+
+        Q_c = self.col_w_q(h_prot_n).view(B, N_prot, H_c, d_c)   # (B, N, H, d_h)
+        K_c = self.col_w_k(m_n).view(B, S, N_prot, H_c, d_c)     # (B, S, N, H, d_h)
+        V_c = self.col_w_v(m_n).view(B, S, N_prot, H_c, d_c)     # (B, S, N, H, d_h)
+        G_c = torch.sigmoid(
+            self.col_w_g(h_prot_n).view(B, N_prot, H_c, d_c)
+        )
+
+        # Attention over S (per-position, NOT over N — no quadratic cost)
+        col_scores = torch.einsum("bnhd,bsnhd->bnhs", Q_c, K_c) / (d_c ** 0.5)
+        # Mask padded S rows with -inf
+        row_mask = msa_mask.permute(0, 2, 1).unsqueeze(2)  # (B, N_prot, 1, S)
         col_scores = col_scores + (1 - row_mask) * (-1e9)
-        alpha = F.softmax(col_scores, dim=1)  # (B, S, N_prot, 1)
-        col_agg = (alpha * m_n).sum(dim=1)  # (B, N_prot, d_msa)
-        h_prot_update = self.col_to_single(col_agg)  # (B, N_prot, d_model)
+        col_alpha = F.softmax(col_scores, dim=-1)  # (B, N_prot, H, S)
+        col_out = torch.einsum("bnhs,bsnhd->bnhd", col_alpha, V_c)  # (B, N_prot, H, d_h)
+        col_out = (G_c * col_out).reshape(B, N_prot, -1)  # (B, N_prot, d_msa)
+        h_prot_update = self.col_w_o(col_out)  # (B, N_prot, d_model)
 
         h_res = h_res.clone()
         _scatter_add_at_indices(h_res, h_prot_update, prot_indices)
@@ -314,13 +332,14 @@ class MSAModule(nn.Module):
         d_model: int = 512,
         d_msa: int = 64,
         h_msa: int = 8,
+        h_col: int = 4,
         h_res: int = 16,
         coevol_rank: int = 16,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
             [
-                MSABlock(d_model, d_msa, h_msa, h_res, coevol_rank)
+                MSABlock(d_model, d_msa, h_msa, h_col, h_res, coevol_rank)
                 for _ in range(n_blocks)
             ]
         )

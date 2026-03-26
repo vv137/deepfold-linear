@@ -103,6 +103,8 @@ class LossWeights:
 class MSAConfig:
     max_depth: int = 128  # max MSA rows after uniform subsampling
     min_depth: int = 1    # minimum random depth during training
+    max_paired: int = 8192    # max taxonomy-paired MSA rows (Boltz default)
+    max_unpaired: int = 16384 # max unpaired MSA rows (Boltz default)
 
 
 @dataclass

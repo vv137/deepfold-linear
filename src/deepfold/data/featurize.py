@@ -151,7 +151,6 @@ def featurize(
         msa_data = [msa_data]
     if msa_deletion is not None and not isinstance(msa_deletion, list):
         msa_deletion = [msa_deletion]
-
     # 3. profile (N, 32), del_mean (N, 1), has_msa (N, 1)
     #    Computed from first cycle's MSA (profile is cycle-invariant in expectation)
     # ------------------------------------------------------------------
@@ -190,7 +189,9 @@ def featurize(
     # ------------------------------------------------------------------
     # 4. msa_feat (C, S_max, N_prot, 34) — per-cycle MSA features
     #    C = number of cycles, S_max = max depth across cycles
+    #    Features: restype_onehot[32] + has_del[1] + del_val[1]
     # ------------------------------------------------------------------
+    D_MSA_FEAT = 34
     if msa_data is not None and N_prot > 0:
         cycle_feats = []
         for c_idx in range(len(msa_data)):
@@ -224,7 +225,7 @@ def featurize(
             S_c = f.shape[0]
             mask_c = torch.ones(S_c, N_prot)
             if S_c < S_max:
-                f = torch.cat([f, torch.zeros(S_max - S_c, N_prot, 34)], dim=0)
+                f = torch.cat([f, torch.zeros(S_max - S_c, N_prot, D_MSA_FEAT)], dim=0)
                 mask_c = torch.cat([mask_c, torch.zeros(S_max - S_c, N_prot)], dim=0)
             padded.append(f)
             masks.append(mask_c)
@@ -243,15 +244,15 @@ def featurize(
                 np.concatenate(
                     [
                         query_oh,
-                        np.zeros((N_prot, 1), dtype=np.float32),
-                        np.zeros((N_prot, 1), dtype=np.float32),
+                        np.zeros((N_prot, 1), dtype=np.float32),  # has_del
+                        np.zeros((N_prot, 1), dtype=np.float32),  # del_val
                     ],
                     axis=-1,
                 )
             ).unsqueeze(0).unsqueeze(0)  # (1, 1, N_prot, 34)
             msa_mask = torch.ones(1, 1, N_prot)  # (1, 1, N_prot)
         else:
-            msa_feat = torch.zeros(1, 1, 0, 34)
+            msa_feat = torch.zeros(1, 1, 0, D_MSA_FEAT)
             msa_mask = torch.zeros(1, 1, 0)
 
     # ------------------------------------------------------------------
