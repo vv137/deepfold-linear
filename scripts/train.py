@@ -167,6 +167,9 @@ def _log_extra(model, step, wandb):
         ax = axes_flat[h]
         ax.imshow(pos_map[:, h, :], aspect="auto", cmap="RdBu_r",
                   vmin=-vmax, vmax=vmax, interpolation="nearest")
+        # Vertical lines separating same-chain sep | inter-chain | bond bins
+        ax.axvline(64.5, color="gray", linewidth=0.5, linestyle="--")
+        ax.axvline(65.5, color="gray", linewidth=0.5, linestyle="--")
         ax.set_title(f"Head {h}", fontsize=9)
         if h % cols == 0:
             ax.set_ylabel("Layer")
