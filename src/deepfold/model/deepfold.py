@@ -156,6 +156,15 @@ class DeepFoldLinear(nn.Module):
         # Compute pos_bins for diffusion transformer position bias
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)  # (B, N, N) int32
 
+        # ---- Sample cycle count (SPEC §5.3) ----
+        if self.training:
+            _nc = torch.randint(1, self.trunk.max_cycles + 1, (1,), device=device)
+            if torch.distributed.is_initialized():
+                torch.distributed.broadcast(_nc, src=0)
+            num_cycles = int(_nc.item())
+        else:
+            num_cycles = self.trunk.inference_cycles
+
         # ---- Trunk ----
         h_res, mu, nu, x_res = self.trunk(
             token_type,
@@ -176,6 +185,7 @@ class DeepFoldLinear(nn.Module):
             msa_pad_mask=msa_pad_mask.amax(dim=1)
             if (msa_pad_mask is not None and msa_pad_mask.dim() == 3)
             else msa_pad_mask,
+            num_cycles=num_cycles,
         )
 
         # Trunk squeezes back to unbatched when input was unbatched.
@@ -208,7 +218,7 @@ class DeepFoldLinear(nn.Module):
             token_atom_starts = torch.stack(starts_list)
             token_atom_counts = torch.stack(counts_list)
 
-        result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res}
+        result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res, "num_cycles": num_cycles}
 
         if (self.training or compute_losses) and x_atom_true is not None and x_res_true is not None:
             # ---- Training: M augmented diffusion samples (Boltz-style multiplicity) ----
@@ -367,6 +377,7 @@ class DeepFoldLinear(nn.Module):
             token_type, profile, del_mean, has_msa, msa_feat,
             c_atom, p_lm, p_lm_idx, token_idx,
             chain_id, global_idx, bond_matrix, protein_mask,
+            num_cycles=self.trunk.inference_cycles,
         )
 
         # Ensure batched

@@ -213,6 +213,7 @@ def train_step(
         "l_lddt": outputs.get("l_lddt", torch.tensor(0.0)).item(),
         "l_disto": outputs.get("l_disto", torch.tensor(0.0)).item(),
         "l_trunk_coord": outputs.get("l_trunk_coord", torch.tensor(0.0)).item(),
+        "num_cycles": outputs.get("num_cycles", 0),
         "lr": lr,
         "grad_norm": grad_norm,
     }

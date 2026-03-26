@@ -709,6 +709,7 @@ def main():
                         "train/grad_norm": metrics["grad_norm"],
                         "train/lr": metrics["lr"],
                         "train/crop_size": crop_size,
+                        "train/num_cycles": metrics["num_cycles"],
                     },
                     step=step,
                 )

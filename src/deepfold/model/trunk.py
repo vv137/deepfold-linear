@@ -81,6 +81,7 @@ class Trunk(nn.Module):
         protein_mask: torch.Tensor,
         token_pad_mask: torch.Tensor | None = None,
         msa_pad_mask: torch.Tensor | None = None,
+        num_cycles: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -99,6 +100,7 @@ class Trunk(nn.Module):
             protein_mask:   (N,) or (B, N) bool
             token_pad_mask: (B, N) bool/float or None (1=real, 0=pad)
             msa_pad_mask:   (B, N_prot) bool/float or None (1=real, 0=pad)
+            num_cycles:     int, number of recycling cycles to run.
 
         Returns:
             h_res:  (N, 512) or (B, N, 512)
@@ -170,17 +172,6 @@ class Trunk(nn.Module):
             )
         else:
             msa_bins = torch.zeros(B, 0, 0, device=device, dtype=torch.long)
-
-        # ---- Sample cycle count (SPEC §5.3) ----
-        # Use a device tensor + broadcast so all DDP ranks get the same
-        # cycle count — prevents forward/backward desync.
-        if self.training:
-            _nc = torch.randint(1, self.max_cycles + 1, (1,), device=device)
-            if torch.distributed.is_initialized():
-                torch.distributed.broadcast(_nc, src=0)
-            num_cycles = int(_nc.item())
-        else:
-            num_cycles = self.inference_cycles
 
         # Initialize log dual variables
         H = self.h_res
