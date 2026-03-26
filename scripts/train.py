@@ -58,6 +58,7 @@ def _run_validation(raw_model, ema, val_loader, device, max_batches):
         n_val += 1
         del val_batch, vm
     ema.restore(raw_model)
+    raw_model.train()
     gc.collect()
     torch.cuda.empty_cache()
     if n_val > 0:

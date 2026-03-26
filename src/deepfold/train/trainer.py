@@ -233,18 +233,16 @@ def val_step(
 ) -> dict[str, float]:
     """Single validation step with mixed precision.
 
-    Uses model.train() so the forward path computes losses (which are gated
-    on self.training). The @torch.no_grad() decorator prevents gradient
-    computation. MSA row dropout still fires but is harmless for validation
-    averaging.
+    Uses model.eval() to disable dropout and stochastic behavior.
+    compute_losses=True ensures losses are computed despite eval mode.
     """
-    model.train()
+    model.eval()
     device = next(model.parameters()).device
 
     with torch.amp.autocast(
         "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
     ):
-        outputs = model(**batch)
+        outputs = model(**batch, compute_losses=True)
 
     metrics = {
         "loss": outputs["loss"].item(),

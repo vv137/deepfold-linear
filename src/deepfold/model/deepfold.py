@@ -127,6 +127,7 @@ class DeepFoldLinear(nn.Module):
         atom_pad_mask: torch.Tensor | None = None,
         pair_valid_mask: torch.Tensor | None = None,
         msa_pad_mask: torch.Tensor | None = None,
+        compute_losses: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Full forward pass: trunk -> diffusion (training) or trunk -> sampling (inference).
@@ -136,7 +137,11 @@ class DeepFoldLinear(nn.Module):
         are floats with 1.0=valid, 0.0=padding. They are only needed for batched
         inputs (B>1) where samples have been padded to the same length.
 
-        Returns dict with 'x_atom_pred' and losses if training.
+        Args:
+            compute_losses: If True, compute and return losses even when not
+                in training mode. Useful for validation with model.eval().
+
+        Returns dict with 'x_atom_pred' and losses if training or compute_losses.
         """
         device = token_type.device
         is_batched = token_type.dim() >= 2
@@ -205,7 +210,7 @@ class DeepFoldLinear(nn.Module):
 
         result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res}
 
-        if self.training and x_atom_true is not None and x_res_true is not None:
+        if (self.training or compute_losses) and x_atom_true is not None and x_res_true is not None:
             # ---- Training: M augmented diffusion samples (Boltz-style multiplicity) ----
             # Trunk runs once; diffusion runs M times with independent augmentations + σ.
             M = self.diffusion_multiplicity
