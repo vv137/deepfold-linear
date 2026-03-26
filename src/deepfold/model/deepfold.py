@@ -58,7 +58,6 @@ class DeepFoldLinear(nn.Module):
         loss_weights: dict[str, float] | None = None,
         # Init config
         gamma_std: float = 1e-4,
-        w_dist_logit: float = -2.0,
         adaln_gate_bias: float = -2.0,
     ):
         super().__init__()
@@ -101,8 +100,7 @@ class DeepFoldLinear(nn.Module):
         self.loss_weights = loss_weights or {}
 
         # Apply SPEC §14 initialization
-        init_model(self, gamma_std=gamma_std, w_dist_logit_val=w_dist_logit,
-                   adaln_gate_bias=adaln_gate_bias)
+        init_model(self, gamma_std=gamma_std, adaln_gate_bias=adaln_gate_bias)
 
     def forward(
         self,

@@ -32,7 +32,7 @@ def extract_param(ckpt_path, suffix, activation):
     """Extract per-block trunk parameter from checkpoint.
 
     Args:
-        suffix: Parameter name suffix, e.g. ".gamma" or ".w_dist_logit".
+        suffix: Parameter name suffix, e.g. ".gamma" or ".w_dist_raw".
         activation: Callable applied to stacked tensor, e.g. torch.tanh.
 
     Returns:

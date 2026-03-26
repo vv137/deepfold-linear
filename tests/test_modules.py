@@ -20,23 +20,16 @@ class TestMSABlock:
         S, N_prot, N = 4, 8, 8
         m = torch.randn(S, N_prot, 16)
         h_res = torch.randn(N, 64)
-        mu = torch.ones(4, N) / N
-        nu = torch.ones(4, N) / N
         protein_mask = torch.ones(N, dtype=torch.bool)
         pos_bias = torch.zeros(4, N_prot, N_prot)
-        alpha_coevol = torch.zeros(4)
 
-        m_out, h_out, mu_out, nu_out = block(
-            m, h_res, mu, nu, protein_mask, pos_bias, alpha_coevol, training=False
+        m_out, h_out, c_bar = block(
+            m, h_res, protein_mask, pos_bias, training=False
         )
 
         assert m_out.shape == (S, N_prot, 16)
         assert h_out.shape == (N, 64)
-        assert mu_out.shape == (4, N)
-        assert nu_out.shape == (4, N)
-
-        # Marginals should sum to 1
-        assert torch.allclose(mu_out.sum(dim=-1), torch.ones(4), atol=1e-5)
+        assert c_bar.shape == (N, 4)  # coevol_rank=4
 
 
 class TestTokenUOTBlock:

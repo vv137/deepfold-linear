@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
 from deepfold.model.position_encoding import PositionBias
-from deepfold.model.primitives import SwiGLU
+from deepfold.model.primitives import SwiGLU, algebraic_sigmoid
 
 K_ITER = 20
 
@@ -48,9 +48,9 @@ class TokenUOTBlock(nn.Module):
         # Per-layer position bias (SPEC §4.3)
         self.pos_bias = PositionBias(n_heads, 68)
 
-        # Per-head geometry weight for cost matrix — sigmoid bounded (0,1)
-        # Init -2.0 → sigmoid ≈ 0.12 (weak geometry bias initially)
-        self.w_dist_logit = nn.Parameter(torch.full((n_heads,), -2.0))
+        # Per-head geometry weight — algebraic sigmoid bounded (0, 1)
+        # Init 0 → midpoint 0.5; heavy-tailed: gradient ∝ 1/(1+|x|)²
+        self.w_dist_raw = nn.Parameter(torch.zeros(n_heads))
 
         # Per-head entropic regularization (fixed buffer, SPEC §7.2)
         nr = n_heads // 4
@@ -126,7 +126,7 @@ class TokenUOTBlock(nn.Module):
 
         pos_weight = self.pos_bias.weight  # (H, 68)
 
-        w_dist = self.w_dist_logit.sigmoid()  # (H,) bounded (0, 1)
+        w_dist = algebraic_sigmoid(self.w_dist_raw)  # (H,) bounded (0, 1)
         effective_w_dist = w_dist
         if geo_gate is not None:
             effective_w_dist = geo_gate * w_dist
@@ -140,7 +140,7 @@ class TokenUOTBlock(nn.Module):
         # Triton forward computes cost tiles on the fly (content + pos_bias + geo_bias).
         # Triton backward uses exact unrolled gradients through K Sinkhorn iterations
         # (not IFT/CG approximate), giving correct gradients for all parameters
-        # including mu_proj, nu_proj, coevol_to_marginal, w_dist_logit, pos_bias.
+        # including mu_proj, nu_proj, coevol_to_marginal, w_dist_raw, pos_bias.
         o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
             Q_ln,
             K_ln,

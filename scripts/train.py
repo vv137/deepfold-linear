@@ -108,10 +108,13 @@ def _log_extra(model, step, wandb):
 
     # ---- Collect per-layer per-head arrays ----
     gamma_map = torch.stack([b.gamma for b in blocks]).detach().cpu().tanh().numpy()
-    wdist_map = torch.stack([b.w_dist_logit for b in blocks]).detach().cpu().sigmoid().numpy()
+    from deepfold.model.primitives import algebraic_sigmoid
+    wdist_map = algebraic_sigmoid(
+        torch.stack([b.w_dist_raw for b in blocks])
+    ).detach().cpu().numpy()
     # pos_bias: (n_layers, H, 68)
     pos_map = torch.stack([b.pos_bias.weight for b in blocks]).detach().cpu().numpy()
-    # alpha_coevol: (n_msa_blocks, H_res)
+    # alpha_coevol: (H_res,) — single vector (v5.2)
     alpha = raw.trunk.msa_module.alpha_coevol.detach().cpu().numpy()
 
     # ---- Summary scalars (cheap trend lines) ----
@@ -131,17 +134,21 @@ def _log_extra(model, step, wandb):
     import matplotlib.pyplot as plt
     plt.close(fig)
 
-    # sigmoid(w_dist_logit): (n_layers, n_heads)
-    fig = _heatmap(wdist_map, f"σ(w_dist) — step {step}", "Head", "Layer",
+    # w_dist (algebraic sigmoid): (n_layers, n_heads)
+    fig = _heatmap(wdist_map, f"w_dist — step {step}", "Head", "Layer",
                    cmap="viridis")
     wandb.log({"heatmap/w_dist": wandb.Image(fig)}, step=step)
     plt.close(fig)
 
-    # alpha_coevol: (n_msa_blocks, H_res)
-    fig = _heatmap(alpha, f"α_coevol — step {step}", "Head", "MSA Block",
-                   figsize=(8, 3))
-    wandb.log({"heatmap/alpha_coevol": wandb.Image(fig)}, step=step)
-    plt.close(fig)
+    # alpha_coevol: (H_res,) — bar chart per head
+    fig_a, ax_a = plt.subplots(figsize=(6, 3), layout="constrained")
+    ax_a.bar(range(len(alpha)), alpha)
+    ax_a.set_xlabel("Head")
+    ax_a.set_ylabel("α_coevol")
+    ax_a.set_title(f"α_coevol — step {step}")
+    ax_a.axhline(0, color="gray", linewidth=0.5)
+    wandb.log({"heatmap/alpha_coevol": wandb.Image(fig_a)}, step=step)
+    plt.close(fig_a)
 
     # trunk pos_bias: per-head heatmap (n_layers, 68) × n_heads
     n_heads = pos_map.shape[1]
@@ -378,7 +385,6 @@ def main():
         diffusion_multiplicity=cfg.diffusion.multiplicity,
         loss_weights=cfg.loss_weights.to_dict(),
         gamma_std=cfg.init.gamma_std,
-        w_dist_logit=cfg.init.w_dist_logit,
         adaln_gate_bias=cfg.init.adaln_gate_bias,
     ).to(device)
 

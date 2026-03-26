@@ -153,11 +153,8 @@ class TestMSABlockBatch:
 
         m = torch.randn(S, N_prot, d_msa)
         h = torch.randn(N, d_model)
-        mu = torch.softmax(torch.randn(h_res, N), dim=-1)
-        nu = torch.softmax(torch.randn(h_res, N), dim=-1)
         protein_mask = torch.zeros(N, dtype=torch.bool)
         protein_mask[:N_prot] = True
-        alpha_coevol = torch.randn(h_res)
 
         from deepfold.model.position_encoding import PositionBias
 
@@ -167,33 +164,27 @@ class TestMSABlockBatch:
 
         # Unbatched
         with torch.no_grad():
-            m_ub, h_ub, mu_ub, nu_ub = block(
+            m_ub, h_ub, c_bar_ub = block(
                 m,
                 h,
-                mu,
-                nu,
                 protein_mask,
                 pos_bias,
-                alpha_coevol,
                 training=False,
             )
 
         # Batched B=1
         with torch.no_grad():
-            m_b, h_b, mu_b, nu_b = block(
+            m_b, h_b, c_bar_b = block(
                 m.unsqueeze(0),
                 h.unsqueeze(0),
-                mu.unsqueeze(0),
-                nu.unsqueeze(0),
                 protein_mask.unsqueeze(0),
                 pos_bias.unsqueeze(0),
-                alpha_coevol,
                 training=False,
             )
 
         torch.testing.assert_close(m_ub, m_b.squeeze(0), atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(h_ub, h_b.squeeze(0), atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(mu_ub, mu_b.squeeze(0), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(c_bar_ub, c_bar_b.squeeze(0), atol=1e-4, rtol=1e-4)
 
     def test_batched_with_padding(self):
         """B=2 with different N_prot (padded MSA)."""
@@ -207,8 +198,6 @@ class TestMSABlockBatch:
 
         m = torch.randn(B, S, N_prot, d_msa)
         h = torch.randn(B, N, d_model)
-        mu = torch.softmax(torch.randn(B, h_res, N), dim=-1)
-        nu = torch.softmax(torch.randn(B, h_res, N), dim=-1)
 
         protein_mask = torch.zeros(B, N, dtype=torch.bool)
         protein_mask[0, :6] = True  # sample 0: 6 protein
@@ -217,7 +206,6 @@ class TestMSABlockBatch:
         msa_pad_mask = torch.ones(B, N_prot)
         msa_pad_mask[1, 4:] = 0  # sample 1 has only 4 real MSA positions
 
-        alpha_coevol = torch.randn(h_res)
         msa_bins = torch.randint(0, 68, (B, N_prot, N_prot))
 
         from deepfold.model.position_encoding import PositionBias
@@ -226,21 +214,18 @@ class TestMSABlockBatch:
         pos_bias = pb(msa_bins)  # (B, H, N_prot, N_prot)
 
         with torch.no_grad():
-            m_out, h_out, mu_out, nu_out = block(
+            m_out, h_out, c_bar_out = block(
                 m,
                 h,
-                mu,
-                nu,
                 protein_mask,
                 pos_bias,
-                alpha_coevol,
                 msa_pad_mask=msa_pad_mask,
                 training=False,
             )
 
         assert m_out.shape == (B, S, N_prot, d_msa)
         assert h_out.shape == (B, N, d_model)
-        assert mu_out.shape == (B, h_res, N)
+        assert c_bar_out.shape == (B, N, 4)  # coevol_rank=4
 
 
 class TestMSAModuleBatch:
@@ -265,8 +250,6 @@ class TestMSAModuleBatch:
 
         m = torch.randn(B, S, N_prot, d_msa)
         h = torch.randn(B, N, d_model)
-        mu = torch.softmax(torch.randn(B, h_res, N), dim=-1)
-        nu = torch.softmax(torch.randn(B, h_res, N), dim=-1)
         protein_mask = torch.zeros(B, N, dtype=torch.bool)
         protein_mask[:, :N_prot] = True
         msa_bins = torch.randint(0, 68, (B, N_prot, N_prot))
@@ -275,8 +258,6 @@ class TestMSAModuleBatch:
             m_out, h_out, mu_out, nu_out = mod(
                 m,
                 h,
-                mu,
-                nu,
                 protein_mask,
                 msa_bins,
                 training=False,
@@ -284,7 +265,7 @@ class TestMSAModuleBatch:
 
         assert m_out.shape == m.shape
         assert h_out.shape == h.shape
-        assert mu_out.shape == mu.shape
+        assert mu_out.shape == (B, h_res, N)
 
 
 class TestTrunkBatch:

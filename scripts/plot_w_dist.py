@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plot sigmoid(w_dist_logit) heatmap for all checkpoints in a run directory.
+"""Plot w_dist (algebraic sigmoid) heatmap for all checkpoints in a run directory.
 
 Usage:
     uv run python scripts/plot_w_dist.py runs/my_run
@@ -12,14 +12,15 @@ from pathlib import Path
 import torch
 
 from _plot_utils import extract_param, compute_stats, print_stats, print_table, plot_heatmap, iter_checkpoints
+from deepfold.model.primitives import algebraic_sigmoid
 
 
 def extract_w_dist(ckpt_path):
-    return extract_param(ckpt_path, ".w_dist_logit", torch.sigmoid)
+    return extract_param(ckpt_path, ".w_dist_raw", algebraic_sigmoid)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot sigmoid(w_dist_logit) heatmap per checkpoint")
+    parser = argparse.ArgumentParser(description="Plot w_dist heatmap per checkpoint")
     parser.add_argument("run_dir", type=Path, help="Run output directory (e.g. runs/my_run)")
     parser.add_argument("-o", "--output-dir", type=Path, default=None,
                         help="Output directory (default: <run_dir>/w_dist_plots)")
@@ -76,8 +77,8 @@ def main():
         plot_heatmap(
             w_dist_map, step, out_path, stats,
             vmin=0, vmax=vlim, cmap="YlOrRd",
-            title_expr=r"\sigma(w_{{dist,h,\ell}})",
-            cb_label=r"$\sigma(w_{dist})$: weak $\leftarrow$ | $\rightarrow$ strong geometry",
+            title_expr=r"w_{{dist,h,\ell}}",
+            cb_label=r"$w_{dist}$: weak $\leftarrow$ | $\rightarrow$ strong geometry",
         )
         print(f"    → {out_path.name}  (vlim={vlim:.4f})")
         count += 1

@@ -46,7 +46,6 @@ class LoggingConfig:
 @dataclass
 class InitConfig:
     gamma_std: float = 1e-4       # EGNN gamma N(0, std) noise init
-    w_dist_logit: float = -2.0    # geometry bias init; sigmoid(-2.0) ≈ 0.12
     adaln_gate_bias: float = -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
 
 

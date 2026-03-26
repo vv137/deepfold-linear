@@ -3,9 +3,9 @@
 Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
-  2. Coordinate path (x_res): completely dormant at init.
-     gamma~N(0,1e-4), w_dist_logit=-2.0, w_rel=0, alpha_coevol=0.
-     Content-only attention first; geometry earns its influence.
+  2. Coordinate path (x_res): dormant at init.
+     gamma~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0, alpha_coevol=0.
+     Content-only attention first; geometry starts at midpoint.
 """
 
 import math
@@ -36,7 +36,6 @@ def _is_position_bias(name: str) -> bool:
 def init_model(
     model: nn.Module,
     gamma_std: float = 1e-4,
-    w_dist_logit_val: float = -2.0,
     adaln_gate_bias: float = -2.0,
 ) -> None:
     """Apply SPEC §14 initialization to a DeepFoldLinear model.
@@ -46,7 +45,7 @@ def init_model(
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
     - Noise init (N(0, gamma_std)) for gamma (symmetry breaking across layers).
     - Zeros for w_rel, alpha_coevol, zero_init_linear outputs.
-    - w_dist_logit init (sigmoid ≈ 0.12, weak geometry initially).
+    - w_dist_raw=0 (algebraic sigmoid midpoint = 0.5).
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
     - Biases: zeros (PyTorch default).
     """
@@ -74,8 +73,8 @@ def init_model(
             # Scalars and 1D params
             if _is_gamma(name):
                 param.data.normal_(0, gamma_std)
-            elif "w_dist_logit" in name:
-                nn.init.constant_(param, w_dist_logit_val)
+            elif "w_dist_raw" in name:
+                nn.init.zeros_(param)  # algebraic sigmoid(0) = 0.5 midpoint
             elif _is_zero_init(name) or _is_position_bias(name):
                 nn.init.zeros_(param)
             elif (

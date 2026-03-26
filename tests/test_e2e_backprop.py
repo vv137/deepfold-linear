@@ -272,18 +272,16 @@ class TestEndToEndBackprop:
             f"Loss exploded: {losses}"
         )
 
-    def test_optimizer_three_param_groups(self):
-        """Optimizer has 3 groups: decay, no-decay, gamma."""
+    def test_optimizer_two_param_groups(self):
+        """Optimizer has 2 groups: decay, no-decay (incl. gamma)."""
         model = _make_model()
         optimizer = build_optimizer(model, lr=1e-4)
 
-        assert len(optimizer.param_groups) == 3
+        assert len(optimizer.param_groups) == 2
         # Group 0: weight decay
         assert optimizer.param_groups[0]["weight_decay"] == 0.01
-        # Group 1: no decay (LN, bias)
+        # Group 1: no decay (LN, bias, gamma, bounded params)
         assert optimizer.param_groups[1]["weight_decay"] == 0.0
-        # Group 2: gamma with decay
-        assert optimizer.param_groups[2]["weight_decay"] == 0.01
 
     def test_distogram_gradient_to_trunk(self):
         """L_disto backprops into trunk h_res parameters."""

@@ -190,13 +190,11 @@ class Trunk(nn.Module):
         for cycle in range(num_cycles):
             is_last = cycle == num_cycles - 1
 
-            # ---- MSA blocks x4 (SPEC §6) ----
+            # ---- MSA module: 4 blocks + marginal update (SPEC §6, v5.2) ----
             if is_last:
                 m, h_res, mu_new, nu_new = self.msa_module(
                     m,
                     h_res,
-                    mu,
-                    nu,
                     protein_mask,
                     msa_bins,
                     msa_pad_mask=msa_pad_mask,
@@ -207,8 +205,6 @@ class Trunk(nn.Module):
                     m, h_res, mu_new, nu_new = self.msa_module(
                         m,
                         h_res,
-                        mu,
-                        nu,
                         protein_mask,
                         msa_bins,
                         msa_pad_mask=msa_pad_mask,

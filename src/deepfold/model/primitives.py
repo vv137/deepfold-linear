@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def algebraic_sigmoid(t: torch.Tensor) -> torch.Tensor:
+    """Map (-∞, +∞) → (0, 1) with heavy tails.  gradient ∝ 1/(1+|t|)²."""
+    return 0.5 * (1 + t / (1 + t.abs()))
+
+
 class SwiGLU(nn.Module):
     """SwiGLU feedforward: gate * SiLU(value) -> out. SPEC uses this everywhere."""
 

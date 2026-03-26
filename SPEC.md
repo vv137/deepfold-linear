@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v5.1
+# Protein Complex Structure Prediction Model: Full Design Specification v5.3
 
 ---
 
@@ -288,8 +288,8 @@ g_i, g_j: global residue indices, preserved after cropping.
 ### 4.3 Parameters
 
 ```
-w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. No decay (bounded). Each of the 48 UOT blocks has its own w_rel_res.
-w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. No decay (bounded). Shared across MSA blocks.
+w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. No decay (Swin convention). Each of the 48 UOT blocks has its own w_rel_res.
+w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. No decay (Swin convention). Shared across MSA blocks.
 ```
 
 ### 4.4 Branchless Online Computation
@@ -349,9 +349,8 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
     for cycle in range(num_cycles):
         is_last = (cycle == num_cycles - 1)
 
-        # ---- MSA blocks × 4 (invariant, no coordinates) ----
-        for b in range(4):
-            m, h_res, mu_new, nu_new = msa_block(m, h_res, mu, nu, block_idx=b)
+        # ---- MSA module: 4 blocks + marginal update (invariant, no coordinates) ----
+        m, h_res, mu_new, nu_new = msa_module(m, h_res, protein_mask)
 
         if cycle > 0:
             mu = softmax(log(mu_new + 1e-8) + 0.5 * log(mu + 1e-8), dim=-1)
@@ -431,18 +430,15 @@ The uniform distribution ensures the network trains equally on all cycle counts.
 - **Row-wise attention**: Within-sequence residue interactions with position bias.
 - **Column weighted mean**: Learned aggregation capturing 1st-order co-evolution.
 - **Low-rank co-evolution aggregation**: c_ij = (1/S) Σ_s U_si^T V_sj captures 2nd-order co-evolution statistics. Rank r=16 allows multiple co-evolution modes (active site, allosteric site, interface, fold stability). The r-dimensional co-evolution vector per pair is reduced to a scalar weight for aggregation but retained as a full profile for marginal bias.
-- **Marginal update**: Per-layer, per-head scalar coefficients gate the co-evolution signal. The r-dimensional co-evolution profile c̄_i ∈ R^16 projects to per-head marginal bias via Lin(16→H_res), letting each head attend to different co-evolution modes. Non-MSA tokens retain uniform marginals.
+- **Marginal update**: Computed once after all 4 MSA blocks, from the final h_res. Per-head co-evolution bias is gated by alpha_coevol (1, H_res). The r-dimensional co-evolution profile c̄_i ∈ R^16 projects to per-head marginal bias via Lin(16→H_res), letting each head attend to different co-evolution modes. Non-MSA tokens retain uniform marginals. (v5.2: moved from per-block to post-loop — earlier blocks' alpha_coevol had zero gradient because each block overwrote mu/nu without using the incoming values.)
 
 ### 6.2 Full Block
 
 ```python
-def msa_block(m, h_res, mu, nu, block_idx):
+def msa_block(m, h_res):
     """
     m:         (S, N_prot, 64)   MSA for protein tokens only
     h_res:     (N, 512)          all tokens
-    mu:        (H_res, N)        all tokens
-    nu:        (H_res, N)        all tokens
-    block_idx: int (0–3), selects per-block alpha_coevol coefficients
     """
 
     # ---- 1. Single → MSA injection (protein tokens only) ----
@@ -513,33 +509,46 @@ def msa_block(m, h_res, mu, nu, block_idx):
     h_res = h_res + Lin(512 → 512)(h_agg)                      # (N, 512)
     c_bar = c_bar_accum / N                                     # (N, 16) per-position profile
 
-    # ---- 5. Marginal update (per-layer, per-head gated) ----
-    # alpha_coevol: (4, H_res) — per MSA block, per head scalar coefficients
+    # ---- 5. SwiGLU transition ----
+    m_n = LN(m)                                                 # (S, N, 64)
+    gate  = Lin(64 → 256)(m_n)                                  # (S, N, 256)
+    value = Lin(64 → 256)(m_n)                                  # (S, N, 256)
+    m = m + Lin(256 → 64)(SiLU(gate) * value)                   # (S, N, 64)
+
+    # ---- 6. Row dropout ----
+    # Drop entire MSA rows (sequences) during training
+    if training:
+        mask = torch.bernoulli(torch.full((S, 1, 1), 0.85))    # (S, 1, 1)
+        m = m * mask / 0.85
+
+    return m, h_res, c_bar
+
+
+def msa_module(m, h_res, protein_mask):
+    """
+    Run 4 MSA blocks, then compute marginals once from final h_res.
+    Returns m, h_res, mu, nu
+    """
+    c_bar = None
+    for b in range(4):
+        m, h_res, c_bar = msa_block(m, h_res)
+
+    # ---- Marginal update (post-loop, per-head gated) ----
+    # alpha_coevol: (H_res,) — per-head scalar coefficients
     # Zero-init, no decay (feeds softmax): co-evolution bias must earn its influence
     # Marginals computed over ALL tokens; co-evolution bias only for protein tokens
     mu_logit = Lin(512 → H_res)(h_res)                         # (N, H_res)
     nu_logit = Lin(512 → H_res)(h_res)                         # (N, H_res)
 
     # r-dim co-evolution profile → per-head bias (protein tokens only)
+    # c_bar from last block only (earlier blocks' c_bar not accumulated)
     # Non-protein tokens: coevol_bias = 0, so they get marginals from h_res alone
     coevol_bias = torch.zeros(N, H_res, device=h_res.device)
     coevol_bias[protein_mask] = Lin(16 → H_res)(c_bar[protein_mask])
-    bias = (alpha_coevol[block_idx][:, None] * coevol_bias.T)  # (H_res, N)
+    bias = (alpha_coevol[:, None] * coevol_bias.T)             # (H_res, N)
 
     mu = softmax((mu_logit.T + bias), dim=-1)                  # (H_res, N)
     nu = softmax((nu_logit.T + bias), dim=-1)                  # (H_res, N)
-
-    # ---- 6. SwiGLU transition ----
-    m_n = LN(m)                                                 # (S, N, 64)
-    gate  = Lin(64 → 256)(m_n)                                  # (S, N, 256)
-    value = Lin(64 → 256)(m_n)                                  # (S, N, 256)
-    m = m + Lin(256 → 64)(SiLU(gate) * value)                   # (S, N, 64)
-
-    # ---- 7. Row dropout ----
-    # Drop entire MSA rows (sequences) during training
-    if training:
-        mask = torch.bernoulli(torch.full((S, 1, 1), 0.85))    # (S, 1, 1)
-        m = m * mask / 0.85
 
     return m, h_res, mu, nu
 ```
@@ -571,7 +580,7 @@ where d_ij = ||x_res_i − x_res_j||₂.
 - f(d) = d/(r_0 + d) is concave, f(0) = 0, bounded in [0, 1).
 - f ∘ d satisfies the triangle inequality (metric).
 - r_0 = 10 Å fixed: roughly contact range (~8 Å) scale.
-- w_dist is per-block, per-head: `w_dist = sigmoid(w_dist_logit)`, bounded to (0, 1). `w_dist_logit` initialized to -2.0 (sigmoid ≈ 0.12, weak geometry initially). No weight decay on `w_dist_logit` (sigmoid already bounds it).
+- w_dist is per-block, per-head: `w_dist = alg_sigmoid(w_dist_raw)` where `alg_sigmoid(t) = 0.5·(1 + t/(1+|t|))`, bounded to (0, 1). `w_dist_raw` initialized to 0 (midpoint = 0.5). Heavy-tailed: gradient ∝ 1/(1+|t|)², preventing saturation at boundaries. No weight decay.
 - Per-block, per-head w_dist allows multi-scale behavior: some heads/layers develop strong geometry sensitivity, others stay weak. The transport-weighted average across heads provides implicit noise robustness.
 - In the trunk: coordinates have variable quality across recycling noise levels. The per-head diversity handles this — geometry-sensitive heads contribute when coordinates are good, geometry-insensitive heads carry the load when coordinates are noisy.
 - In the diffusion module: σ-conditioned geometry gating explicitly modulates the geometry term (see §9.2).
@@ -580,7 +589,7 @@ where d_ij = ||x_res_i − x_res_j||₂.
 
 - Content: LN → approximately [−3, 3]
 - w_rel[bin]: no decay, zeros init → approximately [−1, 1]
-- w_dist · f: sigmoid(logit) · f ∈ [0,1) → [0, 1)
+- w_dist · f: alg_sigmoid(raw) · f ∈ [0,1) → [0, 1)
 
 ### 7.2 Transport Problem
 
@@ -632,7 +641,7 @@ self.register_buffer('eps', torch.tensor([
 
 **No warm/cold distinction**: With K=20, all blocks converge fully regardless of initialization quality. Warm-starting from the previous block's log_u, log_v still helps (convergence may be reached by K=10–14 with warm start), but K=20 provides a safe ceiling. At inference, adaptive early stopping with tol=1e-4 typically terminates at K≈14.
 
-**Why fixed, not learned**: Learnable ε creates gradient complications — ε enters both the kernel scaling (log_K = -C/ε) and the damping factor (κ = λ/(λ+ε)), producing competing gradient components. Per-head κ varies with ε, making convergence analysis ε-dependent. Fixed ε avoids all of this while still providing multi-scale transport. The network adapts through its existing per-head parameters (W_Q, W_K, W_V, W_G, W_O, γ, w_dist_logit) — ample capacity for head specialization.
+**Why fixed, not learned**: Learnable ε creates gradient complications — ε enters both the kernel scaling (log_K = -C/ε) and the damping factor (κ = λ/(λ+ε)), producing competing gradient components. Per-head κ varies with ε, making convergence analysis ε-dependent. Fixed ε avoids all of this while still providing multi-scale transport. The network adapts through its existing per-head parameters (W_Q, W_K, W_V, W_G, W_O, γ, w_dist_raw) — ample capacity for head specialization.
 
 **Why λ=1.0 uniform**: At K=20, convergence is not a constraint — all ε values converge fully. λ=1.0 gives κ ranging from 0.67 (sparse heads, strong marginal enforcement) to 0.2 (diffuse heads, weak enforcement). This is the right physical behavior.
 
@@ -1182,7 +1191,7 @@ for i in range(steps)
 # Post-LN projection names — scale-invariant under LayerNorm, no decay
 POST_LN = {'w_q', 'w_k', 'w_v', 'w_g', 'w_o', 'swiglu'}
 # Bounded or zeros-init gating params — no decay
-BOUNDED = {'w_dist_logit', 'alpha_coevol', 'pos_bias'}
+NO_DECAY_SPECIAL = {'w_dist_raw', 'alpha_coevol', 'pos_bias'}  # gamma handled by explicit check
 
 param_groups = [
     {   # Standalone weight matrices (not post-LN): weight decay
@@ -1190,15 +1199,11 @@ param_groups = [
         'weight_decay': 0.01
     },
     {   # No decay: LN γ/β, biases, post-LN projections (scale-invariant),
-        #           bounded params (sigmoid/softmax-bounded)
+        #           bounded params (w_dist_raw, gamma), gating (alpha_coevol),
+        #           position bias (Swin convention)
         'params': [...],  # layernorm, ln, bias, w_q/k/v/g/o, swiglu,
-                          # w_dist_logit, alpha_coevol, pos_bias
+                          # w_dist_raw, alpha_coevol, pos_bias, gamma
         'weight_decay': 0.0
-    },
-    {   # EGNN γ: weight decay (pull toward zero = no coordinate update)
-        'params': [p for n, p in model.named_parameters()
-                   if 'gamma' in n and 'layernorm' not in n.lower()],
-        'weight_decay': 0.01
     },
 ]
 
@@ -1284,13 +1289,13 @@ class EMA:
 | Geometry bias at high noise (trunk) | Per-head w_dist diversity | Some heads geometry-sensitive, others robust |
 | Geometry bias at high noise (diffusion) | σ-conditioned geo_gate | Learned suppression at high σ |
 | Geometry bias domination | w_dist sigmoid-bounded (0,1), init ≈0.12 | Per-block per-head; can't exceed 1.0 |
-| Position bias scale | w_rel zeros init (per-layer), no decay | Starts at zero; per-layer allows specialization; bounded by bin count |
+| Position bias scale | w_rel zeros init (per-layer), no decay (Swin convention) | Starts at zero; per-layer allows specialization; unbounded but stable in practice |
 | Co-evolution noise | Per-layer per-head α_coevol zeros init + decay | Must earn influence; per-head specialization |
 | Marginal reset across cycles | Log-space geometric blend with previous cycle | Preserves transport patterns |
 | SE(3) equivariance (trunk) | EGNN: relative vectors only | No augmentation needed |
 | SE(3) equivariance (diffusion) | AF3-style augmentation | Standard, lightweight |
 | MSA overfitting | Row dropout p=0.15 | Drop entire sequences |
-| Gradient bias (Sinkhorn) | Unrolled backprop through K iterations | Exact gradient for actual computation; IFT gives biased gradients on Q,K,w_dist_logit |
+| Gradient bias (Sinkhorn) | Unrolled backprop through K iterations | Exact gradient for actual computation; IFT gives biased gradients on Q,K,w_dist_raw |
 | Parameter oscillation | EMA decay=0.999 | Smoothed parameters |
 | Crop boundary | UOT unbalanced marginals | Natural mass adjustment |
 | Diffusion output at init | Zero-init final Linear | Identity prediction initially |
@@ -1343,7 +1348,7 @@ Iteration K → K-1 → ... → 1 → 0:
     ∂L/∂C chains to:
         ∂L/∂W_Q, ∂L/∂W_K    via content term (-LN(Q)^T LN(K)/√d_h)
         ∂L/∂w_rel             via position bias
-        ∂L/∂w_dist_logit      via geometry term (through sigmoid)
+        ∂L/∂w_dist_raw        via geometry term (through algebraic sigmoid)
         ∂L/∂x_res             via distance in geometry term
         ∂L/∂μ, ∂L/∂ν         via marginal terms in Sinkhorn update
 ```
@@ -1358,7 +1363,7 @@ No custom backward needed — standard autograd through the Sinkhorn loop. The K
 
 **Stage 1 — Pre-norm + projections backward**: Standard linear backward for W_Q, W_K, W_V, W_G, ln_attn.
 
-**Backward through MSA blocks**: Standard backprop through 4 blocks. Marginal gradients ∂L/∂μ, ∂L/∂ν from the Sinkhorn backward flow through the marginal projection → α_coevol → co-evolution aggregation → MSA representation. This is how UOT transport quality trains the co-evolution computation.
+**Backward through MSA module**: Standard backprop through 4 blocks + post-loop marginal update. Marginal gradients ∂L/∂μ, ∂L/∂ν from the Sinkhorn backward flow through the post-loop marginal projection → α_coevol → co-evolution c_bar (last block) → MSA representation → all 4 blocks' h_res. (v5.2: marginals computed once after all blocks, fixing dead gradient on per-block α_coevol.)
 
 **Gradient checkpointing**: Each of the 48 UOT+EGNN blocks is checkpointed. During backward, the block's forward pass (including K Sinkhorn iterations) is recomputed from boundary activations (h_res, x_res, log_u, log_v). The K intermediate states are created fresh and consumed by autograd. Memory per block during backward: K × H × N × 4 bytes for Sinkhorn intermediates + O(N²) for cost matrix (eliminated by Flash-Sinkhorn tiling).
 
@@ -1369,7 +1374,7 @@ No custom backward needed — standard autograd through the Sinkhorn loop. The K
 ```
 L_trunk_coord → x_res^(48) → EGNN^(48) → γ^(48) ✓
                                 ↓
-                            T_norm^(48) → Sinkhorn^(48) unrolled → C^(48) → W_Q,W_K,w_dist_logit,w_rel
+                            T_norm^(48) → Sinkhorn^(48) unrolled → C^(48) → W_Q,W_K,w_dist_raw,w_rel
                                                                      ↓
                                                                   x_res^(47) → EGNN^(47) → γ^(47) ✓
                                                                      ↓
@@ -1411,11 +1416,11 @@ def init_model(model, num_blocks=48):
             # --- Scalars and vectors ---
             if 'gamma' in name:                    # EGNN γ: noise init for symmetry breaking
                 param.data.normal_(0, 1e-4)
-            elif 'w_dist_logit' in name:             # geometry bias: sigmoid(-2.0) ≈ 0.12
-                nn.init.constant_(param, -2.0)
+            elif 'w_dist_raw' in name:               # geometry: alg_sigmoid(0) = 0.5 midpoint
+                nn.init.zeros_(param)
             elif 'w_rel' in name:                  # position bias: off at init
                 nn.init.zeros_(param)
-            elif 'alpha_coevol' in name:           # co-evolution gate: off at init
+            elif 'alpha_coevol' in name:           # co-evolution gate: off at init (v5.2: single vector)
                 nn.init.zeros_(param)
             elif 'layernorm.weight' in name:       # LN γ = 1
                 nn.init.ones_(param)
@@ -1442,7 +1447,7 @@ def init_model(model, num_blocks=48):
 | SwiGLU gate, value | Xavier | SiLU(gate) × value product naturally self-suppresses at init |
 | SwiGLU output (ff_out) | Xavier (not scaled) | Product structure already suppresses; double-scaling would starve transitions |
 | γ (EGNN) | randn × 1e-4 | Near-dormant with symmetry-breaking noise; each layer starts with unique γ |
-| w_dist_logit | -2.0 (sigmoid ≈ 0.12) | Weak geometry at init; per-block per-head; sigmoid-bounded (0,1); no weight decay |
+| w_dist_raw | 0 (alg_sigmoid = 0.5) | Midpoint geometry at init; per-block per-head; algebraic sigmoid bounded (0,1); no weight decay |
 | w_rel | zeros (per-layer for trunk) | Position bias off at init; each UOT block learns its own sequence-distance priors |
 | α_coevol | zeros | Co-evolution bias off at init; MSA processing must stabilize first |
 | LN γ, β | (1, 0) | Identity normalization at init |
@@ -1456,12 +1461,12 @@ def init_model(model, num_blocks=48):
 
 **Staged activation dynamics**: At the start of training:
 
-1. Content cost (`-LN(Q)^T LN(K)/√d_h`) is the only active cost term → attention based on sequence/MSA features
+1. Content cost (`-LN(Q)^T LN(K)/√d_h`) and geometry cost (w_dist starts at midpoint 0.5) both active from the start
 2. Transport plans are approximately uniform (all costs similar) → EGNN centroids ≈ global mean → γ≈0 (noise init) means minimal coordinate movement, with symmetry broken across layers
 3. L_disto provides strong gradients (random predictions, high loss) → h_res rapidly learns distance-relevant features
 4. As h_res improves → content cost becomes informative → transport plans sharpen → EGNN centroids become meaningful
-5. L_trunk_coord gradient pushes γ away from zero → coordinates begin to refine
-6. Better coordinates → w_dist grows from ≈0.12 → geometry cost strengthens → positive feedback loop
+5. L_trunk_coord gradient pushes γ away from zero (no weight decay on γ) → coordinates begin to refine
+6. Better coordinates → geometry cost becomes informative → positive feedback loop. Heads that don't benefit from geometry can reduce w_dist; the algebraic sigmoid's heavy tail keeps gradient alive at both boundaries
 
 This ordering emerges naturally from the initialization without any explicit curriculum.
 
@@ -1544,19 +1549,19 @@ All post-LN projections use `bias=False`. Standalone projections (input embed, c
 | MSA co-evol: U,V Lin(64→16, bias=F) | per block × 4 | 4 × 2 × 1K = 8K | Xavier | ✅ |
 | MSA co-evol scalar weight: Lin(16→1, bias=F) | per block × 4 | 4 × 16 = 64 | Xavier | ✅ |
 | MSA co-evol agg: LN_Lin(512→512), Lin(512→512, bias=F) | per block × 4 | 4 × 2 × 262K = 2.1M | Xavier | ✅ |
-| MSA marginals: Lin(512→16, bias=F) × 2 | per block × 4 | 4 × 2 × 8K = 66K | zeros | ✅ |
-| MSA marginal co-evol proj: Lin(16→16, bias=F) | per block × 4 | 4 × 256 = 1K | Xavier | ✅ |
-| MSA alpha_coevol | (4, 16) | 64 | zeros | ✅ |
+| MSA marginals: Lin(512→16, bias=F) × 2 | shared (post-loop) | 2 × 8K = 16K | zeros | ✅ |
+| MSA marginal co-evol proj: Lin(16→16, bias=F) | shared (post-loop) | 256 | Xavier | ✅ |
+| MSA alpha_coevol | (16,) | 16 | zeros | ✅ |
 | MSA SwiGLU: Lin(64→256, bias=F)×2, Lin(256→64, bias=F) | per block × 4 | 4 × 49K = 196K | Xavier | ✅ |
 | MSA position: w_rel_msa | (8, 68) | 544 | zeros | ✅ |
 | **MSA total** | | **~2.7M** | | |
 | Token UOT+EGNN: LN + Q,K,V,G Lin(512→512, bias=F) | per block × 48 | 48 × 4 × 262K = 50.3M | Xavier | ✅ |
 | Token UOT+EGNN: W_O Lin(512→512, bias=F) | per block × 48 | 48 × 262K = 12.6M | **Xavier/√48** | ✅ |
 | Token UOT+EGNN: SwiGLU Lin(512→2048, bias=F)×2, Lin(2048→512, bias=F) | per block × 48 | 48 × 3.1M = 150M | Xavier | ✅ |
-| Token UOT+EGNN: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **zeros** | ✅ |
+| Token UOT+EGNN: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **N(0,1e-4)** | ❌ (tanh-bounded) |
 | Token UOT+EGNN: ε (per-head, fixed) | buffer (16,), shared all blocks | 0 (not a parameter) | [1.0]×4+[2.0]×4+[4.0]×4+[8.0]×4 | N/A |
 | Token position: w_rel_res (×48) | (16, 68) per block | 52K | zeros | ✅ |
-| Geometry: w_dist_logit | per block × 48, (16,) each | 768 | **-2.0** (sigmoid ≈ 0.12) | ❌ (sigmoid-bounded) |
+| Geometry: w_dist_raw | per block × 48, (16,) each | 768 | **0** (alg_sigmoid = 0.5) | ❌ (alg_sigmoid-bounded) |
 | LN γ, β (attention + transition) | per block × 48, 2 × (512,) each | 48 × 2K = 98K | (1, 0) | ❌ |
 | **Token UOT+EGNN total** | | **~213M** | | |
 | **Trunk total** | | **~216M** | | |

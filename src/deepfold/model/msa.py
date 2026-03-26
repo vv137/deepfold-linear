@@ -65,12 +65,7 @@ class MSABlock(nn.Module):
         self.coevol_weight = nn.Linear(coevol_rank, 1)
         self.coevol_out = nn.Linear(d_model, d_model)
 
-        # 5. Marginal update — zeros init (SPEC §14)
-        self.mu_proj = zero_init_linear(d_model, h_res)
-        self.nu_proj = zero_init_linear(d_model, h_res)
-        self.coevol_to_marginal = nn.Linear(coevol_rank, h_res)
-
-        # 6. SwiGLU transition
+        # 5. SwiGLU transition
         self.ln_ff = nn.LayerNorm(d_msa)
         self.swiglu = SwiGLU(d_msa, d_msa * 4, d_msa)
 
@@ -78,36 +73,28 @@ class MSABlock(nn.Module):
         self,
         m: torch.Tensor,
         h_res: torch.Tensor,
-        mu: torch.Tensor,
-        nu: torch.Tensor,
         protein_mask: torch.Tensor,
         pos_bias: torch.Tensor,
-        alpha_coevol: torch.Tensor,
         msa_pad_mask: torch.Tensor | None = None,
         training: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             m:            (S, N_prot, d_msa) or (B, S, N_prot, d_msa) MSA representation
             h_res:        (N, d_model) or (B, N, d_model) all tokens
-            mu:           (H_res, N) or (B, H_res, N) row marginals
-            nu:           (H_res, N) or (B, H_res, N) column marginals
             protein_mask: (N,) or (B, N) bool — True for tokens with MSA data
             pos_bias:     (H_msa, N_prot, N_prot) or (B, H_msa, N_prot, N_prot) position bias
-            alpha_coevol: (H_res,) per-head coevol coefficient for this block
             msa_pad_mask: (B, N_prot) bool/float, 1=real 0=pad. Only for batched.
             training:     bool
 
         Returns:
-            m, h_res, mu, nu
+            m, h_res, c_bar
         """
         # Dual-mode: detect unbatched and add B dim
         unbatched = h_res.dim() == 2
         if unbatched:
             m = m.unsqueeze(0)
             h_res = h_res.unsqueeze(0)
-            mu = mu.unsqueeze(0)
-            nu = nu.unsqueeze(0)
             protein_mask = protein_mask.unsqueeze(0)
             pos_bias = pos_bias.unsqueeze(0)
 
@@ -122,15 +109,10 @@ class MSABlock(nn.Module):
 
         # Skip MSA processing if no protein/RNA tokens.
         if N_prot == 0:
-            result_m, result_h = m, h_res + 0
+            c_bar = torch.zeros(B, N, self.coevol_rank, device=device, dtype=h_res.dtype)
             if unbatched:
-                return (
-                    result_m.squeeze(0),
-                    result_h.squeeze(0),
-                    mu.squeeze(0),
-                    nu.squeeze(0),
-                )
-            return result_m, result_h, mu, nu
+                return m.squeeze(0), h_res.squeeze(0), c_bar.squeeze(0)
+            return m, h_res, c_bar
 
         # Precompute protein indices once for gather/scatter operations
         prot_indices = _build_protein_indices(protein_mask, N_prot)  # (B, N_prot)
@@ -242,25 +224,10 @@ class MSABlock(nn.Module):
         h_res = h_res + self.coevol_out(h_agg / max(N_prot, 1))
         c_bar = c_bar_accum / max(N_prot, 1)  # (B, N, r)
 
-        # ---- 5. Marginal update ----
-        mu_logit = self.mu_proj(h_res)  # (B, N, H_res)
-        nu_logit = self.nu_proj(h_res)  # (B, N, H_res)
-
-        # Co-evolution bias masked to protein tokens
-        coevol_bias = (
-            self.coevol_to_marginal(c_bar) * protein_mask.unsqueeze(-1).float()
-        )
-        bias_t = (alpha_coevol[None, None, :] * coevol_bias).permute(
-            0, 2, 1
-        )  # (B, H_res, N)
-
-        mu_new = F.softmax(mu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
-        nu_new = F.softmax(nu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
-
-        # ---- 6. SwiGLU transition ----
+        # ---- 5. SwiGLU transition ----
         m = m + self.swiglu(self.ln_ff(m))
 
-        # ---- 7. Row dropout ----
+        # ---- 6. Row dropout ----
         if training:
             drop_mask = torch.bernoulli(
                 torch.full((B, S, 1, 1), 0.85, device=device, dtype=m.dtype)
@@ -268,8 +235,8 @@ class MSABlock(nn.Module):
             m = m * drop_mask / 0.85
 
         if unbatched:
-            return m.squeeze(0), h_res.squeeze(0), mu_new.squeeze(0), nu_new.squeeze(0)
-        return m, h_res, mu_new, nu_new
+            return m.squeeze(0), h_res.squeeze(0), c_bar.squeeze(0)
+        return m, h_res, c_bar
 
 
 def _build_protein_indices(protein_mask: torch.Tensor, N_prot: int) -> torch.Tensor:
@@ -337,8 +304,11 @@ class MSAModule(nn.Module):
             ]
         )
 
-        # Per-block, per-head alpha_coevol — zeros init (SPEC §6.2 step 5)
-        self.alpha_coevol = nn.Parameter(torch.zeros(n_blocks, h_res))
+        # Post-loop marginal update (SPEC v5.2: moved from per-block)
+        self.alpha_coevol = nn.Parameter(torch.zeros(h_res))
+        self.mu_proj = zero_init_linear(d_model, h_res)
+        self.nu_proj = zero_init_linear(d_model, h_res)
+        self.coevol_to_marginal = nn.Linear(coevol_rank, h_res)
 
         # MSA position bias
         self.pos_bias = PositionBias(h_msa, 68)
@@ -347,8 +317,6 @@ class MSAModule(nn.Module):
         self,
         m: torch.Tensor,
         h_res: torch.Tensor,
-        mu: torch.Tensor,
-        nu: torch.Tensor,
         protein_mask: torch.Tensor,
         msa_bins: torch.Tensor,
         msa_pad_mask: torch.Tensor | None = None,
@@ -358,8 +326,6 @@ class MSAModule(nn.Module):
         Args:
             m:            (S, N_prot, 64) or (B, S, N_prot, 64)
             h_res:        (N, 512) or (B, N, 512)
-            mu:           (H_res, N) or (B, H_res, N)
-            nu:           (H_res, N) or (B, H_res, N)
             protein_mask: (N,) or (B, N) bool
             msa_bins:     (N_prot, N_prot) or (B, N_prot, N_prot) int
             msa_pad_mask: (B, N_prot) bool/float or None
@@ -370,17 +336,42 @@ class MSAModule(nn.Module):
         """
         pos_bias = self.pos_bias(msa_bins)
 
-        for i, block in enumerate(self.blocks):
-            m, h_res, mu, nu = block(
+        for block in self.blocks:
+            m, h_res, c_bar = block(
                 m,
                 h_res,
-                mu,
-                nu,
                 protein_mask=protein_mask,
                 pos_bias=pos_bias,
-                alpha_coevol=self.alpha_coevol[i],
                 msa_pad_mask=msa_pad_mask,
                 training=training,
             )
+
+        # ---- Marginal update (post-loop, from final h_res + last block's c_bar) ----
+        unbatched = h_res.dim() == 2
+        if unbatched:
+            h_res_b = h_res.unsqueeze(0)
+            c_bar_b = c_bar.unsqueeze(0)
+            pmask_b = protein_mask.unsqueeze(0)
+        else:
+            h_res_b = h_res
+            c_bar_b = c_bar
+            pmask_b = protein_mask
+
+        mu_logit = self.mu_proj(h_res_b)  # (B, N, H_res)
+        nu_logit = self.nu_proj(h_res_b)  # (B, N, H_res)
+
+        coevol_bias = (
+            self.coevol_to_marginal(c_bar_b) * pmask_b.unsqueeze(-1).float()
+        )
+        bias_t = (self.alpha_coevol[None, None, :] * coevol_bias).permute(
+            0, 2, 1
+        )  # (B, H_res, N)
+
+        mu = F.softmax(mu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
+        nu = F.softmax(nu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
+
+        if unbatched:
+            mu = mu.squeeze(0)
+            nu = nu.squeeze(0)
 
         return m, h_res, mu, nu

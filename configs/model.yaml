@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v5.1)
+# DeepFold-Linear model configuration (SPEC v5.3)
 
 model:
   d_model: 512
@@ -94,8 +94,8 @@ wandb:
 
 init:
   gamma_std: 1.0e-4 # EGNN gamma N(0, std) noise init for symmetry breaking
-  w_dist_logit: -2.0 # geometry bias init; sigmoid(-2.0) ≈ 0.12
   adaln_gate_bias: -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
+  # w_dist_raw is always zero-init (alg_sigmoid midpoint = 0.5), not configurable
 
 sinkhorn:
   lambda: 1.0
