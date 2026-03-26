@@ -77,13 +77,13 @@ def build_optimizer(
     1. Standalone weight matrices (not post-LN): weight_decay
     2. No decay: LN γ/β, biases, post-LN projections (w_q/w_k/w_v/w_g/w_o,
        SwiGLU — scale-invariant under LN), bounded params (w_dist_raw,
-       gamma), gating (alpha_coevol), position bias (Swin convention)
+       gamma), position bias (Swin convention)
     """
     # Post-LN projection names — scale-invariant, no decay
     _POST_LN_NAMES = {"w_q", "w_k", "w_v", "w_g", "w_o", "swiglu"}
     # Bounded, gating, or position bias — no decay
     # Note: gamma is handled by the explicit check above, not here
-    _NO_DECAY_SPECIAL = {"w_dist_raw", "alpha_coevol", "pos_bias"}
+    _NO_DECAY_SPECIAL = {"w_dist_raw", "pos_bias"}
 
     decay_params = []
     no_decay_params = []

@@ -116,7 +116,7 @@ class DeepFoldLinear(nn.Module):
         chain_id: torch.Tensor,
         global_idx: torch.Tensor,
         bond_matrix: torch.Tensor,
-        protein_mask: torch.Tensor,
+        msa_token_mask: torch.Tensor,
         token_atom_starts: torch.Tensor | None = None,
         token_atom_counts: torch.Tensor | None = None,
         x_atom_true: torch.Tensor | None = None,
@@ -179,12 +179,9 @@ class DeepFoldLinear(nn.Module):
             chain_id,
             global_idx,
             bond_matrix,
-            protein_mask,
+            msa_token_mask,
             token_pad_mask=token_pad_mask,
-            # msa_pad_mask from collate is (B, S, N_prot); MSA module expects (B, N_prot)
-            msa_pad_mask=msa_pad_mask.amax(dim=1)
-            if (msa_pad_mask is not None and msa_pad_mask.dim() == 3)
-            else msa_pad_mask,
+            msa_pad_mask=msa_pad_mask,
             num_cycles=num_cycles,
         )
 
@@ -355,7 +352,7 @@ class DeepFoldLinear(nn.Module):
         chain_id: torch.Tensor,
         global_idx: torch.Tensor,
         bond_matrix: torch.Tensor,
-        protein_mask: torch.Tensor,
+        msa_token_mask: torch.Tensor,
         token_atom_starts: torch.Tensor | None = None,
         token_atom_counts: torch.Tensor | None = None,
         n_steps: int = 200,
@@ -376,7 +373,7 @@ class DeepFoldLinear(nn.Module):
         h_res, mu, nu, x_res = self.trunk(
             token_type, profile, del_mean, has_msa, msa_feat,
             c_atom, p_lm, p_lm_idx, token_idx,
-            chain_id, global_idx, bond_matrix, protein_mask,
+            chain_id, global_idx, bond_matrix, msa_token_mask,
             num_cycles=self.trunk.inference_cycles,
         )
 

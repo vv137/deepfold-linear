@@ -8,7 +8,7 @@ Key outputs (matching the model's forward signature):
     profile      (N, 32)    float  — MSA residue-type frequencies, zero for non-protein
     del_mean     (N, 1)     float  — MSA deletion mean, zero for non-protein
     has_msa      (N, 1)     float  — 1 for protein/RNA, 0 otherwise
-    msa_feat     (S, N_prot, 34)   — cat(restype_onehot[32], has_del[1], del_val[1])
+    msa_feat     (C, S, N_prot, 34) — per-cycle: cat(restype_onehot[32], has_del[1], del_val[1])
     c_atom       (N_atom, D_ref)   — ref conformer features (cat of ref_pos, charge, mask, elem, name)
     p_lm         (n_pairs, 16_raw) — intra-token atom pair raw features (disp[3], inv_dist[1], valid[1])
     p_lm_idx     (n_pairs, 2)      — atom index pairs for p_lm (into cropped atom array)
@@ -16,7 +16,7 @@ Key outputs (matching the model's forward signature):
     chain_id     (N,)       int    — chain id per token
     global_idx   (N,)       int    — global residue index (preserved after crop)
     bond_matrix  (N, N)     bool   — covalent bond adjacency
-    protein_mask (N,)       bool   — True for tokens with MSA data
+    msa_token_mask (N,)     bool   — True for tokens with MSA data
     x_atom_true  (N_atom, 3) float — ground-truth atom coords (training)
     x_res_true   (N, 3)     float  — ground-truth token (C-alpha/center) coords (training)
 """
@@ -107,9 +107,13 @@ def featurize(
     token_bonds: Optional[list[tuple[int, int]]] = None,
     # MSA data (optional)
     msa_data: Optional[
-        np.ndarray
-    ] = None,  # (S, N_prot) int — residue types in MSA rows
-    msa_deletion: Optional[np.ndarray] = None,  # (S, N_prot) float — deletion counts
+        list[np.ndarray] | np.ndarray
+    ] = None,  # list of (S_i, N_prot) int per cycle, or single (S, N_prot)
+    msa_deletion: Optional[
+        list[np.ndarray] | np.ndarray
+    ] = None,  # list of (S_i, N_prot) float per cycle, or single (S, N_prot)
+    full_msa_data: Optional[np.ndarray] = None,  # (S_full, N_prot) — for profile
+    full_msa_deletion: Optional[np.ndarray] = None,  # (S_full, N_prot) — for del_mean
     msa_mask: Optional[np.ndarray] = None,  # (N,) bool — which tokens have MSA
     # Training flag
     training: bool = True,
@@ -130,74 +134,106 @@ def featurize(
     token_type = torch.from_numpy(token_types.astype(np.int64))
 
     # ------------------------------------------------------------------
-    # 2. protein_mask (N,) bool — True for protein/RNA tokens
+    # 2. msa_token_mask (N,) bool — True for protein/RNA tokens
     # ------------------------------------------------------------------
     if msa_mask is not None:
-        protein_mask = torch.from_numpy(msa_mask.astype(bool))
+        msa_token_mask = torch.from_numpy(msa_mask.astype(bool))
     else:
-        protein_mask = torch.tensor(
+        msa_token_mask = torch.tensor(
             [(t == const.MOL_PROTEIN or t == const.MOL_RNA) for t in token_types],
             dtype=torch.bool,
         )
-    N_prot = int(protein_mask.sum().item())
+    N_prot = int(msa_token_mask.sum().item())
 
     # ------------------------------------------------------------------
+    # Normalize: wrap single arrays into lists for uniform handling
+    if msa_data is not None and not isinstance(msa_data, list):
+        msa_data = [msa_data]
+    if msa_deletion is not None and not isinstance(msa_deletion, list):
+        msa_deletion = [msa_deletion]
+
     # 3. profile (N, 32), del_mean (N, 1), has_msa (N, 1)
+    #    Computed from first cycle's MSA (profile is cycle-invariant in expectation)
     # ------------------------------------------------------------------
     profile = torch.zeros(N, NUM_MSA_RESTYPE_CLASSES, dtype=torch.float32)
     del_mean = torch.zeros(N, 1, dtype=torch.float32)
     has_msa = torch.zeros(N, 1, dtype=torch.float32)
 
-    if msa_data is not None and N_prot > 0:
-        # msa_data: (S, N_prot) int residue type indices
-        S = msa_data.shape[0]
-        msa_onehot = _one_hot_np(msa_data.ravel(), NUM_MSA_RESTYPE_CLASSES)
+    # Use full (pre-subsampling) MSA for profile/del_mean (AF3 §2.3)
+    # Fall back to subsampled data if full MSA not provided
+    profile_msa = full_msa_data if full_msa_data is not None else (
+        msa_data[0] if msa_data is not None else None
+    )
+    profile_del = full_msa_deletion if full_msa_deletion is not None else (
+        msa_deletion[0] if msa_deletion is not None else None
+    )
+
+    if profile_msa is not None and N_prot > 0:
+        S = profile_msa.shape[0]
+        msa_onehot = _one_hot_np(profile_msa.ravel(), NUM_MSA_RESTYPE_CLASSES)
         msa_onehot = msa_onehot.reshape(S, N_prot, NUM_MSA_RESTYPE_CLASSES)
         prot_profile = msa_onehot.mean(axis=0)  # (N_prot, 32)
 
-        prot_indices = protein_mask.nonzero(as_tuple=True)[0]
+        prot_indices = msa_token_mask.nonzero(as_tuple=True)[0]
         for local_i, global_i in enumerate(prot_indices):
             profile[global_i] = torch.from_numpy(prot_profile[local_i])
 
-        if msa_deletion is not None:
-            # arctan transform as in Boltz
-            del_transformed = (np.pi / 2.0) * np.arctan(msa_deletion / 3.0)
+        if profile_del is not None:
+            del_transformed = (np.pi / 2.0) * np.arctan(profile_del / 3.0)
             del_mean_prot = del_transformed.mean(axis=0)  # (N_prot,)
             for local_i, global_i in enumerate(prot_indices):
                 del_mean[global_i, 0] = float(del_mean_prot[local_i])
 
     # has_msa
-    has_msa[protein_mask] = 1.0
+    has_msa[msa_token_mask] = 1.0
 
     # ------------------------------------------------------------------
-    # 4. msa_feat (S, N_prot, 34) — cat(restype_onehot[32], has_del[1], del_val[1])
+    # 4. msa_feat (C, S_max, N_prot, 34) — per-cycle MSA features
+    #    C = number of cycles, S_max = max depth across cycles
     # ------------------------------------------------------------------
     if msa_data is not None and N_prot > 0:
-        S = msa_data.shape[0]
-        msa_restype_oh = torch.from_numpy(
-            _one_hot_np(msa_data.ravel(), NUM_MSA_RESTYPE_CLASSES).reshape(
-                S, N_prot, NUM_MSA_RESTYPE_CLASSES
+        cycle_feats = []
+        for c_idx in range(len(msa_data)):
+            msa_c = msa_data[c_idx]
+            S_c = msa_c.shape[0]
+            msa_restype_oh = torch.from_numpy(
+                _one_hot_np(msa_c.ravel(), NUM_MSA_RESTYPE_CLASSES).reshape(
+                    S_c, N_prot, NUM_MSA_RESTYPE_CLASSES
+                )
             )
-        )
+            if msa_deletion is not None:
+                del_c = msa_deletion[c_idx]
+                has_del = torch.from_numpy(
+                    (del_c > 0).astype(np.float32)
+                ).unsqueeze(-1)
+                del_val = torch.from_numpy(
+                    ((np.pi / 2.0) * np.arctan(del_c / 3.0)).astype(np.float32)
+                ).unsqueeze(-1)
+            else:
+                has_del = torch.zeros(S_c, N_prot, 1)
+                del_val = torch.zeros(S_c, N_prot, 1)
+            cycle_feats.append(
+                torch.cat([msa_restype_oh, has_del, del_val], dim=-1)
+            )  # (S_c, N_prot, 34)
 
-        if msa_deletion is not None:
-            has_del = torch.from_numpy((msa_deletion > 0).astype(np.float32)).unsqueeze(
-                -1
-            )  # (S, N_prot, 1)
-            del_val = torch.from_numpy(
-                ((np.pi / 2.0) * np.arctan(msa_deletion / 3.0)).astype(np.float32)
-            ).unsqueeze(-1)  # (S, N_prot, 1)
-        else:
-            has_del = torch.zeros(S, N_prot, 1)
-            del_val = torch.zeros(S, N_prot, 1)
-
-        msa_feat = torch.cat(
-            [msa_restype_oh, has_del, del_val], dim=-1
-        )  # (S, N_prot, 34)
+        # Pad to S_max and stack into (C, S_max, N_prot, 34)
+        S_max = max(f.shape[0] for f in cycle_feats)
+        padded = []
+        masks = []
+        for f in cycle_feats:
+            S_c = f.shape[0]
+            mask_c = torch.ones(S_c, N_prot)
+            if S_c < S_max:
+                f = torch.cat([f, torch.zeros(S_max - S_c, N_prot, 34)], dim=0)
+                mask_c = torch.cat([mask_c, torch.zeros(S_max - S_c, N_prot)], dim=0)
+            padded.append(f)
+            masks.append(mask_c)
+        msa_feat = torch.stack(padded)  # (C, S_max, N_prot, 34)
+        msa_mask = torch.stack(masks)   # (C, S_max, N_prot)
     else:
-        # Dummy MSA: single row with query sequence one-hot
+        # Dummy MSA: single cycle, single row with query sequence one-hot
         prot_res_types = (
-            token_res_types[protein_mask.numpy()]
+            token_res_types[msa_token_mask.numpy()]
             if N_prot > 0
             else np.array([], dtype=np.int64)
         )
@@ -212,9 +248,9 @@ def featurize(
                     ],
                     axis=-1,
                 )
-            ).unsqueeze(0)  # (1, N_prot, 34)
+            ).unsqueeze(0).unsqueeze(0)  # (1, 1, N_prot, 34)
         else:
-            msa_feat = torch.zeros(1, 0, 34)
+            msa_feat = torch.zeros(1, 1, 0, 34)
 
     # ------------------------------------------------------------------
     # 5. c_atom (N_atom, D_ref) — reference conformer features
@@ -308,7 +344,7 @@ def featurize(
         "profile": profile,  # (N, 32) float
         "del_mean": del_mean,  # (N, 1) float
         "has_msa": has_msa,  # (N, 1) float
-        "msa_feat": msa_feat,  # (S, N_prot, 34) float
+        "msa_feat": msa_feat,  # (C, S_max, N_prot, 34) float — per-cycle MSA
         "c_atom": c_atom,  # (N_atom, 197) float
         "p_lm": p_lm,  # (n_pairs, 5) float — raw feats for AtomPairEmbedding
         "p_lm_idx": p_lm_idx,  # (n_pairs, 2) int
@@ -316,7 +352,7 @@ def featurize(
         "chain_id": chain_id,  # (N,) int
         "global_idx": global_idx,  # (N,) int
         "bond_matrix": bond_matrix,  # (N, N) bool
-        "protein_mask": protein_mask,  # (N,) bool
+        "msa_token_mask": msa_token_mask,  # (N,) bool
         "token_atom_starts": torch.from_numpy(
             token_atom_starts.astype(np.int32)
         ),  # (N,) int32

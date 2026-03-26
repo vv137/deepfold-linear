@@ -26,7 +26,7 @@ def _make_sample(
         "profile": torch.randn(N, 32),
         "del_mean": torch.randn(N, 1),
         "has_msa": torch.ones(N, 1),
-        "msa_feat": torch.randn(1, N_prot, 34),
+        "msa_feat": torch.randn(1, 1, N_prot, 34),
         "c_atom": torch.randn(N_atom, 197),
         "p_lm": torch.randn(n_pairs, 5),
         "p_lm_idx": torch.randint(0, max(N_atom, 1), (n_pairs, 2)),
@@ -34,7 +34,7 @@ def _make_sample(
         "chain_id": torch.zeros(N, dtype=torch.int64),
         "global_idx": torch.arange(N, dtype=torch.int64),
         "bond_matrix": torch.zeros(N, N, dtype=torch.bool),
-        "protein_mask": torch.ones(N, dtype=torch.bool),
+        "msa_token_mask": torch.ones(N, dtype=torch.bool),
         # Padding masks (all-ones for real data)
         "token_pad_mask": torch.ones(N, dtype=torch.float32),
         "atom_pad_mask": torch.ones(N_atom, dtype=torch.float32),
@@ -90,7 +90,7 @@ class TestCollateBatch:
         assert result["p_lm_idx"].shape == (B, max_n_pairs, 2)
         assert result["token_idx"].shape == (B, max_N_atom)
         assert result["bond_matrix"].shape == (B, max_N, max_N)
-        assert result["msa_feat"].shape == (B, 1, max_N_prot, 34)
+        assert result["msa_feat"].shape == (B, 1, 1, max_N_prot, 34)
 
     def test_mask_values(self):
         """Mask tensors have 1.0 for real data and 0.0 for padding."""
@@ -181,12 +181,12 @@ class TestCollateBatch:
         result = collate_fn([s1, s2])
 
         assert "msa_pad_mask" in result
-        # Shape: (B, max_S, max_N_prot)
-        assert result["msa_pad_mask"].shape == (2, 1, 10)
+        # Shape: (B, max_N_prot)
+        assert result["msa_pad_mask"].shape == (2, 10)
         # s1 has N_prot=6, s2 has N_prot=10
-        assert result["msa_pad_mask"][0, 0, :6].sum() == 6.0
-        assert result["msa_pad_mask"][0, 0, 6:].sum() == 0.0
-        assert result["msa_pad_mask"][1, 0, :10].sum() == 10.0
+        assert result["msa_pad_mask"][0, :6].sum() == 6.0
+        assert result["msa_pad_mask"][0, 6:].sum() == 0.0
+        assert result["msa_pad_mask"][1, :10].sum() == 10.0
 
     def test_three_samples(self):
         """Batching 3 samples of different sizes works."""

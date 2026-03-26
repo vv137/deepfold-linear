@@ -22,10 +22,10 @@ def make_synthetic_batch(N=32, N_atom=64, S=4, device="cuda"):
     profile = torch.randn(N, 32, device=device).softmax(dim=-1)
     del_mean = torch.randn(N, 1, device=device).abs() * 0.1
     has_msa = torch.ones(N, 1, device=device)
-    protein_mask = torch.ones(N, device=device, dtype=torch.bool)
+    msa_token_mask = torch.ones(N, device=device, dtype=torch.bool)
 
     # MSA
-    msa_feat = torch.randn(S, N, 34, device=device)
+    msa_feat = torch.randn(1, S, N, 34, device=device)
 
     # Atom-level: raw ref conformer features (before embedding)
     c_atom = torch.randn(N_atom, D_REF, device=device)
@@ -99,7 +99,7 @@ def make_synthetic_batch(N=32, N_atom=64, S=4, device="cuda"):
         "chain_id": chain_id,
         "global_idx": global_idx,
         "bond_matrix": bond_matrix,
-        "protein_mask": protein_mask,
+        "msa_token_mask": msa_token_mask,
         "x_atom_true": x_atom_true,
         "x_res_true": x_res_true,
     }

@@ -4,7 +4,7 @@ Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
   2. Coordinate path (x_res): dormant at init.
-     gamma~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0, alpha_coevol=0.
+     gamma~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0.
      Content-only attention first; geometry starts at midpoint.
 """
 
@@ -15,7 +15,7 @@ import torch.nn as nn
 
 def _is_zero_init(name: str) -> bool:
     """Parameters that must stay at zero (dormant at init)."""
-    return "alpha_coevol" in name
+    return any(k in name for k in ("mu_proj", "nu_proj", "coevol_to_marginal"))
 
 
 def _is_gamma(name: str) -> bool:
@@ -44,7 +44,7 @@ def init_model(
     - Attention output (w_o) scaled by 1/sqrt(L) for residual depth control.
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
     - Noise init (N(0, gamma_std)) for gamma (symmetry breaking across layers).
-    - Zeros for w_rel, alpha_coevol, zero_init_linear outputs.
+    - Zeros for w_rel, zero_init_linear outputs.
     - w_dist_raw=0 (algebraic sigmoid midpoint = 0.5).
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
     - Biases: zeros (PyTorch default).

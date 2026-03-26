@@ -41,8 +41,8 @@ def _make_batch(N=8, N_atom=16, S=2, device="cpu"):
     profile = torch.randn(N, 32, device=device).softmax(dim=-1)
     del_mean = torch.zeros(N, 1, device=device)
     has_msa = torch.ones(N, 1, device=device)
-    protein_mask = torch.ones(N, dtype=torch.bool, device=device)
-    msa_feat = torch.randn(S, N, 34, device=device)
+    msa_token_mask = torch.ones(N, dtype=torch.bool, device=device)
+    msa_feat = torch.randn(1, S, N, 34, device=device)
 
     # D_REF = 197: pos(3) + charge(1) + mask(1) + element_onehot(128) + name_onehot(64)
     c_atom = torch.randn(N_atom, 197, device=device)
@@ -82,7 +82,7 @@ def _make_batch(N=8, N_atom=16, S=2, device="cpu"):
         "chain_id": chain_id,
         "global_idx": global_idx,
         "bond_matrix": bond_matrix,
-        "protein_mask": protein_mask,
+        "msa_token_mask": msa_token_mask,
         "x_atom_true": x_atom_true,
         "x_res_true": x_res_true,
         "atom_resolved_mask": atom_resolved_mask,

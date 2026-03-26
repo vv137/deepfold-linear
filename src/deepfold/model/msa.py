@@ -73,7 +73,7 @@ class MSABlock(nn.Module):
         self,
         m: torch.Tensor,
         h_res: torch.Tensor,
-        protein_mask: torch.Tensor,
+        msa_token_mask: torch.Tensor,
         pos_bias: torch.Tensor,
         msa_pad_mask: torch.Tensor | None = None,
         training: bool = True,
@@ -82,7 +82,7 @@ class MSABlock(nn.Module):
         Args:
             m:            (S, N_prot, d_msa) or (B, S, N_prot, d_msa) MSA representation
             h_res:        (N, d_model) or (B, N, d_model) all tokens
-            protein_mask: (N,) or (B, N) bool — True for tokens with MSA data
+            msa_token_mask: (N,) or (B, N) bool — True for tokens with MSA data
             pos_bias:     (H_msa, N_prot, N_prot) or (B, H_msa, N_prot, N_prot) position bias
             msa_pad_mask: (B, N_prot) bool/float, 1=real 0=pad. Only for batched.
             training:     bool
@@ -95,7 +95,7 @@ class MSABlock(nn.Module):
         if unbatched:
             m = m.unsqueeze(0)
             h_res = h_res.unsqueeze(0)
-            protein_mask = protein_mask.unsqueeze(0)
+            msa_token_mask = msa_token_mask.unsqueeze(0)
             pos_bias = pos_bias.unsqueeze(0)
 
         B, S, N_prot, _ = m.shape
@@ -115,7 +115,7 @@ class MSABlock(nn.Module):
             return m, h_res, c_bar
 
         # Precompute protein indices once for gather/scatter operations
-        prot_indices = _build_protein_indices(protein_mask, N_prot)  # (B, N_prot)
+        prot_indices = _build_protein_indices(msa_token_mask, N_prot)  # (B, N_prot)
 
         # ---- 1. Single -> MSA injection ----
         h_proj = self.single_to_msa(h_res)  # (B, N, d_msa)
@@ -227,11 +227,12 @@ class MSABlock(nn.Module):
         # ---- 5. SwiGLU transition ----
         m = m + self.swiglu(self.ln_ff(m))
 
-        # ---- 6. Row dropout ----
+        # ---- 6. Row dropout (protect query row 0) ----
         if training:
             drop_mask = torch.bernoulli(
                 torch.full((B, S, 1, 1), 0.85, device=device, dtype=m.dtype)
             )
+            drop_mask[:, 0] = 1.0  # always keep query row
             m = m * drop_mask / 0.85
 
         if unbatched:
@@ -239,20 +240,20 @@ class MSABlock(nn.Module):
         return m, h_res, c_bar
 
 
-def _build_protein_indices(protein_mask: torch.Tensor, N_prot: int) -> torch.Tensor:
+def _build_protein_indices(msa_token_mask: torch.Tensor, N_prot: int) -> torch.Tensor:
     """Build (B, N_prot) index tensor of protein positions per batch element.
 
     Uses stable argsort to put True positions first, preserving relative order.
     Padded with index 0 if fewer than N_prot True positions exist.
 
     Args:
-        protein_mask: (B, N) bool
+        msa_token_mask: (B, N) bool
         N_prot: int
 
     Returns:
         (B, N_prot) long tensor of indices
     """
-    sorted_idx = torch.argsort(~protein_mask.bool(), dim=1, stable=True)  # (B, N)
+    sorted_idx = torch.argsort(~msa_token_mask.bool(), dim=1, stable=True)  # (B, N)
     return sorted_idx[:, :N_prot].contiguous()
 
 
@@ -304,11 +305,8 @@ class MSAModule(nn.Module):
             ]
         )
 
-        # Post-loop marginal update (SPEC v5.2: moved from per-block)
-        self.alpha_coevol = nn.Parameter(torch.zeros(h_res))
-        self.mu_proj = zero_init_linear(d_model, h_res)
-        self.nu_proj = zero_init_linear(d_model, h_res)
-        self.coevol_to_marginal = nn.Linear(coevol_rank, h_res)
+        # Co-evolution → marginal bias (zero-init: coevol earns influence)
+        self.coevol_to_marginal = zero_init_linear(coevol_rank, h_res)
 
         # MSA position bias
         self.pos_bias = PositionBias(h_msa, 68)
@@ -317,22 +315,22 @@ class MSAModule(nn.Module):
         self,
         m: torch.Tensor,
         h_res: torch.Tensor,
-        protein_mask: torch.Tensor,
+        msa_token_mask: torch.Tensor,
         msa_bins: torch.Tensor,
         msa_pad_mask: torch.Tensor | None = None,
         training: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             m:            (S, N_prot, 64) or (B, S, N_prot, 64)
             h_res:        (N, 512) or (B, N, 512)
-            protein_mask: (N,) or (B, N) bool
+            msa_token_mask: (N,) or (B, N) bool
             msa_bins:     (N_prot, N_prot) or (B, N_prot, N_prot) int
             msa_pad_mask: (B, N_prot) bool/float or None
             training:     bool
 
         Returns:
-            m, h_res, mu, nu
+            m, h_res, coevol_bias — coevol_bias is (B, H_res, N) or (H_res, N)
         """
         pos_bias = self.pos_bias(msa_bins)
 
@@ -340,38 +338,26 @@ class MSAModule(nn.Module):
             m, h_res, c_bar = block(
                 m,
                 h_res,
-                protein_mask=protein_mask,
+                msa_token_mask=msa_token_mask,
                 pos_bias=pos_bias,
                 msa_pad_mask=msa_pad_mask,
                 training=training,
             )
 
-        # ---- Marginal update (post-loop, from final h_res + last block's c_bar) ----
+        # ---- Co-evolution bias for marginals (computed once, used per-block in trunk) ----
         unbatched = h_res.dim() == 2
         if unbatched:
-            h_res_b = h_res.unsqueeze(0)
             c_bar_b = c_bar.unsqueeze(0)
-            pmask_b = protein_mask.unsqueeze(0)
+            pmask_b = msa_token_mask.unsqueeze(0)
         else:
-            h_res_b = h_res
             c_bar_b = c_bar
-            pmask_b = protein_mask
-
-        mu_logit = self.mu_proj(h_res_b)  # (B, N, H_res)
-        nu_logit = self.nu_proj(h_res_b)  # (B, N, H_res)
+            pmask_b = msa_token_mask
 
         coevol_bias = (
             self.coevol_to_marginal(c_bar_b) * pmask_b.unsqueeze(-1).float()
-        )
-        bias_t = (self.alpha_coevol[None, None, :] * coevol_bias).permute(
-            0, 2, 1
-        )  # (B, H_res, N)
-
-        mu = F.softmax(mu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
-        nu = F.softmax(nu_logit.permute(0, 2, 1) + bias_t, dim=-1)  # (B, H_res, N)
+        ).permute(0, 2, 1)  # (B, H_res, N)
 
         if unbatched:
-            mu = mu.squeeze(0)
-            nu = nu.squeeze(0)
+            coevol_bias = coevol_bias.squeeze(0)
 
-        return m, h_res, mu, nu
+        return m, h_res, coevol_bias

@@ -153,8 +153,8 @@ class TestMSABlockBatch:
 
         m = torch.randn(S, N_prot, d_msa)
         h = torch.randn(N, d_model)
-        protein_mask = torch.zeros(N, dtype=torch.bool)
-        protein_mask[:N_prot] = True
+        msa_token_mask = torch.zeros(N, dtype=torch.bool)
+        msa_token_mask[:N_prot] = True
 
         from deepfold.model.position_encoding import PositionBias
 
@@ -167,7 +167,7 @@ class TestMSABlockBatch:
             m_ub, h_ub, c_bar_ub = block(
                 m,
                 h,
-                protein_mask,
+                msa_token_mask,
                 pos_bias,
                 training=False,
             )
@@ -177,7 +177,7 @@ class TestMSABlockBatch:
             m_b, h_b, c_bar_b = block(
                 m.unsqueeze(0),
                 h.unsqueeze(0),
-                protein_mask.unsqueeze(0),
+                msa_token_mask.unsqueeze(0),
                 pos_bias.unsqueeze(0),
                 training=False,
             )
@@ -199,9 +199,9 @@ class TestMSABlockBatch:
         m = torch.randn(B, S, N_prot, d_msa)
         h = torch.randn(B, N, d_model)
 
-        protein_mask = torch.zeros(B, N, dtype=torch.bool)
-        protein_mask[0, :6] = True  # sample 0: 6 protein
-        protein_mask[1, :4] = True  # sample 1: 4 protein (padded to 6)
+        msa_token_mask = torch.zeros(B, N, dtype=torch.bool)
+        msa_token_mask[0, :6] = True  # sample 0: 6 protein
+        msa_token_mask[1, :4] = True  # sample 1: 4 protein (padded to 6)
 
         msa_pad_mask = torch.ones(B, N_prot)
         msa_pad_mask[1, 4:] = 0  # sample 1 has only 4 real MSA positions
@@ -217,7 +217,7 @@ class TestMSABlockBatch:
             m_out, h_out, c_bar_out = block(
                 m,
                 h,
-                protein_mask,
+                msa_token_mask,
                 pos_bias,
                 msa_pad_mask=msa_pad_mask,
                 training=False,
@@ -250,22 +250,22 @@ class TestMSAModuleBatch:
 
         m = torch.randn(B, S, N_prot, d_msa)
         h = torch.randn(B, N, d_model)
-        protein_mask = torch.zeros(B, N, dtype=torch.bool)
-        protein_mask[:, :N_prot] = True
+        msa_token_mask = torch.zeros(B, N, dtype=torch.bool)
+        msa_token_mask[:, :N_prot] = True
         msa_bins = torch.randint(0, 68, (B, N_prot, N_prot))
 
         with torch.no_grad():
-            m_out, h_out, mu_out, nu_out = mod(
+            m_out, h_out, coevol_bias = mod(
                 m,
                 h,
-                protein_mask,
+                msa_token_mask,
                 msa_bins,
                 training=False,
             )
 
         assert m_out.shape == m.shape
         assert h_out.shape == h.shape
-        assert mu_out.shape == (B, h_res, N)
+        assert coevol_bias.shape == (B, h_res, N)
 
 
 class TestTrunkBatch:
@@ -276,7 +276,7 @@ class TestTrunkBatch:
         profile = torch.randn(B, N, 32, device=device)
         del_mean = torch.randn(B, N, 1, device=device)
         has_msa = torch.ones(B, N, 1, device=device)
-        msa_feat = torch.randn(B, S, N_prot, 34, device=device)
+        msa_feat = torch.randn(B, 1, S, N_prot, 34, device=device)
         c_atom = torch.randn(B, N_atom, 128, device=device)
         p_lm = torch.randn(B, N_atom, 16, device=device)
         p_lm_idx = torch.zeros(B, N_atom, 2, dtype=torch.long, device=device)
@@ -284,8 +284,8 @@ class TestTrunkBatch:
         chain_id = torch.zeros(B, N, dtype=torch.long, device=device)
         global_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
         bond_matrix = torch.zeros(B, N, N, dtype=torch.long, device=device)
-        protein_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
-        protein_mask[:, :N_prot] = True
+        msa_token_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        msa_token_mask[:, :N_prot] = True
         return (
             token_type,
             profile,
@@ -299,7 +299,7 @@ class TestTrunkBatch:
             chain_id,
             global_idx,
             bond_matrix,
-            protein_mask,
+            msa_token_mask,
         )
 
     def test_trunk_forward_batched(self):
@@ -356,7 +356,7 @@ class TestTrunkBatch:
         profile = torch.randn(N, 32)
         del_mean = torch.randn(N, 1)
         has_msa = torch.ones(N, 1)
-        msa_feat = torch.randn(S, N_prot, 34)
+        msa_feat = torch.randn(1, S, N_prot, 34)
         c_atom = torch.randn(N_atom, 128)
         p_lm = torch.randn(N_atom, 16)
         p_lm_idx = torch.zeros(N_atom, 2, dtype=torch.long)
@@ -364,8 +364,8 @@ class TestTrunkBatch:
         chain_id = torch.zeros(N, dtype=torch.long)
         global_idx = torch.arange(N)
         bond_matrix = torch.zeros(N, N, dtype=torch.long)
-        protein_mask = torch.zeros(N, dtype=torch.bool)
-        protein_mask[:N_prot] = True
+        msa_token_mask = torch.zeros(N, dtype=torch.bool)
+        msa_token_mask[:N_prot] = True
 
         with torch.no_grad():
             h_res, mu, nu, x_res = trunk(
@@ -381,7 +381,7 @@ class TestTrunkBatch:
                 chain_id,
                 global_idx,
                 bond_matrix,
-                protein_mask,
+                msa_token_mask,
             )
 
         assert h_res.shape == (N, 64)

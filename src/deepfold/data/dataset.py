@@ -386,6 +386,7 @@ class DeepFoldDataset(Dataset):
         max_msa_seqs: int = 128,
         min_msa_seqs: int = 1,
         msa_dir: Optional[Union[str, Path]] = None,
+        max_msa_cycles: int = 3,
         training: bool = True,
         seed: int = 42,
     ):
@@ -413,6 +414,7 @@ class DeepFoldDataset(Dataset):
         self.max_msa_seqs = max_msa_seqs
         self.min_msa_seqs = min_msa_seqs
         self.msa_dir = Path(msa_dir) if msa_dir else None
+        self.max_msa_cycles = max_msa_cycles
         self.training = training
         self.rng = np.random.RandomState(seed)
 
@@ -583,9 +585,11 @@ class DeepFoldDataset(Dataset):
         # Load real MSA if available
         msa_data_np = None
         msa_del_np = None
+        full_msa_np = None
+        full_del_np = None
 
         if self.msa_dir is not None:
-            msa_data_np, msa_del_np = self._load_chain_msa(
+            msa_data_np, msa_del_np, full_msa_np, full_del_np = self._load_chain_msa(
                 struct, cropped_tokens, msa_mask
             )
 
@@ -609,6 +613,8 @@ class DeepFoldDataset(Dataset):
             token_bonds=bond_pairs,
             msa_data=msa_data_np,
             msa_deletion=msa_del_np,
+            full_msa_data=full_msa_np,
+            full_msa_deletion=full_del_np,
             msa_mask=msa_mask,
             training=self.training,
         )
@@ -620,20 +626,24 @@ class DeepFoldDataset(Dataset):
         struct: dict,
         cropped_tokens: np.ndarray,
         msa_mask: np.ndarray,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple:
         """Load and subsample MSA for the first protein chain in the crop.
 
-        Returns (msa_seqs, msa_dels) aligned to the protein positions in the crop,
-        or (None, None) if no MSA is available.
+        Returns (msa_crops, del_crops, full_msa_crop, full_del_crop):
+          - msa_crops: list of (S_i, N_prot) subsampled MSA per cycle
+          - del_crops: list of (S_i, N_prot) subsampled deletions per cycle
+          - full_msa_crop: (S_full, N_prot) full MSA (for profile/del_mean)
+          - full_del_crop: (S_full, N_prot) full deletions
+        Returns (None, None, None, None) if no MSA is available.
         """
         N_prot = int(msa_mask.sum())
         if N_prot == 0 or self.msa_dir is None:
-            return None, None
+            return None, None, None, None
 
         # Find chain info: get PDB ID from file path (e.g., "101m" from "101m.npz")
         chains = struct.get("chains", None)
         if chains is None:
-            return None, None
+            return None, None, None, None
 
         # Get the first protein chain's MSA
         # MSA files named {pdb}_{chain_letter}.npz (lowercase)
@@ -644,7 +654,7 @@ class DeepFoldDataset(Dataset):
                 break
 
         if pdb_id is None:
-            return None, None
+            return None, None, None, None
 
         # Find unique protein chain IDs in the crop
         prot_chain_ids = np.unique(cropped_tokens["asym_id"][msa_mask])
@@ -671,13 +681,7 @@ class DeepFoldDataset(Dataset):
 
             msa_seqs, msa_dels = result
 
-            # Subsample to max depth
-            msa_seqs, msa_dels = subsample_msa(
-                msa_seqs, msa_dels, self.max_msa_seqs, self.rng, self.training,
-                min_seqs=self.min_msa_seqs,
-            )
-
-            S, L_msa = msa_seqs.shape
+            L_msa = msa_seqs.shape[1]
 
             # Align MSA to cropped protein positions:
             # The MSA has L_msa residues (full chain length).
@@ -699,24 +703,37 @@ class DeepFoldDataset(Dataset):
             # Clamp out-of-range (shouldn't happen but be safe)
             local_idx = np.clip(local_idx, 0, L_msa - 1)
 
-            # Build full (S, N_prot) MSA — fill this chain's columns, leave
-            # other chains' columns as gap token (index 1)
-            N_prot = int(msa_mask.sum())
-            msa_crop = np.full((S, N_prot), 1, dtype=np.int64)  # gap token
-            del_crop = np.zeros((S, N_prot), dtype=np.float32)
-
             # Find positions of this chain within the protein-masked tokens
+            N_prot = int(msa_mask.sum())
             prot_positions = np.where(msa_mask)[0]
             chain_positions = np.where(this_chain_mask)[0]
-            # Map chain_positions to their index within prot_positions
             prot_local = np.searchsorted(prot_positions, chain_positions)
 
-            msa_crop[:, prot_local] = msa_seqs[:, local_idx]
-            del_crop[:, prot_local] = msa_dels[:, local_idx]
+            # Full MSA crop (for profile/del_mean — computed before subsampling)
+            S_full = msa_seqs.shape[0]
+            full_msa_crop = np.full((S_full, N_prot), 1, dtype=np.int64)
+            full_del_crop = np.zeros((S_full, N_prot), dtype=np.float32)
+            full_msa_crop[:, prot_local] = msa_seqs[:, local_idx]
+            full_del_crop[:, prot_local] = msa_dels[:, local_idx]
 
-            return msa_crop, del_crop
+            # Produce max_msa_cycles independent subsamplings
+            msa_crops, del_crops = [], []
+            for _ in range(self.max_msa_cycles):
+                sub_seqs, sub_dels = subsample_msa(
+                    msa_seqs, msa_dels, self.max_msa_seqs, self.rng,
+                    self.training, min_seqs=self.min_msa_seqs,
+                )
+                S = sub_seqs.shape[0]
+                crop = np.full((S, N_prot), 1, dtype=np.int64)
+                dcrop = np.zeros((S, N_prot), dtype=np.float32)
+                crop[:, prot_local] = sub_seqs[:, local_idx]
+                dcrop[:, prot_local] = sub_dels[:, local_idx]
+                msa_crops.append(crop)
+                del_crops.append(dcrop)
 
-        return None, None
+            return msa_crops, del_crops, full_msa_crop, full_del_crop
+
+        return None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -764,16 +781,15 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         collated[key] = _pad_and_stack(values, pad_value=pad_value)
 
     # Generate msa_pad_mask if msa_feat is present and batched
-    if "msa_feat" in collated and collated["msa_feat"].ndim == 4:
-        # msa_feat shape: (B, S, N_prot, 34) — build mask (B, S, N_prot)
-        # where 1.0 = real MSA position, 0.0 = padding
+    # msa_feat: (B, C, S, N_msa, 34) — mask is (B, N_msa) for protein position padding
+    if "msa_feat" in collated and collated["msa_feat"].ndim == 5:
         B = len(batch)
-        msa_shapes = [b["msa_feat"].shape for b in batch]  # each (S_i, N_prot_i, 34)
-        max_S = max(s[0] for s in msa_shapes)
-        max_N_prot = max(s[1] for s in msa_shapes)
-        msa_mask = torch.zeros(B, max_S, max_N_prot, dtype=torch.float32)
-        for i, s in enumerate(msa_shapes):
-            msa_mask[i, : s[0], : s[1]] = 1.0
+        # N_msa dimension is -2 in each sample's (C, S, N_msa, 34)
+        msa_n_dims = [b["msa_feat"].shape[-2] for b in batch]
+        max_N_msa = max(msa_n_dims)
+        msa_mask = torch.zeros(B, max_N_msa, dtype=torch.float32)
+        for i, n in enumerate(msa_n_dims):
+            msa_mask[i, :n] = 1.0
         collated["msa_pad_mask"] = msa_mask
 
     return collated

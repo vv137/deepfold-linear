@@ -116,8 +116,6 @@ def _log_extra(model, step, wandb):
     ).detach().cpu().numpy()
     # pos_bias: (n_layers, H, 68)
     pos_map = torch.stack([b.pos_bias.weight for b in blocks]).detach().cpu().numpy()
-    # alpha_coevol: (H_res,) — single vector (v5.2)
-    alpha = raw.trunk.msa_module.alpha_coevol.detach().cpu().numpy()
 
     # ---- Summary scalars (cheap trend lines) ----
     wandb.log({
@@ -125,7 +123,6 @@ def _log_extra(model, step, wandb):
         "params/gamma_abs_max": float(np.abs(gamma_map).max()),
         "params/w_dist_mean": float(wdist_map.mean()),
         "params/w_dist_max": float(wdist_map.max()),
-        "params/alpha_coevol_abs_max": float(np.abs(alpha).max()),
         "params/pos_bias_abs_max": float(np.abs(pos_map).max()),
     }, step=step)
 
@@ -141,16 +138,6 @@ def _log_extra(model, step, wandb):
                    cmap="viridis")
     wandb.log({"heatmap/w_dist": wandb.Image(fig)}, step=step)
     plt.close(fig)
-
-    # alpha_coevol: (H_res,) — bar chart per head
-    fig_a, ax_a = plt.subplots(figsize=(6, 3), layout="constrained")
-    ax_a.bar(range(len(alpha)), alpha)
-    ax_a.set_xlabel("Head")
-    ax_a.set_ylabel("α_coevol")
-    ax_a.set_title(f"α_coevol — step {step}")
-    ax_a.axhline(0, color="gray", linewidth=0.5)
-    wandb.log({"heatmap/alpha_coevol": wandb.Image(fig_a)}, step=step)
-    plt.close(fig_a)
 
     # trunk pos_bias: per-head heatmap (n_layers, 68) × n_heads
     n_heads = pos_map.shape[1]
@@ -511,6 +498,7 @@ def main():
         max_msa_seqs=cfg.msa.max_depth,
         min_msa_seqs=cfg.msa.min_depth,
         msa_dir=args.msa_dir,
+        max_msa_cycles=cfg.model.max_cycles,
         training=True,
         seed=seed,
     )

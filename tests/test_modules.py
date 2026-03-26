@@ -20,11 +20,11 @@ class TestMSABlock:
         S, N_prot, N = 4, 8, 8
         m = torch.randn(S, N_prot, 16)
         h_res = torch.randn(N, 64)
-        protein_mask = torch.ones(N, dtype=torch.bool)
+        msa_token_mask = torch.ones(N, dtype=torch.bool)
         pos_bias = torch.zeros(4, N_prot, N_prot)
 
         m_out, h_out, c_bar = block(
-            m, h_res, protein_mask, pos_bias, training=False
+            m, h_res, msa_token_mask, pos_bias, training=False
         )
 
         assert m_out.shape == (S, N_prot, 16)

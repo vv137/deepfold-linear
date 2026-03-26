@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold.model.msa import MSAModule
+from deepfold.model.primitives import zero_init_linear
 from deepfold.model.trunk_block import TokenUOTBlock
 from deepfold.model.position_encoding import compute_bins
 from deepfold.model.input_embedding import (
@@ -62,7 +63,12 @@ class Trunk(nn.Module):
             ]
         )
 
-        # w_dist and pos_bias are per-block inside TokenUOTBlock
+        # Shared marginal projections — per-block mu/nu from current h_res
+        # LN stabilizes input scale across 48 blocks of varying depth
+        # bias=False after LN (SPEC §0); zero-init weight: uniform marginals at start
+        self.ln_mu = nn.LayerNorm(d_model)
+        self.mu_proj = nn.Linear(d_model, h_res, bias=False)
+        self.nu_proj = nn.Linear(d_model, h_res, bias=False)
 
     def forward(
         self,
@@ -78,7 +84,7 @@ class Trunk(nn.Module):
         chain_id: torch.Tensor,
         global_idx: torch.Tensor,
         bond_matrix: torch.Tensor,
-        protein_mask: torch.Tensor,
+        msa_token_mask: torch.Tensor,
         token_pad_mask: torch.Tensor | None = None,
         msa_pad_mask: torch.Tensor | None = None,
         num_cycles: int = 1,
@@ -97,7 +103,7 @@ class Trunk(nn.Module):
             chain_id:       (N,) or (B, N) int
             global_idx:     (N,) or (B, N) int
             bond_matrix:    (N, N) or (B, N, N) bool
-            protein_mask:   (N,) or (B, N) bool
+            msa_token_mask:   (N,) or (B, N) bool
             token_pad_mask: (B, N) bool/float or None (1=real, 0=pad)
             msa_pad_mask:   (B, N_prot) bool/float or None (1=real, 0=pad)
             num_cycles:     int, number of recycling cycles to run.
@@ -123,7 +129,7 @@ class Trunk(nn.Module):
             chain_id = chain_id.unsqueeze(0)
             global_idx = global_idx.unsqueeze(0)
             bond_matrix = bond_matrix.unsqueeze(0)
-            protein_mask = protein_mask.unsqueeze(0)
+            msa_token_mask = msa_token_mask.unsqueeze(0)
 
         device = token_type.device
         B, N = token_type.shape
@@ -138,7 +144,7 @@ class Trunk(nn.Module):
 
         # ---- Input embedding (SPEC §3) ----
         h_res = self.token_embed(token_type, profile, del_mean, has_msa)  # (B, N, 512)
-        m = self.msa_embed(msa_feat)  # (B, S, N_prot, 64)
+        # msa_feat: (B, C, S, N_prot, 34) — per-cycle MSA, embedded inside cycle loop
 
         # Atom-to-token encoder (runs once, SPEC §3.5)
         # Per-sample loop: atom encoder uses scatter_mean with sample-specific indices
@@ -151,11 +157,6 @@ class Trunk(nn.Module):
         )  # (B, N, d_model)
         h_res = h_res + atom_agg
 
-        # Initial marginals — uniform over real tokens, zero for pad
-        uniform = (token_pad_mask_f / mask_sum).unsqueeze(1)  # (B, 1, N)
-        mu = uniform.expand(B, self.h_res, N).clone()
-        nu = uniform.expand(B, self.h_res, N).clone()
-
         # Initial coordinates: randn * sigma_data, centered per sample (SPEC §5.2)
         x_res = torch.randn(B, N, 3, device=device) * self.sigma_data * mask_3d
         x_res = x_res - (x_res * mask_3d).sum(dim=1, keepdim=True) / mask_sum.unsqueeze(
@@ -165,10 +166,11 @@ class Trunk(nn.Module):
 
         # Precompute position bins
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)  # (B, N, N)
-        N_prot = m.shape[2]
+        # msa_feat: (B, C, S, N_prot, 34) or (C, S, N_prot, 34)
+        N_prot = msa_feat.shape[-2]
         if N_prot > 0:
             msa_bins = _compute_msa_bins_batched(
-                chain_id, global_idx, bond_matrix, protein_mask, N_prot
+                chain_id, global_idx, bond_matrix, msa_token_mask, N_prot
             )
         else:
             msa_bins = torch.zeros(B, 0, 0, device=device, dtype=torch.long)
@@ -181,49 +183,48 @@ class Trunk(nn.Module):
         for cycle in range(num_cycles):
             is_last = cycle == num_cycles - 1
 
-            # ---- MSA module: 4 blocks + marginal update (SPEC §6, v5.2) ----
+            # ---- Per-cycle MSA embedding (fresh each cycle) ----
+            n_msa_cycles = msa_feat.shape[-4]  # C dimension
+            cycle_msa_feat = msa_feat[:, cycle % n_msa_cycles]  # (B, S, N_prot, 34)
+            m = self.msa_embed(cycle_msa_feat)  # (B, S, N_prot, 64)
+
+            # ---- MSA module: 4 blocks + coevol bias (SPEC §6) ----
             if is_last:
-                m, h_res, mu_new, nu_new = self.msa_module(
+                m, h_res, coevol_bias = self.msa_module(
                     m,
                     h_res,
-                    protein_mask,
+                    msa_token_mask,
                     msa_bins,
                     msa_pad_mask=msa_pad_mask,
                     training=self.training,
                 )
             else:
                 with torch.no_grad():
-                    m, h_res, mu_new, nu_new = self.msa_module(
+                    m, h_res, coevol_bias = self.msa_module(
                         m,
                         h_res,
-                        protein_mask,
+                        msa_token_mask,
                         msa_bins,
                         msa_pad_mask=msa_pad_mask,
                         training=self.training,
                     )
 
-            # Marginal carry: log-space geometric blend (SPEC §5.2)
-            if cycle > 0:
-                mu = F.softmax(
-                    torch.log(mu_new + 1e-8) + 0.5 * torch.log(mu + 1e-8), dim=-1
-                )
-                nu = F.softmax(
-                    torch.log(nu_new + 1e-8) + 0.5 * torch.log(nu + 1e-8), dim=-1
-                )
-            else:
-                mu, nu = mu_new, nu_new
-
-            # Zero out padded positions in marginals
-            mu = mu * token_pad_mask_f.unsqueeze(1)
-            nu = nu * token_pad_mask_f.unsqueeze(1)
-
             # ---- Token UOT+EGNN blocks x48 (SPEC §8) ----
+            # Per-block marginals from current h_res + coevol_bias
             log_u_prev = log_u_carry
             log_v_prev = log_v_carry
 
             for block in self.uot_blocks:
+                # Compute per-block marginals from current h_res
+                h_n = self.ln_mu(h_res)
+                mu_logit = self.mu_proj(h_n).permute(0, 2, 1)  # (B, H, N)
+                nu_logit = self.nu_proj(h_n).permute(0, 2, 1)  # (B, H, N)
+                mu = F.softmax(mu_logit + coevol_bias, dim=-1)
+                nu = F.softmax(nu_logit + coevol_bias, dim=-1)
+                mu = mu * token_pad_mask_f.unsqueeze(1)
+                nu = nu * token_pad_mask_f.unsqueeze(1)
+
                 if is_last:
-                    # checkpoint_wrapper handles activation checkpointing
                     h_res, x_res, log_u_prev, log_v_prev = block(
                         h_res,
                         x_res,
@@ -255,8 +256,6 @@ class Trunk(nn.Module):
             if not is_last:
                 h_res = h_res.detach()
                 x_res = x_res.detach()
-                mu = mu.detach()
-                nu = nu.detach()
                 log_u_carry = log_u_prev.detach() if log_u_prev is not None else None
                 log_v_carry = log_v_prev.detach() if log_v_prev is not None else None
             else:
@@ -272,7 +271,7 @@ def _compute_msa_bins_batched(
     chain_id: torch.Tensor,
     global_idx: torch.Tensor,
     bond_matrix: torch.Tensor,
-    protein_mask: torch.Tensor,
+    msa_token_mask: torch.Tensor,
     N_prot: int,
 ) -> torch.Tensor:
     """Compute MSA position bins for protein subset, batched.
@@ -281,7 +280,7 @@ def _compute_msa_bins_batched(
         chain_id: (B, N)
         global_idx: (B, N)
         bond_matrix: (B, N, N)
-        protein_mask: (B, N) bool
+        msa_token_mask: (B, N) bool
         N_prot: int
 
     Returns:
@@ -291,7 +290,7 @@ def _compute_msa_bins_batched(
 
     B, N = chain_id.shape
 
-    prot_indices = _build_protein_indices(protein_mask, N_prot)  # (B, N_prot)
+    prot_indices = _build_protein_indices(msa_token_mask, N_prot)  # (B, N_prot)
 
     # Gather protein chain_id and global_idx
     prot_chain = torch.gather(chain_id, 1, prot_indices)  # (B, N_prot)

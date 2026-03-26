@@ -309,8 +309,8 @@ class ProteinFeatures:
     bond_matrix : Tensor
         (N, N) bool — covalent bond adjacency at token level.
         NOTE: dense for reference impl; will be sparse in production.
-    protein_mask : Tensor
-        (N,) bool — True for protein tokens (used to index MSA).
+    msa_token_mask : Tensor
+        (N,) bool — True for tokens with MSA data (protein/RNA).
 
     Attributes — Training targets
     ------------------------------
@@ -339,7 +339,7 @@ class ProteinFeatures:
     chain_id: Tensor  # (N,)
     global_idx: Tensor  # (N,)
     bond_matrix: Tensor  # (N, N) bool
-    protein_mask: Tensor  # (N,) bool
+    msa_token_mask: Tensor  # (N,) bool
 
     # Training targets (optional)
     x_atom_true: Optional[Tensor] = None  # (N_atom, 3)

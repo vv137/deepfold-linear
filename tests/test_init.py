@@ -43,12 +43,6 @@ class TestZeroInit:
             if "w_dist_raw" in name:
                 assert (p == 0).all(), f"{name} should be zero (alg_sigmoid midpoint)"
 
-    def test_alpha_coevol_zero(self):
-        model = _make_small_model()
-        for name, p in model.named_parameters():
-            if "alpha_coevol" in name:
-                assert (p == 0).all(), f"{name} should be zero"
-
     def test_position_bias_zero(self):
         model = _make_small_model()
         for name, p in model.named_parameters():
