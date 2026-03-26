@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 def _run_validation(raw_model, ema, val_loader, device, max_batches):
     """Run validation epoch with EMA weights, return averaged metrics or None."""
+    gc.collect()
+    torch.cuda.empty_cache()
     ema.apply(raw_model)
     metrics_sum = {
         k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
