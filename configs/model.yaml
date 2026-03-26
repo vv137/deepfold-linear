@@ -29,6 +29,7 @@ data:
 
 logging:
   save_every: 100 # checkpoint every N steps
+  save_every_minutes: 60 # time-based checkpoint interval (0 = disabled)
   log_every: 1 # console/wandb log every N steps
   extra_log_every: 50 # expensive logs (heatmaps) every N steps
 

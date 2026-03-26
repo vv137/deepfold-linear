@@ -5,6 +5,7 @@ import gc
 import logging
 import multiprocessing
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -627,6 +628,7 @@ def main():
     train_iter = iter(train_loader)
     prev_crop = get_crop_size(start_step)
     oom_count = 0
+    last_ckpt_time = time.monotonic()
 
     for step in range(start_step + 1, cfg.training.total_steps + 1):
         # Update crop size when schedule changes
@@ -720,10 +722,24 @@ def main():
                 _log_extra(model, step, wandb)
 
         # Checkpointing (before validation — save consistent state)
-        if step % cfg.logging.save_every == 0:
+        # Rank 0 decides; broadcast to all ranks to avoid DDP deadlock
+        # (time.monotonic() can differ across processes)
+        now = time.monotonic()
+        step_trigger = step % cfg.logging.save_every == 0
+        time_trigger = (
+            cfg.logging.save_every_minutes > 0
+            and (now - last_ckpt_time) >= cfg.logging.save_every_minutes * 60
+        )
+        should_save = step_trigger or time_trigger
+        if use_ddp:
+            _save_flag = torch.tensor([int(should_save)], device=device)
+            dist.broadcast(_save_flag, src=0)
+            should_save = _save_flag.item() > 0
+        if should_save:
+            last_ckpt_time = now
             if use_ddp:
                 dist.barrier()
-        if rank0 and step % cfg.logging.save_every == 0:
+        if rank0 and should_save:
             raw_model = model.module if use_ddp else model
             path = os.path.join(checkpoint_dir, f"step_{step}.pt")
             ckpt_data = {

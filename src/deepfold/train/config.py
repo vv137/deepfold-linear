@@ -39,6 +39,7 @@ class DataConfig:
 @dataclass
 class LoggingConfig:
     save_every: int = 10_000
+    save_every_minutes: int = 60  # time-based checkpoint interval (0 = disabled)
     log_every: int = 100
     extra_log_every: int = 1_000
 
