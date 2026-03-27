@@ -172,11 +172,11 @@ class TokenUOTBlock(nn.Module):
         h = h + h_update
 
         # ---- EGNN x_res update (equivariant, SPEC §8) ----
-        # Input-dependent gamma gate: tanh(W @ LN(h) + b) → (B, N, H)
+        # Input-dependent gamma gate: mean over heads for scale-invariance to H
         gamma_gate = torch.tanh(self.w_gamma(self.ln_gamma(h)))  # (B, N, H)
         self._last_gamma_gate = gamma_gate.detach()  # for logging
         delta = x_res.unsqueeze(1).float() - x_centroid  # (B, H, N, 3)
-        x_update = torch.einsum("bnh,bhnc->bnc", gamma_gate, delta)  # (B, N, 3)
+        x_update = torch.einsum("bnh,bhnc->bnc", gamma_gate, delta) / self.n_heads  # (B, N, 3)
         x_update = x_update * mask.unsqueeze(-1)
         x_res = x_res + x_update.to(x_res.dtype)
 

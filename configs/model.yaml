@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v5.5)
+# DeepFold-Linear model configuration (SPEC v5.6)
 
 model:
   d_model: 512

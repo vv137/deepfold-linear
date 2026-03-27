@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v5.5
+# Protein Complex Structure Prediction Model: Full Design Specification v5.6
 
 ---
 
@@ -824,7 +824,7 @@ class TokenUOTBlock(nn.Module):
         # Transport-weighted centroid per head (fused in Flash kernel with V aggregation)
         x_centroid = einsum('hnm,mc->hnc', T_norm, x_res)        # (H, N, 3)
         delta = x_res[None] - x_centroid                          # (H, N, 3)
-        x_res = x_res + einsum('nh,hnc->nc', gamma_gate, delta)  # (N, 3)
+        x_res = x_res + einsum('nh,hnc->nc', gamma_gate, delta) / H  # (N, 3) mean over heads
         # NOTE: No per-block re-centering. EGNN is exactly translation-equivariant
         # (T_norm is row-stochastic). Re-centering done once per cycle (§5.2)
         # to handle float32 drift only.
@@ -856,6 +856,8 @@ The update is: `x_new = x + Σ_h γ_h(h_i) · (x_i − T_norm^(h) @ x)`, where `
 Unlike a fixed scalar γ per head, the gamma gate `tanh(W_gamma @ LN(h) + b)` is **residue-specific**: each token i computes its own per-head step size from its representation h_i. This allows the same head to attract some residues while repelling others within a single block.
 
 **Initialization**: W_gamma = 0 (zeros), bias ~ N(0, 1e-4). At init, `γ(h_i) = tanh(0 + b) ≈ b`, recovering the original per-head scalar behavior. The input-dependent component activates as W_gamma grows from zero.
+
+**Scaling**: The multi-head combination is averaged (`/ H`), making the update scale-invariant to the number of heads. At init, effective step ≈ `mean(tanh(b)) / H ≈ b̄` — same order as the original scalar γ.
 
 **Parameters**: ~9.2K per block (LN: 1024 + W_gamma: 512×16 = 8192 + bias: 16), ×48 blocks ≈ 442K total (0.1% of model).
 
