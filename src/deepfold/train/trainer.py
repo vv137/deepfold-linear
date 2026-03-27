@@ -12,6 +12,27 @@ from deepfold.data.crop import get_crop_size  # noqa: F401 — re-export
 logger = logging.getLogger(__name__)
 
 
+def _log_grad_spike(model: nn.Module, step: int, grad_norm: float) -> None:
+    """Log per-module grad norms when a spike is detected."""
+    raw = model.module if hasattr(model, "module") else model
+    module_norms = {}
+    for name, param in raw.named_parameters():
+        if param.grad is None:
+            continue
+        # Group by top-level module: trunk.uot_blocks.3.w_q → trunk
+        parts = name.split(".")
+        key = parts[0] if len(parts) > 1 else name
+        g = param.grad.norm().item()
+        if key not in module_norms or g > module_norms[key]:
+            module_norms[key] = (g, name)
+    top = sorted(module_norms.items(), key=lambda x: -x[1][0])[:5]
+    lines = [f"  {mod}: max_grad={gn:.1f} ({pname})" for mod, (gn, pname) in top]
+    logger.warning(
+        "Grad spike at step %d (norm=%.1f). Top modules:\n%s",
+        step, grad_norm, "\n".join(lines),
+    )
+
+
 # ============================================================================
 # EMA
 # ============================================================================
@@ -83,7 +104,7 @@ def build_optimizer(
     _POST_LN_NAMES = {"w_q", "w_k", "w_v", "w_g", "w_o", "swiglu"}
     # Bounded, gating, or position bias — no decay
     # Note: gamma is handled by the explicit check above, not here
-    _NO_DECAY_SPECIAL = {"w_dist_raw", "pos_bias"}
+    _NO_DECAY_SPECIAL = {"w_dist_raw"}
 
     decay_params = []
     no_decay_params = []
@@ -177,6 +198,8 @@ def train_step(
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_grad_norm
                 ).item()
+                if grad_norm > max_grad_norm * 10:
+                    _log_grad_spike(model, step, grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -189,6 +212,8 @@ def train_step(
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_grad_norm
                 ).item()
+                if grad_norm > max_grad_norm * 10:
+                    _log_grad_spike(model, step, grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
                 if scheduler is not None:

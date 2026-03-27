@@ -319,8 +319,11 @@ def log_distance_mse(
 
     for i0 in range(0, N, chunk):
         ie = min(i0 + chunk, N)
-        d_pred = torch.cdist(x_pred_f[:, i0:ie], x_pred_f)  # (B, chunk, N)
-        d_true = torch.cdist(x_true_f[:, i0:ie], x_true_f)  # (B, chunk, N)
+        # Add eps before sqrt inside cdist to avoid 0/0 in backward
+        diff_pred = x_pred_f[:, i0:ie, None, :] - x_pred_f[:, None, :, :]
+        d_pred = (diff_pred * diff_pred).sum(-1).add(1e-8).sqrt()
+        diff_true = x_true_f[:, i0:ie, None, :] - x_true_f[:, None, :, :]
+        d_true = (diff_true * diff_true).sum(-1).add(1e-8).sqrt()
 
         log_pred = torch.log1p(d_pred)
         log_true = torch.log1p(d_true)
