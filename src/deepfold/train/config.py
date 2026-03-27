@@ -45,12 +45,6 @@ class LoggingConfig:
 
 
 @dataclass
-class InitConfig:
-    gamma_std: float = 1e-4       # EGNN gamma N(0, std) noise init
-    adaln_gate_bias: float = -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
-
-
-@dataclass
 class TrainingConfig:
     lr: float = 1e-3           # max_lr (peak after warmup)
     base_lr: float = 0.0       # starting LR for warmup
@@ -85,17 +79,19 @@ class ValidationConfig:
 
 @dataclass
 class LossWeights:
-    w_diff: float = 1.0
-    w_lddt: float = 1.0
-    w_disto: float = 0.2
-    w_trunk_coord: float = 0.5
+    w_diff: float | None = 1.0
+    w_lddt: float | None = 1.0
+    w_disto: float | None = 0.2
+    w_trunk_slddt: float | None = None
+    w_trunk_logmse: float | None = 0.1
 
-    def to_dict(self) -> dict[str, float]:
+    def to_dict(self) -> dict[str, float | None]:
         return {
             "w_diff": self.w_diff,
             "w_lddt": self.w_lddt,
             "w_disto": self.w_disto,
-            "w_trunk_coord": self.w_trunk_coord,
+            "w_trunk_slddt": self.w_trunk_slddt,
+            "w_trunk_logmse": self.w_trunk_logmse,
         }
 
 
@@ -144,7 +140,6 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    init: InitConfig = field(default_factory=InitConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     loss_weights: LossWeights = field(default_factory=LossWeights)
@@ -180,8 +175,6 @@ def load_config(path: Optional[str | Path] = None) -> Config:
         _apply_dict(cfg.data, raw["data"])
     if "logging" in raw:
         _apply_dict(cfg.logging, raw["logging"])
-    if "init" in raw:
-        _apply_dict(cfg.init, raw["init"])
     if "training" in raw:
         _apply_dict(cfg.training, raw["training"])
     if "validation" in raw:

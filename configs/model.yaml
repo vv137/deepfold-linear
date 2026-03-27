@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v5.3)
+# DeepFold-Linear model configuration (SPEC v5.5)
 
 model:
   d_model: 512
@@ -30,13 +30,13 @@ data:
   seed: 42
 
 logging:
-  save_every: 100 # checkpoint every N steps
+  save_every: 200 # checkpoint every N steps
   save_every_minutes: 60 # time-based checkpoint interval (0 = disabled)
   log_every: 1 # console/wandb log every N steps
   extra_log_every: 50 # expensive logs (heatmaps) every N steps
 
 training:
-  batch_size: 1
+  batch_size: 4
   # AF3 LR schedule: warmup → plateau → exponential decay
   lr: 1.0e-3 # max_lr (peak after warmup)
   base_lr: 0.0 # starting LR for warmup
@@ -50,7 +50,7 @@ training:
   ema_decay: 0.999
   ema_warmup_steps: 1000
   max_grad_norm: 10.0
-  grad_accum_steps: 128
+  grad_accum_steps: 4
   crop_schedule:
     - [0, 256]
     # - [0, 256]
@@ -59,15 +59,16 @@ training:
     # - [500000, 768]
 
 validation:
-  val_every: 1000 # validate every N steps
+  val_every: 200 # validate every N steps
   val_batches: 32 # max batches per validation run (0 = all)
-  validate_first: false # run full validation before training starts
+  validate_first: true # run full validation before training starts
 
 loss_weights:
   w_diff: 1.0
   w_lddt: 1.0
   w_disto: 0.2
-  w_trunk_coord: 0.5
+  w_trunk_slddt: null # smooth LDDT on x_res (null = disabled)
+  w_trunk_logmse: 0.1 # log-distance MSE on x_res
 
 sampler:
   type: cluster # "cluster" or "random"
@@ -88,17 +89,12 @@ diffusion:
   inference_steps: 200
 
 wandb:
-  enabled: false
+  enabled: true
   project: deepfold-linear
   entity: null # your wandb team/user; null = default
   name: null # run name; null = auto-generated
-  tags: []
+  tags: ["v5.5"]
   log_every: 1 # log every N optimizer steps
-
-init:
-  gamma_std: 1.0e-4 # EGNN gamma N(0, std) noise init for symmetry breaking
-  adaln_gate_bias: -2.0 # AdaLN-Zero gate bias; sigmoid(-2.0) ≈ 0.12
-  # w_dist_raw is always zero-init (alg_sigmoid midpoint = 0.5), not configurable
 
 sinkhorn:
   lambda: 1.0

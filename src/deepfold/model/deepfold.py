@@ -25,6 +25,7 @@ from deepfold.model.losses import (
     DistogramLoss,
     _atom_type_weights,
     edm_diffusion_loss,
+    log_distance_mse,
     smooth_lddt,
     total_loss,
 )
@@ -248,6 +249,17 @@ class DeepFoldLinear(nn.Module):
             # Each diffusion call is checkpointed individually to bound peak
             # memory. No DDP issue: the loop runs in forward, checkpoint
             # replays inside backward but DDP hooks are already resolved.
+            # Explicit None in loss_weights disables that term.
+            # Missing keys fall through to total_loss defaults.
+            _w = self.loss_weights
+            zero = torch.tensor(0.0, device=device)
+
+            def _enabled(key):
+                return key not in _w or _w[key] is not None
+
+            need_diff = _enabled("w_diff")
+            need_lddt = _enabled("w_lddt")
+
             l_diff_parts = []
             l_lddt_parts = []
 
@@ -278,50 +290,66 @@ class DeepFoldLinear(nn.Module):
                     use_reentrant=False,
                 )
 
-                l_diff_parts.append(
-                    edm_diffusion_loss(
-                        x_pred_i,
-                        x_true_i,
-                        sigma_i,
-                        resolved_mask=atom_resolved_mask,
-                        atom_weights=atom_weights,
+                if need_diff:
+                    l_diff_parts.append(
+                        edm_diffusion_loss(
+                            x_pred_i,
+                            x_true_i,
+                            sigma_i,
+                            resolved_mask=atom_resolved_mask,
+                            atom_weights=atom_weights,
+                        )
                     )
-                )
-                l_lddt_parts.append(
-                    smooth_lddt(
-                        x_pred_i,
-                        x_true_i,
-                        resolved_mask=atom_resolved_mask,
-                        is_nucleotide=atom_is_nuc,
+                if need_lddt:
+                    l_lddt_parts.append(
+                        smooth_lddt(
+                            x_pred_i,
+                            x_true_i,
+                            resolved_mask=atom_resolved_mask,
+                            is_nucleotide=atom_is_nuc,
+                        )
                     )
-                )
 
             # Average over M samples
-            l_diff = torch.stack(l_diff_parts).mean()
-            l_lddt = torch.stack(l_lddt_parts).mean()
+            l_diff = torch.stack(l_diff_parts).mean() if l_diff_parts else zero
+            l_lddt = torch.stack(l_lddt_parts).mean() if l_lddt_parts else zero
 
-            # Trunk-only losses (not multiplied — computed once)
-            if is_batched:
-                # Batched: use token_pad_mask for distogram
-                l_disto = self.distogram_loss(
-                    h_res, x_res_true, token_pad_mask=token_pad_mask
-                )
-            else:
-                # Unbatched: build (N, N) pair mask from resolved mask
-                if token_resolved_mask is not None:
-                    disto_mask = (
-                        token_resolved_mask[:, None] * token_resolved_mask[None, :]
+            # Distogram (trunk-only, computed once)
+            if _enabled("w_disto"):
+                if is_batched:
+                    l_disto = self.distogram_loss(
+                        h_res, x_res_true, token_pad_mask=token_pad_mask
                     )
                 else:
-                    disto_mask = None
-                l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
+                    if token_resolved_mask is not None:
+                        disto_mask = (
+                            token_resolved_mask[:, None] * token_resolved_mask[None, :]
+                        )
+                    else:
+                        disto_mask = None
+                    l_disto = self.distogram_loss(h_res, x_res_true, valid_mask=disto_mask)
+            else:
+                l_disto = zero
 
-            l_trunk_coord = smooth_lddt(
-                x_res, x_res_true, resolved_mask=token_resolved_mask,
-                is_nucleotide=token_is_nuc,
-            )
+            # Trunk coordinate losses — skip if weight is None
+            if _enabled("w_trunk_slddt"):
+                l_trunk_slddt = smooth_lddt(
+                    x_res, x_res_true, resolved_mask=token_resolved_mask,
+                    is_nucleotide=token_is_nuc,
+                )
+            else:
+                l_trunk_slddt = zero
+
+            if _enabled("w_trunk_logmse"):
+                l_trunk_logmse = log_distance_mse(
+                    x_res, x_res_true, resolved_mask=token_resolved_mask,
+                )
+            else:
+                l_trunk_logmse = zero
+
             l_total = total_loss(
-                l_diff, l_lddt, l_disto, l_trunk_coord, **self.loss_weights
+                l_diff, l_lddt, l_disto, l_trunk_slddt, l_trunk_logmse,
+                **self.loss_weights,
             )
 
             result.update(
@@ -331,7 +359,8 @@ class DeepFoldLinear(nn.Module):
                     "l_diff": l_diff,
                     "l_lddt": l_lddt,
                     "l_disto": l_disto,
-                    "l_trunk_coord": l_trunk_coord,
+                    "l_trunk_slddt": l_trunk_slddt,
+                    "l_trunk_logmse": l_trunk_logmse,
                 }
             )
 

@@ -68,8 +68,8 @@ class TestTokenUOTBlock:
         N, H = 8, 4
         block = TokenUOTBlock(d_model=64, n_heads=H, block_idx=0)
         block.eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
-        # Set nonzero gamma to test equivariance
-        block.gamma.data = torch.randn(H) * 0.1
+        # Set nonzero gamma bias to test equivariance
+        block.w_gamma.bias.data = torch.randn(H) * 0.1
 
         h = torch.randn(N, 64)
         mu = torch.ones(H, N) / N

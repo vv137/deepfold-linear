@@ -42,8 +42,10 @@ class TokenUOTBlock(nn.Module):
         self.w_g = nn.Linear(d_model, d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
 
-        # EGNN: per-head signed geometry step size — noise init (SPEC §8.2)
-        self.gamma = nn.Parameter(torch.randn(n_heads) * 1e-4)
+        # EGNN: input-dependent per-head geometry gate (SPEC §8.2)
+        # bias=True exception: bias serves as per-head "base gamma" offset.
+        self.ln_gamma = nn.LayerNorm(d_model)
+        self.w_gamma = nn.Linear(d_model, n_heads, bias=True)
 
         # Per-layer position bias (SPEC §4.3)
         self.pos_bias = PositionBias(n_heads, 68)
@@ -170,8 +172,11 @@ class TokenUOTBlock(nn.Module):
         h = h + h_update
 
         # ---- EGNN x_res update (equivariant, SPEC §8) ----
+        # Input-dependent gamma gate: tanh(W @ LN(h) + b) → (B, N, H)
+        gamma_gate = torch.tanh(self.w_gamma(self.ln_gamma(h)))  # (B, N, H)
+        self._last_gamma_gate = gamma_gate.detach()  # for logging
         delta = x_res.unsqueeze(1).float() - x_centroid  # (B, H, N, 3)
-        x_update = torch.einsum("h,bhnc->bnc", self.gamma.tanh() / self.n_heads, delta)  # (B, N, 3)
+        x_update = torch.einsum("bnh,bhnc->bnc", gamma_gate, delta)  # (B, N, 3)
         x_update = x_update * mask.unsqueeze(-1)
         x_res = x_res + x_update.to(x_res.dtype)
 

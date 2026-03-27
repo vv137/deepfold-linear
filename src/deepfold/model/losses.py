@@ -12,6 +12,7 @@ from deepfold.model.diffusion import SIGMA_DATA
 
 try:
     from deepfold.model.kernels.distogram_kernel import triton_distogram_loss
+    from deepfold.model.kernels.log_distance_mse_kernel import triton_log_distance_mse
 
     _HAS_TRITON = True
 except ImportError:
@@ -268,6 +269,82 @@ def smooth_lddt(
     return (1.0 - lddt).mean()
 
 
+
+
+# ============================================================================
+# Log-Distance MSE Loss (SPEC §11.2b)
+# ============================================================================
+
+
+def log_distance_mse(
+    x_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    resolved_mask: torch.Tensor | None = None,
+    chunk: int = 256,
+) -> torch.Tensor:
+    """Log-space pairwise distance MSE for trunk coordinate supervision.
+
+    L = mean_{i≠j, valid} [log(d_pred_ij + 1) - log(d_true_ij + 1)]^2
+
+    Soft distance weighting: large-distance errors are compressed by log,
+    providing global topology supervision without hard cutoffs.
+
+    Args:
+        x_pred: (B, N, 3) or (N, 3) predicted token coordinates
+        x_true: (B, N, 3) or (N, 3) ground truth token coordinates
+        resolved_mask: (B, N) or (N,) float, 1=valid 0=pad
+        chunk: tile size for PyTorch fallback (ignored when Triton available)
+    """
+    # Unbatched → batched
+    if x_pred.dim() == 2:
+        result = log_distance_mse(
+            x_pred.unsqueeze(0),
+            x_true.unsqueeze(0),
+            resolved_mask.unsqueeze(0) if resolved_mask is not None else None,
+            chunk,
+        )
+        return result
+
+    # Triton path
+    if _HAS_TRITON and x_pred.is_cuda:
+        return triton_log_distance_mse(x_pred, x_true, mask=resolved_mask)
+
+    # PyTorch fallback — chunked to limit peak memory
+    B, N, _ = x_pred.shape
+    loss_sum = torch.zeros(B, device=x_pred.device, dtype=torch.float32)
+    count = torch.zeros(B, device=x_pred.device, dtype=torch.float32)
+
+    x_pred_f = x_pred.float()
+    x_true_f = x_true.detach().float()
+
+    for i0 in range(0, N, chunk):
+        ie = min(i0 + chunk, N)
+        d_pred = torch.cdist(x_pred_f[:, i0:ie], x_pred_f)  # (B, chunk, N)
+        d_true = torch.cdist(x_true_f[:, i0:ie], x_true_f)  # (B, chunk, N)
+
+        log_pred = torch.log1p(d_pred)
+        log_true = torch.log1p(d_true)
+        sq = (log_pred - log_true) ** 2  # (B, chunk, N)
+
+        # Mask: diagonal exclusion + resolved
+        i_idx = torch.arange(i0, ie, device=x_pred.device)
+        j_idx = torch.arange(N, device=x_pred.device)
+        diag_mask = (i_idx[:, None] != j_idx[None, :])  # (chunk, N)
+
+        if resolved_mask is not None:
+            pair_mask = (
+                resolved_mask[:, i0:ie, None] * resolved_mask[:, None, :]
+            )  # (B, chunk, N)
+            valid = diag_mask.unsqueeze(0) & (pair_mask > 0)
+        else:
+            valid = diag_mask.unsqueeze(0).expand(B, -1, -1)
+
+        valid_f = valid.float()
+        loss_sum += (sq * valid_f).sum(dim=(1, 2))
+        count += valid_f.sum(dim=(1, 2))
+
+    per_batch = loss_sum / count.clamp(min=1.0)
+    return per_batch.mean()
 
 
 # ============================================================================
@@ -534,20 +611,27 @@ def total_loss(
     l_diff: torch.Tensor,
     l_lddt: torch.Tensor,
     l_disto: torch.Tensor,
-    l_trunk_coord: torch.Tensor,
-    w_diff: float = 1.0,
-    w_lddt: float = 1.0,
-    w_disto: float = 0.2,
-    w_trunk_coord: float = 0.5,
+    l_trunk_slddt: torch.Tensor,
+    l_trunk_logmse: torch.Tensor,
+    w_diff: float | None = 1.0,
+    w_lddt: float | None = 1.0,
+    w_disto: float | None = 0.2,
+    w_trunk_slddt: float | None = None,
+    w_trunk_logmse: float | None = 0.1,
 ) -> torch.Tensor:
     """Weighted total loss (SPEC §11.6).
 
-    Default weights: L_diff + L_lddt + 0.2*L_disto + 0.5*L_trunk_coord.
+    Any weight set to None disables that loss term entirely.
     Configurable via loss_weights in model.yaml.
     """
-    return (
-        w_diff * l_diff
-        + w_lddt * l_lddt
-        + w_disto * l_disto
-        + w_trunk_coord * l_trunk_coord
-    )
+    parts = [
+        (w_diff, l_diff),
+        (w_lddt, l_lddt),
+        (w_disto, l_disto),
+        (w_trunk_slddt, l_trunk_slddt),
+        (w_trunk_logmse, l_trunk_logmse),
+    ]
+    active = [(w, l) for w, l in parts if w is not None]
+    if not active:
+        return l_diff * 0.0  # preserve device/dtype, zero gradient
+    return sum(w * l for w, l in active)

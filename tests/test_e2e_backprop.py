@@ -118,7 +118,7 @@ class TestEndToEndBackprop:
         model.train()
 
         outputs = model(**batch)
-        for key in ["loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord"]:
+        for key in ["loss", "l_diff", "l_lddt", "l_disto", "l_trunk_slddt", "l_trunk_logmse"]:
             assert key in outputs, f"Missing loss: {key}"
             assert torch.isfinite(outputs[key]), f"{key} not finite: {outputs[key]}"
 
@@ -188,14 +188,14 @@ class TestEndToEndBackprop:
         )
 
     def test_egnn_gamma_receives_gradient(self):
-        """L_trunk_coord provides gradient to EGNN γ parameters."""
+        """L_trunk_logmse provides gradient to EGNN γ parameters."""
         torch.manual_seed(3)
         model = _make_model()
         batch = _make_batch()
         model.train()
 
         outputs = model(**batch)
-        outputs["l_trunk_coord"].backward()
+        outputs["l_trunk_logmse"].backward()
 
         gamma_grads = []
         for name, p in model.named_parameters():

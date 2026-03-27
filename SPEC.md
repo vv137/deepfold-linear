@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v5.4
+# Protein Complex Structure Prediction Model: Full Design Specification v5.5
 
 ---
 
@@ -67,7 +67,7 @@
 2. **O(N) memory architecture**: No N×N stored matrices. Reference implementation uses O(N²) for co-evolution and distogram; tiled versions planned.
 3. **Low-rank co-evolution aggregation (rank 16)**: 2nd-order co-evolution statistics compressed into single representation via rank-16 outer product; r-dimensional co-evolution profile drives per-head marginal bias; co-evolving positions become UOT hubs through ν marginals.
 4. **Bond-aware position encoding**: 68-bin scheme unifying sequence separation, chain identity, and covalent bonds.
-5. **EGNN coordinate update in UOT blocks**: Transport-weighted centroid displacement with per-head signed γ. SE(3) equivariant by construction — no augmentation in trunk. Coordinates refine across 48 blocks × 3 cycles. Fused into Flash-Sinkhorn kernel at ~10% extra cost.
+5. **EGNN coordinate update in UOT blocks**: Transport-weighted centroid displacement with input-dependent per-head γ gate (residue-specific attraction/repulsion). SE(3) equivariant by construction — no augmentation in trunk. Coordinates refine across 48 blocks × 3 cycles. Fused into Flash-Sinkhorn kernel at ~10% extra cost.
 6. **Geometry-aware UOT**: x_res → metric cost; coordinates improve each block via EGNN → geometry cost becomes increasingly reliable across blocks.
 7. **Unrolled Sinkhorn backward**: Standard autograd through K iterations; exact gradient for actual computation, not theoretical fixed point.
 8. **Transport-weighted average**: Length-invariant, ν_i controls how much other residues attend to position i.
@@ -118,12 +118,12 @@ Input: token_types, MSA (protein-only), bond_matrix, reference conformer
     Token UOT+EGNN blocks × 48:
       Each block:
         UOT attention → h_res update                                 (invariant)
-        EGNN → x_res update: x += Σ_h γ_h · (x − T_norm^h @ x)     (equivariant)
+        EGNN → x_res update: x += Σ_h γ_h(h_i) · (x_i − T_norm^h @ x) (equivariant, input-dependent γ)
       Geometry cost uses latest x_res each block
     Re-center x_res (once per cycle, float32 hygiene)
 
   freeze h_res, x_res
-  L_trunk_coord = smooth_lddt(x_res, x_0)                           direct EGNN supervision
+  L_trunk = log_distance_mse(x_res, x_0) and/or smooth_lddt         direct EGNN supervision
 
 [Diffusion — 200 steps (inference), sampled σ (training)]
   AF3-style augmentation for SE(3).
@@ -416,7 +416,7 @@ The uniform distribution ensures the network trains equally on all cycle counts.
 | no_grad on all but last cycle | Memory: always 52 blocks in graph regardless of cycle count |
 | EGNN updates every UOT block | Coordinates refine continuously (48 updates/cycle) |
 | Re-centering once per cycle | Float32 hygiene; EGNN is exactly translation-equivariant in exact arithmetic |
-| L_trunk_coord on final x_res | Direct gradient to all EGNN γ parameters; fixes dead-gradient on last block |
+| L_trunk on final x_res (log-distance MSE and/or smooth LDDT) | Direct gradient to all EGNN γ gate parameters; fixes dead-gradient on last block |
 | No coordinate embedding into h_res | Geometry enters h_res through UOT cost → T* → attention output |
 | No augmentation | EGNN is SE(3) equivariant by construction |
 | Per-layer marginals | mu_proj/nu_proj on LN(h_res) + coevol_bias; recomputed each block |
@@ -750,8 +750,9 @@ class TokenUOTBlock(nn.Module):
         self.W_G = Lin(d, d, bias=False)
         self.W_O = Lin(d, d, bias=False)
 
-        # EGNN: per-head signed geometry step size
-        self.gamma = nn.Parameter(torch.randn(H) * 1e-4)  # (16,) noise init — breaks symmetry across layers
+        # EGNN: input-dependent per-head geometry gate
+        self.ln_gamma = LayerNorm(d)
+        self.W_gamma = Lin(d, H, bias=True)  # W=zeros, bias~N(0,1e-4); bias=True exception to post-LN convention
 
         # Per-head entropic regularization (fixed, multi-scale transport)
         self.register_buffer('eps', torch.tensor([
@@ -817,12 +818,13 @@ class TokenUOTBlock(nn.Module):
         h = h + self.W_O(o)
 
         # ---- x_res update (equivariant): EGNN ----
+        # Input-dependent gamma gate: tanh(W_gamma(LN(h)) + b) → (N, H) ∈ [-1, 1]
+        # h is invariant → gamma_gate is invariant → update is equivariant
+        gamma_gate = tanh(self.W_gamma(self.ln_gamma(h)))         # (N, H)
         # Transport-weighted centroid per head (fused in Flash kernel with V aggregation)
         x_centroid = einsum('hnm,mc->hnc', T_norm, x_res)        # (H, N, 3)
-        # Relative displacement (equivariant: depends only on relative vectors)
         delta = x_res[None] - x_centroid                          # (H, N, 3)
-        # Multi-head combination: signed γ allows attraction AND repulsion
-        x_res = x_res + einsum('h,hnc->nc', self.gamma, delta)   # (N, 3)
+        x_res = x_res + einsum('nh,hnc->nc', gamma_gate, delta)  # (N, 3)
         # NOTE: No per-block re-centering. EGNN is exactly translation-equivariant
         # (T_norm is row-stochastic). Re-centering done once per cycle (§5.2)
         # to handle float32 drift only.
@@ -838,22 +840,26 @@ class TokenUOTBlock(nn.Module):
 
 ### 8.1 EGNN Coordinate Update: SE(3) Equivariance Proof
 
-The update is: `x_new = x + Σ_h γ_h · (x − T_norm^(h) @ x)`.
+The update is: `x_new = x + Σ_h γ_h(h_i) · (x_i − T_norm^(h) @ x)`, where `γ_h(h_i) = tanh(W @ LN(h_i) + b)_h` is an invariant scalar gate per token i and head h.
 
-**Rotation** (x → xR, R ∈ O(3)): T_norm is invariant (computed from invariant cost C). So `(xR) − T_norm(xR) = (x − T_norm·x)R`. The rotation factors out. ✓
+**Rotation** (x → xR, R ∈ O(3)): T_norm is invariant (computed from invariant cost C). γ_h(h_i) is invariant (computed from h, which is invariant). So `(xR) − T_norm(xR) = (x − T_norm·x)R`. The rotation factors out. ✓
 
 **Translation** (x → x + 1t^T): T_norm is row-stochastic (rows sum to 1), so `T_norm·(x + 1t^T) = T_norm·x + 1t^T`. The displacement `(x + 1t^T) − T_norm·(x + 1t^T) = x − T_norm·x`. Translation cancels completely. ✓
 
-### 8.2 Per-Head Signed γ: Attraction and Repulsion
+### 8.2 Input-Dependent γ Gate: Residue-Specific Attraction and Repulsion
 
-| γ sign | Effect | Physical interpretation |
+| γ_h(h_i) sign | Effect on token i | Physical interpretation |
 |---|---|---|
 | γ > 0 | Token moves AWAY from centroid | Repulsion: maintains steric separation |
 | γ < 0 | Token moves TOWARD centroid | Attraction: pulls co-evolving residues together |
 
-Different heads learn different signs. The multi-head combination produces complex force fields from 16 scalar parameters per block.
+Unlike a fixed scalar γ per head, the gamma gate `tanh(W_gamma @ LN(h) + b)` is **residue-specific**: each token i computes its own per-head step size from its representation h_i. This allows the same head to attract some residues while repelling others within a single block.
 
-Zeros init: coordinates don't move initially — EGNN must earn its influence. AdamW decay pulls γ toward zero (= no coordinate update). tanh bounds effective γ to (-1, 1), preventing oscillation. **768 total scalars** (48 blocks × 16 heads) for the entire trunk's coordinate refinement.
+**Initialization**: W_gamma = 0 (zeros), bias ~ N(0, 1e-4). At init, `γ(h_i) = tanh(0 + b) ≈ b`, recovering the original per-head scalar behavior. The input-dependent component activates as W_gamma grows from zero.
+
+**Parameters**: ~9.2K per block (LN: 1024 + W_gamma: 512×16 = 8192 + bias: 16), ×48 blocks ≈ 442K total (0.1% of model).
+
+**Regularization**: Both W_gamma.weight and W_gamma.bias are excluded from AdamW weight decay (same treatment as original scalar γ — coordinate path should not be regularized toward zero by decay). tanh bounds output to (-1, 1).
 
 ### 8.3 Flash Kernel Integration
 
@@ -1133,31 +1139,51 @@ def permutation_invariant_loss(pred_x, true_x, chain_ids, loss_fn):
 
 Applied to L_diff and L_lddt. L_disto uses intra-chain pairs only (no permutation needed).
 
-### 11.5 Trunk Coordinate Loss
+### 11.5 Trunk Coordinate Losses
 
-Direct structural supervision on the trunk's EGNN-refined coordinates. This is critical: without it, the last UOT+EGNN block's γ receives zero gradient (its x_res output is not used by any other loss). With it, every γ^(b) in all 48 blocks receives direct gradient through the chain of EGNN updates.
+Direct structural supervision on the trunk's EGNN-refined coordinates. This is critical: without it, the last UOT+EGNN block's γ gate receives zero gradient (its x_res output is not used by any other loss). With it, every γ gate in all 48 blocks receives direct gradient through the chain of EGNN updates.
+
+Two complementary trunk coordinate losses are available (either or both can be enabled via null weights):
+
+**Log-distance MSE** (default, `w_trunk_logmse`):
 
 ```
-L_trunk_coord = smooth_lddt(x_res_final, x_0_res)
+L_trunk_logmse = mean_{i≠j, valid} [log(d_pred_ij + 1) - log(d_true_ij + 1)]²
 ```
 
-Uses the same smooth LDDT formulation as §11.2 (slope=1, per-type cutoff 15/30 Å, nucleotide flag), but evaluated on token-level (Cα) coordinates from the trunk, not atom-level coordinates from the diffusion module. Since smooth LDDT uses internal pairwise distances, it is invariant to rigid-body transformations — no alignment needed, consistent with the equivariant architecture.
+Soft distance weighting via log compression: large-distance errors are dampened, providing global topology supervision without hard cutoffs. Gradient ∝ 1/((d+1)·d) — natural soft decay. Triton-fused fwd+bwd with O(1) extra memory (no N² materialization).
+
+**Smooth LDDT** (optional, `w_trunk_slddt`):
+
+```
+L_trunk_slddt = smooth_lddt(x_res_final, x_0_res)
+```
+
+Same formulation as §11.2 (slope=1, per-type cutoff 15/30 Å). Hard cutoff for local precision.
+
+Both operate on token-level (Cα) coordinates and are invariant to rigid-body transformations — no alignment needed. Log-distance MSE provides global topology signal; smooth LDDT provides local precision.
 
 ### 11.6 Total Loss
 
 ```
-L = L_diff + L_lddt + 0.2 · L_disto + 0.5 · L_trunk_coord
+L = w_diff · L_diff + w_lddt · L_lddt + w_disto · L_disto
+    + w_trunk_slddt · L_trunk_slddt + w_trunk_logmse · L_trunk_logmse
+
+Default: L = L_diff + L_lddt + 0.2 · L_disto + 0.1 · L_trunk_logmse
+(w_trunk_slddt = null → disabled)
 
 Fine-tuning: L += α_bond · L_bond
 ```
+
+Any weight set to null disables that loss term entirely (no computation).
 
 **Gradient flow**:
 
 - L_diff, L_lddt, L_bond → diffusion module parameters (atom blocks, diffusion UOT, coord output)
 - L_disto → trunk h_res → all trunk parameters (representation supervision)
-- L_trunk_coord → trunk x_res → all EGNN γ parameters + all UOT params via geometry cost (coordinate supervision)
+- L_trunk_logmse / L_trunk_slddt → trunk x_res → all EGNN γ gate parameters (W_gamma weight + bias) + all UOT params via geometry cost (coordinate supervision)
 
-L_disto and L_trunk_coord are complementary: L_disto teaches h_res to encode distance information (pairwise distance classification into 39 bins), L_trunk_coord teaches EGNN γ to produce accurate coordinates (pairwise distance regression via smooth LDDT). Together they provide the trunk with both representation-level and coordinate-level structural signals.
+L_disto and L_trunk are complementary: L_disto teaches h_res to encode distance information (pairwise distance classification into 39 bins), L_trunk teaches the EGNN γ gate to produce accurate coordinates. Together they provide the trunk with both representation-level and coordinate-level structural signals.
 
 where L_bond penalizes deviations from ideal bond lengths and angles (standard force-field terms, fine-tuning only).
 

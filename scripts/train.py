@@ -45,7 +45,7 @@ def _run_validation(raw_model, ema, val_loader, device, max_batches):
     torch.cuda.empty_cache()
     ema.apply(raw_model)
     metrics_sum = {
-        k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
+        k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_slddt", "l_trunk_logmse")
     }
     n_val = 0
     max_val = max_batches if max_batches > 0 else len(val_loader)
@@ -70,10 +70,10 @@ def _run_validation(raw_model, ema, val_loader, device, max_batches):
 def _log_val_metrics(val_avg, step, label, wandb):
     """Log validation metrics to console and optionally wandb."""
     logger.info(
-        "[%s] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f",
+        "[%s] step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f slddt=%.4f logmse=%.4f",
         label, step,
         val_avg["loss"], val_avg["l_diff"], val_avg["l_lddt"],
-        val_avg["l_disto"], val_avg["l_trunk_coord"],
+        val_avg["l_disto"], val_avg["l_trunk_slddt"], val_avg["l_trunk_logmse"],
     )
     if wandb is not None:
         wandb.log({f"val/{k}": v for k, v in val_avg.items()}, step=step)
@@ -109,7 +109,24 @@ def _log_extra(model, step, wandb):
     blocks = raw.trunk.uot_blocks
 
     # ---- Collect per-layer per-head arrays ----
-    gamma_map = torch.stack([b.gamma for b in blocks]).detach().cpu().tanh().numpy()
+    # Base gamma: tanh(w_gamma.bias) — residue-independent component (n_layers, H)
+    gamma_bias_map = torch.stack(
+        [b.w_gamma.bias for b in blocks]
+    ).detach().cpu().tanh().numpy()
+
+    # Runtime gamma gate stats from last forward pass (if available)
+    gamma_gate_stats = {}
+    if hasattr(blocks[0], "_last_gamma_gate"):
+        gates = [b._last_gamma_gate for b in blocks if hasattr(b, "_last_gamma_gate")]
+        if gates:
+            # Each gate: (B, N, H) — compute per-head stats across B,N
+            gate_mean = torch.stack([g.mean(dim=(0, 1)) for g in gates]).cpu().numpy()  # (L, H)
+            gate_std = torch.stack([g.std(dim=(0, 1)) for g in gates]).cpu().numpy()
+            gate_sign = torch.stack([g.sign().mean(dim=(0, 1)) for g in gates]).cpu().numpy()
+            gamma_gate_stats = {
+                "mean": gate_mean, "std": gate_std, "sign_mean": gate_sign,
+            }
+
     from deepfold.model.primitives import algebraic_sigmoid
     wdist_map = algebraic_sigmoid(
         torch.stack([b.w_dist_raw for b in blocks])
@@ -118,20 +135,34 @@ def _log_extra(model, step, wandb):
     pos_map = torch.stack([b.pos_bias.weight for b in blocks]).detach().cpu().numpy()
 
     # ---- Summary scalars (cheap trend lines) ----
-    wandb.log({
-        "params/gamma_abs_mean": float(np.abs(gamma_map).mean()),
-        "params/gamma_abs_max": float(np.abs(gamma_map).max()),
+    scalars = {
+        "params/gamma_bias_abs_mean": float(np.abs(gamma_bias_map).mean()),
+        "params/gamma_bias_abs_max": float(np.abs(gamma_bias_map).max()),
         "params/w_dist_mean": float(wdist_map.mean()),
         "params/w_dist_max": float(wdist_map.max()),
         "params/pos_bias_abs_max": float(np.abs(pos_map).max()),
-    }, step=step)
+    }
+    if gamma_gate_stats:
+        scalars["params/gamma_gate_mean_abs"] = float(np.abs(gamma_gate_stats["mean"]).mean())
+        scalars["params/gamma_gate_std_mean"] = float(gamma_gate_stats["std"].mean())
+        scalars["params/gamma_gate_sign_mean"] = float(gamma_gate_stats["sign_mean"].mean())
+    wandb.log(scalars, step=step)
+
+    import matplotlib.pyplot as plt
 
     # ---- Heatmaps ----
-    # tanh(gamma): (n_layers, n_heads)
-    fig = _heatmap(gamma_map, f"tanh(γ) — step {step}", "Head", "Layer")
-    wandb.log({"heatmap/gamma": wandb.Image(fig)}, step=step)
-    import matplotlib.pyplot as plt
+    # Base gamma: tanh(w_gamma.bias) — (n_layers, n_heads)
+    fig = _heatmap(gamma_bias_map, f"tanh(γ_bias) — step {step}", "Head", "Layer")
+    wandb.log({"heatmap/gamma_bias": wandb.Image(fig)}, step=step)
     plt.close(fig)
+
+    # Runtime gamma gate stats (if available)
+    if gamma_gate_stats:
+        for stat_name, data in gamma_gate_stats.items():
+            fig = _heatmap(data, f"γ_gate {stat_name} — step {step}", "Head", "Layer",
+                           cmap="RdBu_r" if stat_name == "sign_mean" else "viridis")
+            wandb.log({f"heatmap/gamma_gate_{stat_name}": wandb.Image(fig)}, step=step)
+            plt.close(fig)
 
     # w_dist (algebraic sigmoid): (n_layers, n_heads)
     fig = _heatmap(wdist_map, f"w_dist — step {step}", "Head", "Layer",
@@ -321,7 +352,6 @@ def main():
             "model": _section(cfg.model),
             "data": _section(cfg.data),
             "logging": _section(cfg.logging),
-            "init": _section(cfg.init),
             "training": _section(cfg.training),
             "validation": _section(cfg.validation),
             "loss_weights": cfg.loss_weights.to_dict(),
@@ -376,8 +406,6 @@ def main():
         inference_cycles=cfg.model.inference_cycles,
         diffusion_multiplicity=cfg.diffusion.multiplicity,
         loss_weights=cfg.loss_weights.to_dict(),
-        gamma_std=cfg.init.gamma_std,
-        adaln_gate_bias=cfg.init.adaln_gate_bias,
     ).to(device)
 
     if rank0:
@@ -679,14 +707,15 @@ def main():
 
         if rank0 and step % cfg.logging.log_every == 0:
             logger.info(
-                "step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f trunk=%.4f "
-                "grad_norm=%.4f lr=%.6f crop=%d",
+                "step=%d loss=%.4f diff=%.4f lddt=%.4f disto=%.4f "
+                "slddt=%.4f logmse=%.4f grad_norm=%.4f lr=%.6f crop=%d",
                 step,
                 metrics["loss"],
                 metrics["l_diff"],
                 metrics["l_lddt"],
                 metrics["l_disto"],
-                metrics["l_trunk_coord"],
+                metrics["l_trunk_slddt"],
+                metrics["l_trunk_logmse"],
                 metrics["grad_norm"],
                 metrics["lr"],
                 crop_size,
@@ -698,7 +727,8 @@ def main():
                         "train/l_diff": metrics["l_diff"],
                         "train/l_lddt": metrics["l_lddt"],
                         "train/l_disto": metrics["l_disto"],
-                        "train/l_trunk_coord": metrics["l_trunk_coord"],
+                        "train/l_trunk_slddt": metrics["l_trunk_slddt"],
+                        "train/l_trunk_logmse": metrics["l_trunk_logmse"],
                         "train/grad_norm": metrics["grad_norm"],
                         "train/lr": metrics["lr"],
                         "train/crop_size": crop_size,

@@ -90,7 +90,8 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "gamma" in name and "layernorm" not in name.lower():
+        if "w_gamma" in name:
+            # EGNN gamma gate — no decay on both weight and bias
             no_decay_params.append(param)
         elif "layernorm" in name.lower() or "ln" in name.lower() or "bias" in name:
             no_decay_params.append(param)
@@ -112,7 +113,7 @@ def build_optimizer(
 # Metric aggregation
 # ============================================================================
 
-_METRIC_KEYS = ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_coord")
+_METRIC_KEYS = ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_slddt", "l_trunk_logmse")
 
 
 def _reduce_metrics(
@@ -212,7 +213,8 @@ def train_step(
         "l_diff": outputs.get("l_diff", torch.tensor(0.0)).item(),
         "l_lddt": outputs.get("l_lddt", torch.tensor(0.0)).item(),
         "l_disto": outputs.get("l_disto", torch.tensor(0.0)).item(),
-        "l_trunk_coord": outputs.get("l_trunk_coord", torch.tensor(0.0)).item(),
+        "l_trunk_slddt": outputs.get("l_trunk_slddt", torch.tensor(0.0)).item(),
+        "l_trunk_logmse": outputs.get("l_trunk_logmse", torch.tensor(0.0)).item(),
         "num_cycles": outputs.get("num_cycles", 0),
         "lr": lr,
         "grad_norm": grad_norm,
@@ -250,6 +252,7 @@ def val_step(
         "l_diff": outputs.get("l_diff", torch.tensor(0.0)).item(),
         "l_lddt": outputs.get("l_lddt", torch.tensor(0.0)).item(),
         "l_disto": outputs.get("l_disto", torch.tensor(0.0)).item(),
-        "l_trunk_coord": outputs.get("l_trunk_coord", torch.tensor(0.0)).item(),
+        "l_trunk_slddt": outputs.get("l_trunk_slddt", torch.tensor(0.0)).item(),
+        "l_trunk_logmse": outputs.get("l_trunk_logmse", torch.tensor(0.0)).item(),
     }
     return _reduce_metrics(metrics, device)

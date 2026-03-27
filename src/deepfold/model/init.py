@@ -4,7 +4,7 @@ Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
   2. Coordinate path (x_res): dormant at init.
-     gamma~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0.
+     W_gamma=0, W_gamma.bias~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0.
      Content-only attention first; geometry starts at midpoint.
 """
 
@@ -18,9 +18,14 @@ def _is_zero_init(name: str) -> bool:
     return any(k in name for k in ("mu_proj", "nu_proj", "coevol_to_marginal"))
 
 
-def _is_gamma(name: str) -> bool:
-    """EGNN gamma — noise init for symmetry breaking."""
-    return "gamma" in name
+def _is_gamma_weight(name: str) -> bool:
+    """EGNN gamma gate W_gamma.weight — zeros init (dormant at init)."""
+    return "w_gamma.weight" in name
+
+
+def _is_gamma_bias(name: str) -> bool:
+    """EGNN gamma gate W_gamma.bias — noise init for symmetry breaking."""
+    return "w_gamma.bias" in name
 
 
 def _is_adaln_zero_gate(name: str) -> bool:
@@ -43,7 +48,7 @@ def init_model(
     - Xavier normal for all 2D weight matrices (except zero-init ones).
     - Attention output (w_o) scaled by 1/sqrt(L) for residual depth control.
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
-    - Noise init (N(0, gamma_std)) for gamma (symmetry breaking across layers).
+    - W_gamma.weight zeros, W_gamma.bias ~ N(0, gamma_std) (dormant + symmetry breaking).
     - Zeros for w_rel, zero_init_linear outputs.
     - w_dist_raw=0 (algebraic sigmoid midpoint = 0.5).
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
@@ -71,7 +76,7 @@ def init_model(
 
         if param.dim() < 2:
             # Scalars and 1D params
-            if _is_gamma(name):
+            if _is_gamma_bias(name):
                 param.data.normal_(0, gamma_std)
             elif "w_dist_raw" in name:
                 nn.init.zeros_(param)  # algebraic sigmoid(0) = 0.5 midpoint
@@ -91,7 +96,7 @@ def init_model(
             continue
 
         # 2D weight matrices
-        if _is_zero_init(name) or _is_position_bias(name):
+        if _is_zero_init(name) or _is_position_bias(name) or _is_gamma_weight(name):
             nn.init.zeros_(param)
             continue
 
