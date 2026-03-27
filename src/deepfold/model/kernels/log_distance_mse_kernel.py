@@ -100,6 +100,7 @@ def _log_dist_mse_bwd_kernel(
     stride_mb,
     BLOCK_I: tl.constexpr,
     BLOCK_J: tl.constexpr,
+    N_J_BLOCKS: tl.constexpr,
     HAS_MASK: tl.constexpr,
 ):
     """Each program owns BLOCK_I rows of i, loops over all j."""
@@ -130,10 +131,7 @@ def _log_dist_mse_bwd_kernel(
     acc1 = tl.zeros([BLOCK_I], dtype=tl.float32)
     acc2 = tl.zeros([BLOCK_I], dtype=tl.float32)
 
-    n_j_blocks = tl.cdiv(N, BLOCK_J)
-    for j_block in tl.static_range(0, 4096):  # upper bound, break via mask
-        if j_block >= n_j_blocks:
-            break
+    for j_block in tl.static_range(0, N_J_BLOCKS):
         j_idx = j_block * BLOCK_J + tl.arange(0, BLOCK_J)
         j_valid = j_idx < N
 
@@ -242,6 +240,7 @@ class _LogDistMSE(torch.autograd.Function):
 
         grad_x = torch.empty_like(x_pred)
 
+        n_j_blocks = triton.cdiv(N, _BLOCK_J)
         grid = (B, triton.cdiv(N, _BLOCK_I))
         _log_dist_mse_bwd_kernel[grid](
             x_pred, x_true,
@@ -253,6 +252,7 @@ class _LogDistMSE(torch.autograd.Function):
             grad_x.stride(0), grad_x.stride(1),
             mask.stride(0) if has_mask else 0,
             BLOCK_I=_BLOCK_I, BLOCK_J=_BLOCK_J,
+            N_J_BLOCKS=n_j_blocks,
             HAS_MASK=has_mask,
         )
 
