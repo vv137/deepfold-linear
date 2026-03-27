@@ -117,7 +117,7 @@ def _log_extra(model, step, wandb):
     # Runtime gamma gate stats from last forward pass (if available)
     gamma_gate_stats = {}
     if hasattr(blocks[0], "_last_gamma_gate"):
-        gates = [b._last_gamma_gate for b in blocks if hasattr(b, "_last_gamma_gate")]
+        gates = [b._last_gamma_gate.float() for b in blocks if hasattr(b, "_last_gamma_gate")]
         if gates:
             # Each gate: (B, N, H) — compute per-head stats across B,N
             gate_mean = torch.stack([g.mean(dim=(0, 1)) for g in gates]).cpu().numpy()  # (L, H)
