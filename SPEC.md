@@ -288,8 +288,8 @@ g_i, g_j: global residue indices, preserved after cropping.
 ### 4.3 Parameters
 
 ```
-w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. No decay (Swin convention). Each of the 48 UOT blocks has its own w_rel_res.
-w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. No decay (Swin convention). Shared across MSA blocks.
+w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. With decay (unlike Swin — unbounded pos_bias destabilizes Sinkhorn backward at small ε). Each of the 48 UOT blocks has its own w_rel_res.
+w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. With decay (same reason). Shared across MSA blocks.
 ```
 
 ### 4.4 Branchless Online Computation
@@ -1230,10 +1230,11 @@ param_groups = [
         'weight_decay': 0.01
     },
     {   # No decay: LN γ/β, biases, post-LN projections (scale-invariant),
-        #           bounded params (w_dist_raw, gamma),
-        #           position bias (Swin convention)
+        #           bounded params (w_dist_raw, W_gamma)
+        #   NOTE: pos_bias gets decay — unbounded, and large values destabilize
+        #         Sinkhorn backward at small ε (exp(-pos/ε) saturates).
         'params': [...],  # layernorm, ln, bias, w_q/k/v/g/o, swiglu,
-                          # w_dist_raw, pos_bias, gamma
+                          # w_dist_raw, w_gamma
         'weight_decay': 0.0
     },
 ]
@@ -1320,7 +1321,7 @@ class EMA:
 | Geometry bias at high noise (trunk) | Per-head w_dist diversity | Some heads geometry-sensitive, others robust |
 | Geometry bias at high noise (diffusion) | σ-conditioned geo_gate | Learned suppression at high σ |
 | Geometry bias domination | w_dist sigmoid-bounded (0,1), init ≈0.12 | Per-block per-head; can't exceed 1.0 |
-| Position bias scale | w_rel zeros init (per-layer), no decay (Swin convention) | Starts at zero; per-layer allows specialization; unbounded but stable in practice |
+| Position bias scale | w_rel zeros init (per-layer), with decay | Starts at zero; per-layer allows specialization; decay prevents unbounded growth that destabilizes Sinkhorn backward at small ε |
 | Co-evolution noise | Zero-init coevol_to_marginal | Must earn influence; starts at zero bias |
 | Per-layer marginals | mu_proj/nu_proj zero-init on LN(h_res) + coevol_bias | Marginals track evolving h_res each block |
 | SE(3) equivariance (trunk) | EGNN: relative vectors only | No augmentation needed |
