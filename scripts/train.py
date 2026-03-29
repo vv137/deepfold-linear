@@ -328,6 +328,8 @@ def main():
         local_rank = 0
 
     rank0 = local_rank == 0
+    if not rank0:
+        logging.getLogger().setLevel(logging.WARNING)
 
     # ---- Output directory setup (rank 0 generates name, broadcast to all) ----
     if rank0:
