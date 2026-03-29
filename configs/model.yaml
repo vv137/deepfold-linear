@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v5.6)
+# DeepFold-Linear model configuration (SPEC v6.0)
 
 model:
   d_model: 512
@@ -7,7 +7,7 @@ model:
   h_res: 16
   h_msa: 8
   n_msa_blocks: 4
-  n_uot_blocks: 48
+  n_trunk_blocks: 48
   # Diffusion v2: encoder-transformer-decoder (Boltz-1 style)
   n_diff_transformer_layers: 24
   n_diff_encoder_blocks: 3
@@ -93,11 +93,10 @@ wandb:
   project: deepfold-linear
   entity: null # your wandb team/user; null = default
   name: null # run name; null = auto-generated
-  tags: ["v5.5"]
+  tags: ["v6.0"]
   log_every: 1 # log every N optimizer steps
 
 sinkhorn:
-  lambda: 1.0
   eps_heads:
     [
       0.5,
@@ -118,5 +117,3 @@ sinkhorn:
       4.0,
     ]
   k_iter: 20
-  k_max_infer: 20
-  tol_infer: 0.0001

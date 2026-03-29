@@ -106,69 +106,88 @@ def _log_extra(model, step, wandb):
     import numpy as np
 
     raw = model.module if hasattr(model, "module") else model
-    blocks = raw.trunk.uot_blocks
+    blocks = raw.trunk.trunk_blocks
 
     # ---- Collect per-layer per-head arrays ----
-    # Base gamma: tanh(w_gamma.bias) — residue-independent component (n_layers, H)
-    gamma_bias_map = torch.stack(
-        [b.w_gamma.bias for b in blocks]
+    # Cost weighting: sigmoid(alpha_h) — (n_layers, H)
+    alpha_map = torch.stack(
+        [b.alpha_h for b in blocks]
+    ).detach().cpu().sigmoid().numpy()
+
+    # Per-head characteristic distance r_h — (n_layers, H)
+    r_h_map = torch.stack(
+        [b.r_h for b in blocks]
+    ).detach().cpu().numpy()
+
+    # Per-head intensity gate: tanh(lambda_h_raw) — (n_layers, H)
+    lambda_map = torch.stack(
+        [b.lambda_h_raw for b in blocks]
     ).detach().cpu().tanh().numpy()
 
-    # Runtime gamma gate stats from last forward pass (if available)
-    gamma_gate_stats = {}
-    if hasattr(blocks[0], "_last_gamma_gate"):
-        gates = [b._last_gamma_gate.float() for b in blocks if hasattr(b, "_last_gamma_gate")]
+    # Runtime gate stats from last forward pass (if available)
+    gate_stats = {}
+    if hasattr(blocks[0], "_last_gate"):
+        gates = [b._last_gate.float() for b in blocks if hasattr(b, "_last_gate")]
         if gates:
-            # Each gate: (B, N, H) — compute per-head stats across B,N
-            gate_mean = torch.stack([g.mean(dim=(0, 1)) for g in gates]).cpu().numpy()  # (L, H)
-            gate_std = torch.stack([g.std(dim=(0, 1)) for g in gates]).cpu().numpy()
-            gate_sign = torch.stack([g.sign().mean(dim=(0, 1)) for g in gates]).cpu().numpy()
-            gamma_gate_stats = {
-                "mean": gate_mean, "std": gate_std, "sign_mean": gate_sign,
-            }
+            # Each gate: (B, N, 1) — compute stats across B,N
+            gate_mean = torch.stack([g.mean() for g in gates]).cpu().numpy()  # (L,)
+            gate_std = torch.stack([g.std() for g in gates]).cpu().numpy()
+            gate_stats = {"mean": gate_mean, "std": gate_std}
 
-    from deepfold.model.primitives import algebraic_sigmoid
-    wdist_map = algebraic_sigmoid(
-        torch.stack([b.w_dist_raw for b in blocks])
-    ).detach().cpu().numpy()
+    # Transport entropy removed — requires O(N²) T materialization.
+    # Can be re-added with Triton tiled entropy kernel if needed.
+    transport_entropy = {}
+
     # pos_bias: (n_layers, H, 68)
     pos_map = torch.stack([b.pos_bias.weight for b in blocks]).detach().cpu().numpy()
 
     # ---- Summary scalars (cheap trend lines) ----
     scalars = {
-        "params/gamma_bias_abs_mean": float(np.abs(gamma_bias_map).mean()),
-        "params/gamma_bias_abs_max": float(np.abs(gamma_bias_map).max()),
-        "params/w_dist_mean": float(wdist_map.mean()),
-        "params/w_dist_max": float(wdist_map.max()),
+        "params/alpha_h_mean": float(alpha_map.mean()),
+        "params/alpha_h_max": float(alpha_map.max()),
+        "params/r_h_mean": float(r_h_map.mean()),
+        "params/lambda_h_mean": float(lambda_map.mean()),
         "params/pos_bias_abs_max": float(np.abs(pos_map).max()),
     }
-    if gamma_gate_stats:
-        scalars["params/gamma_gate_mean_abs"] = float(np.abs(gamma_gate_stats["mean"]).mean())
-        scalars["params/gamma_gate_std_mean"] = float(gamma_gate_stats["std"].mean())
-        scalars["params/gamma_gate_sign_mean"] = float(gamma_gate_stats["sign_mean"].mean())
+    if gate_stats:
+        scalars["params/gate_mean"] = float(gate_stats["mean"].mean())
+        scalars["params/gate_std_mean"] = float(gate_stats["std"].mean())
+    if transport_entropy:
+        scalars["params/transport_entropy_mean"] = float(transport_entropy["entropy"].mean())
     wandb.log(scalars, step=step)
 
     import matplotlib.pyplot as plt
 
     # ---- Heatmaps ----
-    # Base gamma: tanh(w_gamma.bias) — (n_layers, n_heads)
-    fig = _heatmap(gamma_bias_map, f"tanh(γ_bias) — step {step}", "Head", "Layer")
-    wandb.log({"heatmap/gamma_bias": wandb.Image(fig)}, step=step)
+    # Cost weighting: sigmoid(alpha_h) — (n_layers, n_heads)
+    fig = _heatmap(alpha_map, f"σ(α_h) cost weight — step {step}", "Head", "Layer")
+    wandb.log({"heatmap/alpha_h": wandb.Image(fig)}, step=step)
     plt.close(fig)
 
-    # Runtime gamma gate stats (if available)
-    if gamma_gate_stats:
-        for stat_name, data in gamma_gate_stats.items():
-            fig = _heatmap(data, f"γ_gate {stat_name} — step {step}", "Head", "Layer",
-                           cmap="RdBu_r" if stat_name == "sign_mean" else "viridis")
-            wandb.log({f"heatmap/gamma_gate_{stat_name}": wandb.Image(fig)}, step=step)
-            plt.close(fig)
-
-    # w_dist (algebraic sigmoid): (n_layers, n_heads)
-    fig = _heatmap(wdist_map, f"w_dist — step {step}", "Head", "Layer",
-                   cmap="viridis")
-    wandb.log({"heatmap/w_dist": wandb.Image(fig)}, step=step)
+    # r_h characteristic distance: (n_layers, n_heads)
+    fig = _heatmap(r_h_map, f"r_h — step {step}", "Head", "Layer", cmap="viridis")
+    wandb.log({"heatmap/r_h": wandb.Image(fig)}, step=step)
     plt.close(fig)
+
+    # lambda_h displacement scale: (n_layers, n_heads)
+    fig = _heatmap(lambda_map, f"λ_h — step {step}", "Head", "Layer", cmap="viridis")
+    wandb.log({"heatmap/lambda_h": wandb.Image(fig)}, step=step)
+    plt.close(fig)
+
+    # Transport plan entropy heatmap
+    if transport_entropy:
+        fig = _heatmap(transport_entropy["entropy"],
+                       f"Transport entropy — step {step}", "Head", "Layer", cmap="viridis")
+        wandb.log({"heatmap/transport_entropy": wandb.Image(fig)}, step=step)
+        plt.close(fig)
+
+    # Runtime gate stats
+    if gate_stats:
+        gate_data = np.stack([gate_stats["mean"], gate_stats["std"]], axis=1)  # (L, 2)
+        fig = _heatmap(gate_data, f"Gate tanh stats — step {step}",
+                       "mean / std", "Layer", cmap="RdBu_r")
+        wandb.log({"heatmap/gate_stats": wandb.Image(fig)}, step=step)
+        plt.close(fig)
 
     # trunk pos_bias: per-head heatmap (n_layers, 68) × n_heads
     n_heads = pos_map.shape[1]
@@ -186,7 +205,6 @@ def _log_extra(model, step, wandb):
         ax = axes_flat[h]
         ax.imshow(pos_map[:, h, :], aspect="auto", cmap="RdBu_r",
                   vmin=-vmax, vmax=vmax, interpolation="nearest")
-        # Vertical lines separating same-chain sep | inter-chain | bond bins
         ax.axvline(64.5, color="gray", linewidth=0.5, linestyle="--")
         ax.axvline(65.5, color="gray", linewidth=0.5, linestyle="--")
         ax.set_title(f"Head {h}", fontsize=9)
@@ -395,7 +413,7 @@ def main():
         h_res=cfg.model.h_res,
         h_msa=cfg.model.h_msa,
         n_msa_blocks=cfg.model.n_msa_blocks,
-        n_uot_blocks=cfg.model.n_uot_blocks,
+        n_trunk_blocks=cfg.model.n_trunk_blocks,
         n_diff_transformer_layers=cfg.model.n_diff_transformer_layers,
         n_diff_encoder_blocks=cfg.model.n_diff_encoder_blocks,
         n_diff_decoder_blocks=cfg.model.n_diff_decoder_blocks,

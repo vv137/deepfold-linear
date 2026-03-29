@@ -23,7 +23,7 @@ def _make_model(device="cpu", multiplicity=2):
         h_res=4,
         h_msa=4,
         n_msa_blocks=1,
-        n_uot_blocks=2,
+        n_trunk_blocks=2,
         n_diff_transformer_layers=2,
         n_diff_encoder_blocks=1,
         n_diff_decoder_blocks=1,

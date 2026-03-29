@@ -17,7 +17,7 @@ class ModelConfig:
     h_res: int = 16
     h_msa: int = 8
     n_msa_blocks: int = 4
-    n_uot_blocks: int = 48
+    n_trunk_blocks: int = 48
     # Diffusion v2
     n_diff_transformer_layers: int = 24
     n_diff_encoder_blocks: int = 3

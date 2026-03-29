@@ -1,60 +1,72 @@
-"""Token UOT+EGNN Block (SPEC §8). 48 blocks in trunk.
+"""Token OT Block — MHA + Balanced Sinkhorn Transport (SPEC §8, v6.0).
+
+48 blocks in trunk. Each block:
+  [Step 1] MHA with 68-bin position bias → h update + SwiGLU FFN
+  [Step 2] Balanced Sinkhorn transport → coordinate update
 
 Supports both unbatched (N, d) and batched (B, N, d) inputs via dual-mode pattern.
 """
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold.model.kernels.flash_sinkhorn_attn import flash_sinkhorn_attn
+from deepfold.model.kernels.flash_sinkhorn_transport import balanced_sinkhorn_transport
 from deepfold.model.position_encoding import PositionBias
-from deepfold.model.primitives import SwiGLU, algebraic_sigmoid
+from deepfold.model.primitives import SwiGLU
 
 K_ITER = 20
 
 
-class TokenUOTBlock(nn.Module):
-    """Single Token UOT+EGNN block (SPEC §8)."""
+class TokenOTBlock(nn.Module):
+    """Single Token OT block: MHA + balanced Sinkhorn transport (SPEC §8)."""
 
     def __init__(
         self,
         d_model: int = 512,
         n_heads: int = 16,
         r_0: float = 10.0,
+        dropout: float = 0.0,
         block_idx: int = 0,
     ):
         super().__init__()
         assert d_model % n_heads == 0
-        assert n_heads % 4 == 0
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads  # 32
-        self.r_0 = r_0
         self.block_idx = block_idx
 
-        # Attention projections — after LN, so bias=False (SPEC §0)
-        self.ln_attn = nn.LayerNorm(d_model)
+        # ---- [Step 1] MHA Track ----
+        self.ln_mha = nn.LayerNorm(d_model)
         self.w_q = nn.Linear(d_model, d_model, bias=False)
         self.w_k = nn.Linear(d_model, d_model, bias=False)
         self.w_v = nn.Linear(d_model, d_model, bias=False)
-        self.w_g = nn.Linear(d_model, d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
-
-        # EGNN: input-dependent per-head geometry gate (SPEC §8.2)
-        # bias=True exception: bias serves as per-head "base gamma" offset.
-        self.ln_gamma = nn.LayerNorm(d_model)
-        self.w_gamma = nn.Linear(d_model, n_heads, bias=True)
-
-        # Per-layer position bias (SPEC §4.3)
+        self.w_g = nn.Linear(d_model, d_model, bias=False)  # MHA output gate
         self.pos_bias = PositionBias(n_heads, 68)
+        self.attn_dropout = nn.Dropout(dropout)
 
-        # Per-head geometry weight — algebraic sigmoid bounded (0, 1)
-        # Init 0 → midpoint 0.5; heavy-tailed: gradient ∝ 1/(1+|x|)²
-        self.w_dist_raw = nn.Parameter(torch.zeros(n_heads))
+        # ---- FFN (SwiGLU) ----
+        self.ln_ff = nn.LayerNorm(d_model)
+        self.swiglu = SwiGLU(d_model, d_model * 4, d_model)
+        self.ff_dropout = nn.Dropout(dropout)
 
-        # Per-head entropic regularization (fixed buffer, SPEC §7.2)
+        # ---- [Step 3] Sinkhorn Transport Track ----
+        self.ln_sink = nn.LayerNorm(d_model)
+        self.w_q_sink = nn.Linear(d_model, d_model, bias=False)
+        self.w_k_sink = nn.Linear(d_model, d_model, bias=False)
+
+        # Mixing gate α_h: sigmoid(alpha_h) blends feat vs geo
+        # Init -1.0 → sigmoid(-1) ≈ 0.27 → start sequence/feature-heavy
+        self.alpha_h = nn.Parameter(torch.full((n_heads,), -1.0))
+
+        # Per-head characteristic distance (learnable, init r_0)
+        self.r_h = nn.Parameter(torch.full((n_heads,), r_0))
+
+        # Per-head entropic regularization (fixed buffer)
         nr = n_heads // 4
         self.register_buffer(
             "eps",
@@ -64,48 +76,35 @@ class TokenUOTBlock(nn.Module):
             ),
         )
 
-        # SwiGLU transition (512 -> 2048 -> 512)
-        self.ln_ff = nn.LayerNorm(d_model)
-        self.swiglu = SwiGLU(d_model, d_model * 4, d_model)
+        # ---- [Step 4] Coordinate Update ----
+        # Mobility gate G_i: sigmoid(Linear(h)) → per-residue ∈ (0, 1)
+        self.ln_gate = nn.LayerNorm(d_model)
+        self.w_gate = nn.Linear(d_model, 1, bias=True)
+        # Intensity gate λ_h: tanh(param)/H → per-head bounded scale
+        self.lambda_h_raw = nn.Parameter(torch.zeros(n_heads))  # tanh(0)=0 → dormant at init
 
     def forward(
         self,
         h: torch.Tensor,
         x_res: torch.Tensor,
-        mu: torch.Tensor,
-        nu: torch.Tensor,
-        log_u_prev: torch.Tensor | None,
-        log_v_prev: torch.Tensor | None,
         pos_bins: torch.Tensor,
-        geo_gate: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            h:          (N, 512) or (B, N, 512) token representation
-            x_res:      (N, 3) or (B, N, 3) token coordinates
-            mu:         (H, N) or (B, H, N) row marginals
-            nu:         (H, N) or (B, H, N) column marginals
-            log_u_prev: (H, N) or (B, H, N) or None — warm-start
-            log_v_prev: (H, N) or (B, H, N) or None
-            pos_bins:   (N, N) or (B, N, N) int, 68-bin position encoding
-            geo_gate:   (H,) or None — sigma-gated for diffusion blocks
-            mask:       (B, N) bool/float, 1=real 0=pad. Only for batched.
+            h:        (N, 512) or (B, N, 512) token representation
+            x_res:    (N, 3) or (B, N, 3) token coordinates
+            pos_bins: (N, N) or (B, N, N) int, 68-bin position encoding
+            mask:     (B, N) bool/float, 1=real 0=pad. Only for batched.
 
         Returns:
-            h, x_res, log_u, log_v
+            h, x_res
         """
         # Dual-mode: detect unbatched and add B dim
         unbatched = h.dim() == 2
         if unbatched:
             h = h.unsqueeze(0)
             x_res = x_res.unsqueeze(0)
-            mu = mu.unsqueeze(0)
-            nu = nu.unsqueeze(0)
-            if log_u_prev is not None:
-                log_u_prev = log_u_prev.unsqueeze(0)
-            if log_v_prev is not None:
-                log_v_prev = log_v_prev.unsqueeze(0)
             pos_bins = pos_bins.unsqueeze(0)
 
         B, N, _ = h.shape
@@ -115,84 +114,75 @@ class TokenUOTBlock(nn.Module):
         if mask is None:
             mask = h.new_ones(B, N)
 
-        # ---- Pre-norm ----
-        h_n = self.ln_attn(h)  # (B, N, d_model)
-        Q = self.w_q(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)  # (B, H, N, d_h)
+        # ================================================================
+        # [Step 1] MHA: Contextualization with 68-bin position bias
+        # ================================================================
+        h_n = self.ln_mha(h)
+        Q = self.w_q(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         K = self.w_k(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         V = self.w_v(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
-        G = self.w_g(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        # ---- Flash Sinkhorn Attention: O(N) memory ----
-        Q_ln = F.layer_norm(Q, [d_h])
-        K_ln = F.layer_norm(K, [d_h])
+        # Attention scores + position bias
+        scale = 1.0 / math.sqrt(d_h)
+        scores = torch.einsum("bhid,bhjd->bhij", Q, K) * scale  # (B, H, N, N)
+        scores = scores + self.pos_bias(pos_bins)  # (B, H, N, N)
 
-        pos_weight = self.pos_bias.weight  # (H, 68)
+        # Mask: padded positions get -inf
+        attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
+        scores = scores.masked_fill(attn_mask == 0, float("-inf"))
 
-        w_dist = algebraic_sigmoid(self.w_dist_raw)  # (H,) bounded (0, 1)
-        effective_w_dist = w_dist
-        if geo_gate is not None:
-            effective_w_dist = geo_gate * w_dist
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
 
-        # FP32 for log marginals — BF16 underflows the softmax Jacobian
-        # in the backward, killing gradient to mu_proj/nu_proj.
-        log_mu = torch.log(mu.float().clamp(min=1e-8))  # (B, H, N)
-        log_nu = torch.log(nu.float().clamp(min=1e-8))
-
-        # Flash Sinkhorn: O(N) memory for both training and inference.
-        # Triton forward computes cost tiles on the fly (content + pos_bias + geo_bias).
-        # Triton backward uses exact unrolled gradients through K Sinkhorn iterations
-        # (not IFT/CG approximate), giving correct gradients for all parameters
-        # including mu_proj, nu_proj, coevol_to_marginal, w_dist_raw, pos_bias.
-        o, x_centroid, log_u, log_v = flash_sinkhorn_attn(
-            Q_ln,
-            K_ln,
-            V,
-            G,
-            x_res,
-            pos_weight,
-            pos_bins,
-            self.eps,
-            effective_w_dist,
-            log_mu,
-            log_nu,
-            K_iter=K_ITER,
-            lam=1.0,
-            r_0=self.r_0,
-            log_u_init=log_u_prev,
-            log_v_init=log_v_prev,
-            mask=mask,
-        )
-        # o: (B, N, H*d_h), x_centroid: (B, H, N, 3)
-        # log_u: (B, H, N), log_v: (B, H, N)
-
-        # h update (invariant)
-        h_update = self.w_o(o.to(h.dtype))  # (B, N, d_model)
-        # Zero out padded positions
+        # Value aggregation with per-head gate: sigmoid(G) * (attn @ V)
+        G = self.w_g(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)  # (B, H, N, d_h)
+        o = torch.sigmoid(G) * torch.einsum("bhij,bhjd->bhid", attn, V)
+        o = o.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, d)
+        h_update = self.w_o(o)
         h_update = h_update * mask.unsqueeze(-1)
         h = h + h_update
 
-        # ---- EGNN x_res update (equivariant, SPEC §8) ----
-        # Input-dependent gamma gate: mean over heads for scale-invariance to H
-        gamma_gate = torch.tanh(self.w_gamma(self.ln_gamma(h)))  # (B, N, H)
-        self._last_gamma_gate = gamma_gate.detach()  # for logging
-        delta = x_res.unsqueeze(1).float() - x_centroid  # (B, H, N, 3)
-        x_update = torch.einsum("bnh,bhnc->bnc", gamma_gate, delta) / self.n_heads  # (B, N, 3)
-        x_update = x_update * mask.unsqueeze(-1)
-        x_res = x_res + x_update.to(x_res.dtype)
-
-        # ---- SwiGLU transition ----
-        ff_update = self.swiglu(self.ln_ff(h))
+        # ---- FFN (SwiGLU) ----
+        ff_update = self.ff_dropout(self.swiglu(self.ln_ff(h)))
         ff_update = ff_update * mask.unsqueeze(-1)
         h = h + ff_update
 
-        log_u_out = log_u.to(h.dtype)
-        log_v_out = log_v.to(h.dtype)
+        # ================================================================
+        # [Step 2–3] Balanced Sinkhorn Transport
+        # ================================================================
+        h_s = self.ln_sink(h)
+        Q_s = self.w_q_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
+        K_s = self.w_k_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
+
+        # L2-normalize for cosine cost
+        Q_s = F.normalize(Q_s, dim=-1)
+        K_s = F.normalize(K_s, dim=-1)
+
+        # Balanced Sinkhorn → centroid (O(N) saved memory via checkpoint)
+        x_centroid = balanced_sinkhorn_transport(
+            Q_s, K_s, x_res, self.eps, self.alpha_h, self.r_h,
+            K_iter=K_ITER, mask=mask,
+        )
+        # x_centroid: (B, H, N, 3)
+
+        # ================================================================
+        # [Step 4] Gated Coordinate Update
+        # ================================================================
+        # vec_h = centroid - x → displacement toward transport target
+        vec_h = x_centroid - x_res.unsqueeze(1).to(x_centroid.dtype)  # (B, H, N, 3)
+
+        # Mobility gate G_i: sigmoid → per-residue ∈ (0, 1)
+        gate = torch.sigmoid(self.w_gate(self.ln_gate(h)))  # (B, N, 1)
+        self._last_gate = gate.detach()
+
+        # Intensity gate λ_h: tanh(raw) / H → per-head bounded, averaged
+        lam = torch.tanh(self.lambda_h_raw).view(1, H, 1, 1) / H
+        weighted_disp = (lam * vec_h).sum(dim=1)  # (B, N, 3)
+
+        x_update = gate * weighted_disp  # (B, N, 3)
+        x_update = x_update * mask.unsqueeze(-1)
+        x_res = x_res + x_update.to(x_res.dtype)
 
         if unbatched:
-            return (
-                h.squeeze(0),
-                x_res.squeeze(0),
-                log_u_out.squeeze(0),
-                log_v_out.squeeze(0),
-            )
-        return h, x_res, log_u_out, log_v_out
+            return h.squeeze(0), x_res.squeeze(0)
+        return h, x_res

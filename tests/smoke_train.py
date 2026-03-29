@@ -118,7 +118,7 @@ def main():
         h_res=16,
         h_msa=8,
         n_msa_blocks=1,
-        n_uot_blocks=4,  # 4 instead of 48
+        n_trunk_blocks=4,  # 4 instead of 48
         n_diff_transformer_layers=2,
         n_diff_encoder_blocks=1,
         n_diff_decoder_blocks=1,

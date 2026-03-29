@@ -3,7 +3,7 @@
 import torch
 
 from deepfold.model.msa import MSABlock
-from deepfold.model.trunk_block import TokenUOTBlock
+from deepfold.model.trunk_block import TokenOTBlock
 from deepfold.model.position_encoding import compute_bins
 from deepfold.model.diffusion import (
     AtomBlock,
@@ -32,48 +32,35 @@ class TestMSABlock:
         assert c_bar.shape == (N, 4)  # coevol_rank=4
 
 
-class TestTokenUOTBlock:
+class TestTokenOTBlock:
     def test_shape(self):
         N, H = 10, 4
-        block = TokenUOTBlock(d_model=64, n_heads=H, block_idx=0)
+        block = TokenOTBlock(d_model=64, n_heads=H, block_idx=0)
         # Override eps for smaller head count
         block.eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
 
         h = torch.randn(N, 64)
         x_res = torch.randn(N, 3)
-        mu = torch.ones(H, N) / N
-        nu = torch.ones(H, N) / N
 
         chain_id = torch.zeros(N, dtype=torch.long)
         global_idx = torch.arange(N, dtype=torch.long)
         bond_matrix = torch.zeros(N, N, dtype=torch.bool)
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
-        h_out, x_out, log_u, log_v = block(
-            h,
-            x_res,
-            mu,
-            nu,
-            None,
-            None,
-            pos_bins,
-        )
+        h_out, x_out = block(h, x_res, pos_bins)
 
         assert h_out.shape == (N, 64)
         assert x_out.shape == (N, 3)
-        assert log_u.shape == (H, N)
 
-    def test_egnn_equivariance(self):
-        """EGNN coordinate update should be SE(3) equivariant (SPEC §8.1)."""
+    def test_coordinate_equivariance(self):
+        """Coordinate update should be rotation equivariant (SPEC §8.1)."""
         torch.manual_seed(42)
         N, H = 8, 4
-        block = TokenUOTBlock(d_model=64, n_heads=H, block_idx=0)
+        block = TokenOTBlock(d_model=64, n_heads=H, block_idx=0)
         block.eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
-        # Set nonzero gamma bias to test equivariance
-        block.w_gamma.bias.data = torch.randn(H) * 0.1
+        # Set nonzero lambda to test equivariance
+        block.lambda_h_raw.data = torch.randn(H) * 0.1
 
         h = torch.randn(N, 64)
-        mu = torch.ones(H, N) / N
-        nu = torch.ones(H, N) / N
         chain_id = torch.zeros(N, dtype=torch.long)
         global_idx = torch.arange(N, dtype=torch.long)
         bond_matrix = torch.zeros(N, N, dtype=torch.bool)
@@ -81,27 +68,21 @@ class TestTokenUOTBlock:
         x_res = torch.randn(N, 3)
 
         # Forward pass 1: original
-        _, x_out1, _, _ = block(
-            h, x_res, mu, nu, None, None, pos_bins
-        )
+        _, x_out1 = block(h, x_res, pos_bins)
 
         # Forward pass 2: rotated input
-        # Random rotation matrix
         q = torch.randn(3, 3)
         R, _ = torch.linalg.qr(q)
         if R.det() < 0:
             R[:, 0] *= -1
-        t = torch.randn(3)  # translation
 
-        x_rotated = x_res @ R.T + t
-        _, x_out2, _, _ = block(
-            h, x_rotated, mu, nu, None, None, pos_bins
-        )
+        x_rotated = x_res @ R.T
+        _, x_out2 = block(h, x_rotated, pos_bins)
 
-        # x_out2 should be x_out1 @ R.T + t
-        x_expected = x_out1 @ R.T + t
+        # x_out2 should be x_out1 @ R.T (rotation equivariant)
+        x_expected = x_out1 @ R.T
         assert torch.allclose(x_out2, x_expected, atol=1e-4), (
-            f"EGNN equivariance failed: max diff = {(x_out2 - x_expected).abs().max()}"
+            f"Equivariance failed: max diff = {(x_out2 - x_expected).abs().max()}"
         )
 
 

@@ -1,6 +1,6 @@
 """Test consistency between Triton kernel and Python fallback paths.
 
-1. TokenUOTBlock train (dense) vs eval (flash) consistency
+1. TokenOTBlock train (dense) vs eval (flash) consistency
 2. Direct Triton forward vs Python fallback forward at flash_sinkhorn_attn level
 """
 
@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from deepfold.model.position_encoding import compute_bins
-from deepfold.model.trunk_block import TokenUOTBlock
+from deepfold.model.trunk_block import TokenOTBlock
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -16,7 +16,7 @@ class TestTritonFallbackConsistency:
     """Compare training (dense Sinkhorn) vs inference (flash Sinkhorn) outputs."""
 
     def _make_block(self, d_model=64, n_heads=4):
-        block = TokenUOTBlock(d_model=d_model, n_heads=n_heads, block_idx=0)
+        block = TokenOTBlock(d_model=d_model, n_heads=n_heads, block_idx=0)
         block.eps = torch.tensor([0.5, 1.0, 2.0, 4.0])
         return block
 

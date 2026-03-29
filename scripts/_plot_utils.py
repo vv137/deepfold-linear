@@ -42,14 +42,14 @@ def extract_param(ckpt_path, suffix, activation):
 
     params = {}
     for k, v in state.items():
-        if k.startswith("trunk.uot_blocks.") and k.endswith(suffix):
+        if k.startswith("trunk.trunk_blocks.") and k.endswith(suffix):
             idx = int(k.split(".")[2])
             params[idx] = v.clone()
 
     del state
 
     if not params:
-        raise RuntimeError(f"No trunk.uot_blocks.*{suffix} found in {ckpt_path}")
+        raise RuntimeError(f"No trunk.trunk_blocks.*{suffix} found in {ckpt_path}")
 
     n_layers = max(params) + 1
     param_map = activation(torch.stack([params[i] for i in range(n_layers)])).numpy()

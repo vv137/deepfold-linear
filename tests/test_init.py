@@ -2,7 +2,6 @@
 
 import math
 
-import torch
 import torch.nn as nn
 
 
@@ -17,7 +16,7 @@ def _make_small_model():
         h_res=4,
         h_msa=4,
         n_msa_blocks=1,
-        n_uot_blocks=4,
+        n_trunk_blocks=4,
         n_diff_transformer_layers=2,
         n_diff_encoder_blocks=1,
         n_diff_decoder_blocks=1,
@@ -65,7 +64,7 @@ class TestXavierInit:
     def test_trunk_uot_w_q_is_xavier_scale(self):
         model = _make_small_model()
         for name, p in model.named_parameters():
-            if "trunk.uot_blocks.0.w_q.weight" in name:
+            if "trunk.trunk_blocks.0.w_q.weight" in name:
                 fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(p)
                 expected_std = math.sqrt(2.0 / (fan_in + fan_out))
                 actual_std = p.std().item()
@@ -89,7 +88,7 @@ class TestDepthScaling:
     def test_trunk_w_o_scaled(self):
         model = _make_small_model()
         for name, p in model.named_parameters():
-            if "trunk.uot_blocks.0.w_o.weight" in name:
+            if "trunk.trunk_blocks.0.w_o.weight" in name:
                 fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(p)
                 xavier_std = math.sqrt(2.0 / (fan_in + fan_out))
                 xavier_std / math.sqrt(48)  # always uses 48
@@ -103,7 +102,7 @@ class TestDepthScaling:
         """SwiGLU output should NOT be depth-scaled (self-suppression suffices)."""
         model = _make_small_model()
         for name, p in model.named_parameters():
-            if "trunk.uot_blocks.0.swiglu.out_proj.weight" in name:
+            if "trunk.trunk_blocks.0.swiglu.out_proj.weight" in name:
                 fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(p)
                 xavier_std = math.sqrt(2.0 / (fan_in + fan_out))
                 actual_std = p.std().item()

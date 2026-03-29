@@ -19,11 +19,11 @@ def _log_grad_spike(model: nn.Module, step: int, grad_norm: float) -> None:
     for name, param in raw.named_parameters():
         if param.grad is None:
             continue
-        # Group by top-level module: trunk.uot_blocks.3.w_q → trunk
+        # Group by top-level module: trunk.trunk_blocks.3.w_q → trunk
         parts = name.split(".")
         key = parts[0] if len(parts) > 1 else name
         g = param.grad.norm().item()
-        if key not in module_norms or g > module_norms[key]:
+        if key not in module_norms or g > module_norms[key][0]:
             module_norms[key] = (g, name)
     top = sorted(module_norms.items(), key=lambda x: -x[1][0])[:5]
     lines = [f"  {mod}: max_grad={gn:.1f} ({pname})" for mod, (gn, pname) in top]
@@ -95,30 +95,25 @@ def build_optimizer(
 ) -> AdamW:
     """Build AdamW optimizer with 2 param groups (SPEC §13.1).
 
-    1. Standalone weight matrices (not post-LN): weight_decay
-    2. No decay: LN γ/β, biases, post-LN projections (w_q/w_k/w_v/w_g/w_o,
-       SwiGLU — scale-invariant under LN), bounded params (w_dist_raw,
-       gamma), position bias (Swin convention)
+    Decay: all weight matrices (MHA Q/K/V/O, Sinkhorn Q/K, SwiGLU, w_gate).
+    No decay: LN γ/β, biases, small scalars (alpha_h, r_h, lambda_h),
+              position bias (Swin convention).
     """
-    # Post-LN projection names — scale-invariant, no decay
-    _POST_LN_NAMES = {"w_q", "w_k", "w_v", "w_g", "w_o", "swiglu"}
-    # Bounded, gating, or position bias — no decay
-    # Note: gamma is handled by the explicit check above, not here
-    _NO_DECAY_SPECIAL = {"w_dist_raw"}
+    # Small per-head scalars — no decay
+    _NO_DECAY_SCALARS = {"alpha_h", "r_h", "lambda_h", "eps"}
 
     decay_params = []
     no_decay_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "w_gamma" in name:
-            # EGNN gamma gate — no decay on both weight and bias
+        if "layernorm" in name.lower() or ".ln_" in name or name.endswith(".ln.weight") or name.endswith(".ln.bias"):
             no_decay_params.append(param)
-        elif "layernorm" in name.lower() or "ln" in name.lower() or "bias" in name:
+        elif "bias" in name:
             no_decay_params.append(param)
-        elif any(k in name for k in _POST_LN_NAMES):
+        elif "pos_bias" in name:
             no_decay_params.append(param)
-        elif any(k in name for k in _NO_DECAY_SPECIAL):
+        elif any(name.endswith(f".{k}") for k in _NO_DECAY_SCALARS):
             no_decay_params.append(param)
         else:
             decay_params.append(param)

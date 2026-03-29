@@ -44,7 +44,7 @@ class DeepFoldLinear(nn.Module):
         h_res: int = 16,
         h_msa: int = 8,
         n_msa_blocks: int = 4,
-        n_uot_blocks: int = 48,
+        n_trunk_blocks: int = 48,
         # Diffusion v2 config
         n_diff_transformer_layers: int = 24,
         n_diff_encoder_blocks: int = 3,
@@ -75,7 +75,7 @@ class DeepFoldLinear(nn.Module):
             h_res=h_res,
             h_msa=h_msa,
             n_msa_blocks=n_msa_blocks,
-            n_uot_blocks=n_uot_blocks,
+            n_trunk_blocks=n_trunk_blocks,
             sigma_data=sigma_data,
             max_cycles=max_cycles,
             inference_cycles=inference_cycles,
@@ -167,7 +167,7 @@ class DeepFoldLinear(nn.Module):
             num_cycles = self.trunk.inference_cycles
 
         # ---- Trunk ----
-        h_res, mu, nu, x_res = self.trunk(
+        h_res, x_res = self.trunk(
             token_type,
             profile,
             del_mean,
@@ -191,7 +191,7 @@ class DeepFoldLinear(nn.Module):
         if not is_batched:
             def _unsqueeze(t):
                 return t.unsqueeze(0) if t is not None else None
-            h_res, mu, nu, x_res = _unsqueeze(h_res), _unsqueeze(mu), _unsqueeze(nu), _unsqueeze(x_res)
+            h_res, x_res = _unsqueeze(h_res), _unsqueeze(x_res)
             c_atom, token_idx, token_type, s_inputs, pos_bins = (
                 _unsqueeze(c_atom), _unsqueeze(token_idx), _unsqueeze(token_type),
                 _unsqueeze(s_inputs), _unsqueeze(pos_bins),
@@ -216,7 +216,7 @@ class DeepFoldLinear(nn.Module):
             token_atom_starts = torch.stack(starts_list)
             token_atom_counts = torch.stack(counts_list)
 
-        result = {"h_res": h_res, "mu": mu, "nu": nu, "x_res": x_res, "num_cycles": num_cycles}
+        result = {"h_res": h_res, "x_res": x_res, "num_cycles": num_cycles}
 
         if (self.training or compute_losses) and x_atom_true is not None and x_res_true is not None:
             # ---- Training: M augmented diffusion samples (Boltz-style multiplicity) ----
@@ -399,7 +399,7 @@ class DeepFoldLinear(nn.Module):
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
 
         # Trunk
-        h_res, mu, nu, x_res = self.trunk(
+        h_res, x_res = self.trunk(
             token_type, profile, del_mean, has_msa, msa_feat,
             c_atom, p_lm, p_lm_idx, token_idx,
             chain_id, global_idx, bond_matrix, msa_token_mask,

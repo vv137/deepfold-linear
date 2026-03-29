@@ -4,8 +4,8 @@ Two-tier philosophy:
   1. Representation path (h_res): near-identity across all blocks.
      W_O scaled by 1/sqrt(L) per module depth. Each block starts weak.
   2. Coordinate path (x_res): dormant at init.
-     W_gamma=0, W_gamma.bias~N(0,1e-4), w_dist_raw=0 (midpoint), w_rel=0.
-     Content-only attention first; geometry starts at midpoint.
+     alpha_h=0 (cost weight midpoint 0.5), w_gate bias=0 (tanh gate starts at 0),
+     lambda_h=1 (unit displacement scale), pos_bias=0.
 """
 
 import math
@@ -15,17 +15,7 @@ import torch.nn as nn
 
 def _is_zero_init(name: str) -> bool:
     """Parameters that must stay at zero (dormant at init)."""
-    return any(k in name for k in ("mu_proj", "nu_proj", "coevol_to_marginal"))
-
-
-def _is_gamma_weight(name: str) -> bool:
-    """EGNN gamma gate W_gamma.weight — zeros init (dormant at init)."""
-    return "w_gamma.weight" in name
-
-
-def _is_gamma_bias(name: str) -> bool:
-    """EGNN gamma gate W_gamma.bias — noise init for symmetry breaking."""
-    return "w_gamma.bias" in name
+    return any(k in name for k in ("alpha_h",))
 
 
 def _is_adaln_zero_gate(name: str) -> bool:
@@ -40,23 +30,22 @@ def _is_position_bias(name: str) -> bool:
 
 def init_model(
     model: nn.Module,
-    gamma_std: float = 1e-4,
     adaln_gate_bias: float = -2.0,
+    **kwargs,
 ) -> None:
     """Apply SPEC §14 initialization to a DeepFoldLinear model.
 
     - Xavier normal for all 2D weight matrices (except zero-init ones).
     - Attention output (w_o) scaled by 1/sqrt(L) for residual depth control.
     - SwiGLU output NOT depth-scaled (product structure self-suppresses).
-    - W_gamma.weight zeros, W_gamma.bias ~ N(0, gamma_std) (dormant + symmetry breaking).
-    - Zeros for w_rel, zero_init_linear outputs.
-    - w_dist_raw=0 (algebraic sigmoid midpoint = 0.5).
+    - alpha_h=0 (cost weight sigmoid midpoint = 0.5).
+    - lambda_h=1 (unit displacement scale, PyTorch default).
+    - Zeros for pos_bias weights.
     - LayerNorm: weight=1, bias=0 (PyTorch default, but explicit).
     - Biases: zeros (PyTorch default).
     """
     # Collect depth info: module name -> number of sibling blocks
-    # trunk.uot_blocks.X  -> 48 blocks
-    # diffusion.diff_uot_blocks.X -> 2 blocks
+    # trunk.trunk_blocks.X  -> 48 blocks
     # msa_module.blocks.X -> 4 blocks (MSA)
     # diffusion.atom_blocks.X -> 3 blocks
     # atom_encoder -> 1 block (no depth scaling needed)
@@ -76,11 +65,7 @@ def init_model(
 
         if param.dim() < 2:
             # Scalars and 1D params
-            if _is_gamma_bias(name):
-                param.data.normal_(0, gamma_std)
-            elif "w_dist_raw" in name:
-                nn.init.zeros_(param)  # algebraic sigmoid(0) = 0.5 midpoint
-            elif _is_zero_init(name) or _is_position_bias(name):
+            if _is_zero_init(name) or _is_position_bias(name):
                 nn.init.zeros_(param)
             elif (
                 "layernorm" in name.lower()
@@ -92,11 +77,11 @@ def init_model(
                     nn.init.ones_(param)
                 else:
                     nn.init.zeros_(param)
-            # All other 1D (biases) stay at PyTorch default (zeros)
+            # All other 1D (biases, lambda_h, r_h) stay at PyTorch default
             continue
 
         # 2D weight matrices
-        if _is_zero_init(name) or _is_position_bias(name) or _is_gamma_weight(name):
+        if _is_zero_init(name) or _is_position_bias(name):
             nn.init.zeros_(param)
             continue
 
@@ -120,10 +105,8 @@ def _get_residual_depth(name: str) -> int | None:
     Only applies to repeated block stacks where residual contributions
     accumulate. Returns None for non-block parameters.
     """
-    if ".uot_blocks." in name and "diff_uot_blocks" not in name:
-        return 48  # trunk UOT+EGNN blocks
-    if ".diff_uot_blocks." in name:
-        return 2  # diffusion UOT blocks
+    if ".trunk_blocks." in name:
+        return 48  # trunk OT blocks
     if "msa_module.blocks." in name or "msa_module.blocks" in name:
         return 4  # MSA blocks
     if ".atom_blocks." in name:

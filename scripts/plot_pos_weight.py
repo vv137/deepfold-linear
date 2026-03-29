@@ -32,8 +32,8 @@ SHARED_KEYS = {
     "diffusion": "diffusion.pos_bias.weight",
 }
 
-# Trunk has per-layer pos_bias: trunk.uot_blocks.{i}.pos_bias.weight
-TRUNK_PATTERN = re.compile(r"trunk\.uot_blocks\.(\d+)\.pos_bias\.weight")
+# Trunk has per-layer pos_bias: trunk.trunk_blocks.{i}.pos_bias.weight
+TRUNK_PATTERN = re.compile(r"trunk\.trunk_blocks\.(\d+)\.pos_bias\.weight")
 
 
 def extract_all_pos_weights(ckpt_path, layers=None):

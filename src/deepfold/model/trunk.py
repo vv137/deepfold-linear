@@ -1,15 +1,13 @@
-"""Trunk / Recycling Loop (SPEC §5). Manages MSA + Token UOT+EGNN blocks.
+"""Trunk / Recycling Loop (SPEC §5, v6.0). Manages MSA + Token OT blocks.
 
 Supports both unbatched and batched inputs via dual-mode pattern.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from deepfold.model.msa import MSAModule
-from deepfold.model.primitives import zero_init_linear
-from deepfold.model.trunk_block import TokenUOTBlock
+from deepfold.model.trunk_block import TokenOTBlock
 from deepfold.model.position_encoding import compute_bins
 from deepfold.model.input_embedding import (
     TokenSingleEmbedding,
@@ -29,10 +27,11 @@ class Trunk(nn.Module):
         h_res: int = 16,
         h_msa: int = 8,
         n_msa_blocks: int = 4,
-        n_uot_blocks: int = 48,
+        n_trunk_blocks: int = 48,
         sigma_data: float = 16.0,
         max_cycles: int = 5,
         inference_cycles: int = 3,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -55,20 +54,16 @@ class Trunk(nn.Module):
             h_res=h_res,
         )
 
-        # Token UOT+EGNN blocks
-        self.uot_blocks = nn.ModuleList(
+        # Token OT blocks (MHA + balanced Sinkhorn)
+        self.trunk_blocks = nn.ModuleList(
             [
-                TokenUOTBlock(d_model=d_model, n_heads=h_res, block_idx=i)
-                for i in range(n_uot_blocks)
+                TokenOTBlock(
+                    d_model=d_model, n_heads=h_res,
+                    dropout=dropout, block_idx=i,
+                )
+                for i in range(n_trunk_blocks)
             ]
         )
-
-        # Shared marginal projections — per-block mu/nu from current h_res
-        # LN stabilizes input scale across 48 blocks of varying depth
-        # bias=False after LN (SPEC §0); zero-init weight: uniform marginals at start
-        self.ln_mu = nn.LayerNorm(d_model)
-        self.mu_proj = nn.Linear(d_model, h_res, bias=False)
-        self.nu_proj = nn.Linear(d_model, h_res, bias=False)
 
     def forward(
         self,
@@ -88,7 +83,7 @@ class Trunk(nn.Module):
         token_pad_mask: torch.Tensor | None = None,
         msa_mask: torch.Tensor | None = None,
         num_cycles: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             token_type:     (N,) or (B, N) int
@@ -110,8 +105,6 @@ class Trunk(nn.Module):
 
         Returns:
             h_res:  (N, 512) or (B, N, 512)
-            mu:     (H, N) or (B, H, N)
-            nu:     (H, N) or (B, H, N)
             x_res:  (N, 3) or (B, N, 3)
         """
         # Dual-mode: detect unbatched
@@ -133,21 +126,17 @@ class Trunk(nn.Module):
 
         device = token_type.device
         B, N = token_type.shape
-        token_idx.shape[1]
 
         if token_pad_mask is None:
             token_pad_mask = token_type.new_ones(B, N).float()
         token_pad_mask_f = token_pad_mask.float()
-        # Precompute frequently used mask shapes
         mask_3d = token_pad_mask_f.unsqueeze(-1)  # (B, N, 1)
         mask_sum = token_pad_mask_f.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
 
         # ---- Input embedding (SPEC §3) ----
         h_res = self.token_embed(token_type, profile, del_mean, has_msa)  # (B, N, 512)
-        # msa_feat: (B, C, S, N_prot, 34) — per-cycle MSA, embedded inside cycle loop
 
         # Atom-to-token encoder (runs once, SPEC §3.5)
-        # Per-sample loop: atom encoder uses scatter_mean with sample-specific indices
         atom_agg = torch.stack(
             [
                 self.atom_encoder(c_atom[b], p_lm[b], p_lm_idx[b], token_idx[b], N)
@@ -166,7 +155,6 @@ class Trunk(nn.Module):
 
         # Precompute position bins
         pos_bins = compute_bins(chain_id, global_idx, bond_matrix)  # (B, N, N)
-        # msa_feat: (B, C, S, N_prot, 34) or (C, S, N_prot, 34)
         N_prot = msa_feat.shape[-2]
         if N_prot > 0:
             msa_bins = _compute_msa_bins_batched(
@@ -174,11 +162,6 @@ class Trunk(nn.Module):
             )
         else:
             msa_bins = torch.zeros(B, 0, 0, device=device, dtype=torch.long)
-
-        # Initialize log dual variables
-        H = self.h_res
-        log_u_carry = torch.zeros(B, H, N, device=device, dtype=torch.float32)
-        log_v_carry = torch.zeros(B, H, N, device=device, dtype=torch.float32)
 
         for cycle in range(num_cycles):
             is_last = cycle == num_cycles - 1
@@ -195,62 +178,27 @@ class Trunk(nn.Module):
 
             # ---- MSA module: 4 blocks + coevol bias (SPEC §6) ----
             if is_last:
-                m, h_res, coevol_bias = self.msa_module(
-                    m,
-                    h_res,
-                    msa_token_mask,
-                    msa_bins,
-                    msa_mask=cycle_msa_mask,
-                    training=self.training,
+                m, h_res, _coevol_bias = self.msa_module(
+                    m, h_res, msa_token_mask, msa_bins,
+                    msa_mask=cycle_msa_mask, training=self.training,
                 )
             else:
                 with torch.no_grad():
-                    m, h_res, coevol_bias = self.msa_module(
-                        m,
-                        h_res,
-                        msa_token_mask,
-                        msa_bins,
-                        msa_mask=cycle_msa_mask,
-                        training=self.training,
+                    m, h_res, _coevol_bias = self.msa_module(
+                        m, h_res, msa_token_mask, msa_bins,
+                        msa_mask=cycle_msa_mask, training=self.training,
                     )
 
-            # ---- Token UOT+EGNN blocks x48 (SPEC §8) ----
-            # Per-block marginals from current h_res + coevol_bias
-            log_u_prev = log_u_carry
-            log_v_prev = log_v_carry
-
-            for block in self.uot_blocks:
-                # Compute per-block marginals from current h_res
-                h_n = self.ln_mu(h_res)
-                mu_logit = self.mu_proj(h_n).permute(0, 2, 1)  # (B, H, N)
-                nu_logit = self.nu_proj(h_n).permute(0, 2, 1)  # (B, H, N)
-                mu = F.softmax(mu_logit + coevol_bias, dim=-1)
-                nu = F.softmax(nu_logit + coevol_bias, dim=-1)
-                mu = mu * token_pad_mask_f.unsqueeze(1)
-                nu = nu * token_pad_mask_f.unsqueeze(1)
-
+            # ---- Token OT blocks ×48 (SPEC §8) ----
+            for block in self.trunk_blocks:
                 if is_last:
-                    h_res, x_res, log_u_prev, log_v_prev = block(
-                        h_res,
-                        x_res,
-                        mu,
-                        nu,
-                        log_u_prev,
-                        log_v_prev,
-                        pos_bins,
-                        mask=token_pad_mask,
+                    h_res, x_res = block(
+                        h_res, x_res, pos_bins, mask=token_pad_mask,
                     )
                 else:
                     with torch.no_grad():
-                        h_res, x_res, log_u_prev, log_v_prev = block(
-                            h_res,
-                            x_res,
-                            mu,
-                            nu,
-                            log_u_prev,
-                            log_v_prev,
-                            pos_bins,
-                            mask=token_pad_mask,
+                        h_res, x_res = block(
+                            h_res, x_res, pos_bins, mask=token_pad_mask,
                         )
 
             # Re-center x_res per sample (once per cycle, SPEC §5.2)
@@ -261,15 +209,10 @@ class Trunk(nn.Module):
             if not is_last:
                 h_res = h_res.detach()
                 x_res = x_res.detach()
-                log_u_carry = log_u_prev.detach() if log_u_prev is not None else None
-                log_v_carry = log_v_prev.detach() if log_v_prev is not None else None
-            else:
-                log_u_carry = log_u_prev
-                log_v_carry = log_v_prev
 
         if unbatched:
-            return h_res.squeeze(0), mu.squeeze(0), nu.squeeze(0), x_res.squeeze(0)
-        return h_res, mu, nu, x_res
+            return h_res.squeeze(0), x_res.squeeze(0)
+        return h_res, x_res
 
 
 def _compute_msa_bins_batched(
@@ -302,7 +245,6 @@ def _compute_msa_bins_batched(
     prot_global = torch.gather(global_idx, 1, prot_indices)  # (B, N_prot)
 
     # Gather protein bond_matrix: (B, N_prot, N_prot)
-    # First gather rows, then columns
     idx_row = prot_indices.unsqueeze(2).expand(B, N_prot, N)  # (B, N_prot, N)
     prot_bond_rows = torch.gather(bond_matrix, 1, idx_row)  # (B, N_prot, N)
     idx_col = prot_indices.unsqueeze(1).expand(B, N_prot, N_prot)  # (B, N_prot, N_prot)

@@ -9,7 +9,6 @@ Usage:
 import argparse
 from pathlib import Path
 
-import torch
 
 from _plot_utils import extract_param, compute_stats, print_stats, print_table, plot_heatmap, iter_checkpoints
 from deepfold.model.primitives import algebraic_sigmoid
