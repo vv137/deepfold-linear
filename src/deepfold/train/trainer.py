@@ -253,11 +253,16 @@ def train_step(
 def val_step(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
+    rollout: bool = False,
+    rollout_steps: int = 20,
+    rollout_samples: int = 5,
 ) -> dict[str, float]:
     """Single validation step with mixed precision.
 
     Uses model.eval() to disable dropout and stochastic behavior.
     compute_losses=True ensures losses are computed despite eval mode.
+    If rollout=True, also runs a mini-rollout (short diffusion sampling)
+    and reports best-of-N MSE/LDDT metrics.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -275,4 +280,21 @@ def val_step(
         "l_trunk_slddt": outputs.get("l_trunk_slddt", torch.tensor(0.0)).item(),
         "l_trunk_logmse": outputs.get("l_trunk_logmse", torch.tensor(0.0)).item(),
     }
+
+    # Mini-rollout: short diffusion sampling + symmetry correction
+    if rollout:
+        # Filter batch keys to mini_rollout signature
+        base = model.module if hasattr(model, "module") else model
+        with torch.amp.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
+        ):
+            rollout_metrics = base.mini_rollout(
+                **{k: v for k, v in batch.items()
+                   if k not in ("pair_valid_mask", "msa_mask", "x_res_true",
+                                "compute_losses")},
+                n_steps=rollout_steps,
+                n_samples=rollout_samples,
+            )
+        metrics.update(rollout_metrics)
+
     return _reduce_metrics(metrics, device)

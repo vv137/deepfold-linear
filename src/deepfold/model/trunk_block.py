@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold.model.kernels.flash_sinkhorn_transport import balanced_sinkhorn_transport
+from deepfold.model.kernels.flash_sinkhorn_transport import (
+    balanced_sinkhorn_transport,
+    balanced_sinkhorn_transport_dual,
+)
 from deepfold.model.position_encoding import PositionBias
 from deepfold.model.primitives import SwiGLU
 
@@ -61,6 +64,10 @@ class TokenOTBlock(nn.Module):
         self.ln_sink = nn.LayerNorm(d_model)
         self.w_q_sink = nn.Linear(d_model, d_model, bias=False)
         self.w_k_sink = nn.Linear(d_model, d_model, bias=False)
+
+        # Transport-weighted feature aggregation (coupled update)
+        self.w_v_sink = nn.Linear(d_model, d_model, bias=False)  # V projection for T@V
+        self.w_o_sink = nn.Linear(d_model, d_model, bias=False)  # output projection
 
         # Mixing gate α_h: sigmoid(alpha_h) blends feat vs geo
         # Init -1.0 → sigmoid(-1) ≈ 0.27 → start sequence/feature-heavy
@@ -149,22 +156,29 @@ class TokenOTBlock(nn.Module):
         h = h + ff_update
 
         # ================================================================
-        # [Step 2–3] Balanced Sinkhorn Transport
+        # [Step 2–3] Balanced Sinkhorn Transport (coupled h + x update)
         # ================================================================
         h_s = self.ln_sink(h)
         Q_s = self.w_q_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
         K_s = self.w_k_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
+        V_s = self.w_v_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        # L2-normalize for cosine cost
+        # L2-normalize Q, K for cosine cost (V not normalized)
         Q_s = F.normalize(Q_s, dim=-1)
         K_s = F.normalize(K_s, dim=-1)
 
-        # Balanced Sinkhorn → centroid (O(N) saved memory via checkpoint)
-        x_centroid = balanced_sinkhorn_transport(
-            Q_s, K_s, x_res, self.eps, self.alpha_h, self.r_h,
+        # Fused dual transport: T@x (coords) + T@V (features) in one pass
+        x_centroid, h_centroid = balanced_sinkhorn_transport_dual(
+            Q_s, K_s, x_res, V_s, self.eps, self.alpha_h, self.r_h,
             K_iter=K_ITER, mask=mask,
         )
-        # x_centroid: (B, H, N, 3)
+        # x_centroid: (B, H, N, 3), h_centroid: (B, H, N, d_h)
+
+        # ---- Feature update: transport-weighted spatial context → h ----
+        h_transport = h_centroid.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
+        h_update_sink = self.w_o_sink(h_transport)
+        h_update_sink = h_update_sink * mask.unsqueeze(-1)
+        h = h + h_update_sink
 
         # ================================================================
         # [Step 4] Gated Coordinate Update

@@ -39,23 +39,37 @@ logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 
-def _run_validation(raw_model, ema, val_loader, device, max_batches):
+def _batch_to_device(batch, device):
+    """Move batch to device, handling non-tensor symmetry keys."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v  # list keys (symmetry specs) stay on CPU
+    return out
+
+
+def _run_validation(raw_model, ema, val_loader, device, max_batches,
+                    rollout=False, rollout_steps=20, rollout_samples=5):
     """Run validation epoch with EMA weights, return averaged metrics or None."""
     gc.collect()
     torch.cuda.empty_cache()
     ema.apply(raw_model)
-    metrics_sum = {
-        k: 0.0 for k in ("loss", "l_diff", "l_lddt", "l_disto", "l_trunk_slddt", "l_trunk_logmse")
-    }
+    base_keys = ["loss", "l_diff", "l_lddt", "l_disto", "l_trunk_slddt", "l_trunk_logmse"]
+    if rollout:
+        base_keys += ["rollout_mse", "rollout_slddt", "rollout_lddt"]
+    metrics_sum = {k: 0.0 for k in base_keys}
     n_val = 0
     max_val = max_batches if max_batches > 0 else len(val_loader)
     for val_batch in val_loader:
         if n_val >= max_val:
             break
-        val_batch = {k: v.to(device, non_blocking=True) for k, v in val_batch.items()}
-        vm = val_step(raw_model, val_batch)
+        val_batch = _batch_to_device(val_batch, device)
+        vm = val_step(raw_model, val_batch, rollout=rollout,
+                      rollout_steps=rollout_steps, rollout_samples=rollout_samples)
         for k in metrics_sum:
-            metrics_sum[k] += vm[k]
+            metrics_sum[k] += vm.get(k, 0.0)
         n_val += 1
         del val_batch, vm
     ema.restore(raw_model)
@@ -665,7 +679,7 @@ def main():
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
 
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch = _batch_to_device(batch, device)
 
             is_last_micro = micro == grad_accum - 1
             result = train_step(

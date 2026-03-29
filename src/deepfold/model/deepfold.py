@@ -28,10 +28,53 @@ from deepfold.model.losses import (
     log_distance_mse,
     smooth_lddt,
     total_loss,
+    weighted_rigid_align,
 )
 from deepfold.data.augment import batch_augment
 from deepfold.data import const
 from deepfold.data.symmetry import apply_symmetry_correction
+
+
+def _heun_sample(denoise_fn, sigmas, x_init):
+    """Heun 2nd-order ODE sampler. All no_grad — caller manages context."""
+    x = x_init
+    n_steps = len(sigmas)
+    for i in range(n_steps - 1):
+        s_cur, s_nxt = sigmas[i], sigmas[i + 1]
+        denoised = denoise_fn(x, s_cur)
+        d_cur = (x - denoised) / s_cur
+        x_nxt = x + (s_nxt - s_cur) * d_cur
+        if s_nxt > 0 and i < n_steps - 2:
+            d_nxt = (x_nxt - denoise_fn(x_nxt, s_nxt)) / s_nxt
+            x_nxt = x + (s_nxt - s_cur) * 0.5 * (d_cur + d_nxt)
+        x = x_nxt
+    return x
+
+
+def _apply_symmetry_batch(pred, true, resolved_mask, atom_weights,
+                           sym_all_coords, sym_all_resolved_mask,
+                           sym_crop_to_all_atom_map,
+                           sym_chain_symmetries, sym_amino_acid_symmetries,
+                           is_batched):
+    """Apply symmetry correction, handling batched/unbatched dispatch."""
+    if is_batched:
+        corr, corr_rm = [], []
+        for b in range(pred.shape[0]):
+            ct, cr = apply_symmetry_correction(
+                pred[b], true[b], resolved_mask[b], atom_weights[b],
+                sym_all_coords[b], sym_all_resolved_mask[b],
+                sym_crop_to_all_atom_map[b],
+                sym_chain_symmetries[b], sym_amino_acid_symmetries[b],
+            )
+            corr.append(ct); corr_rm.append(cr)
+        return torch.stack(corr), torch.stack(corr_rm)
+    else:
+        return apply_symmetry_correction(
+            pred, true, resolved_mask, atom_weights,
+            sym_all_coords.squeeze(0), sym_all_resolved_mask.squeeze(0),
+            sym_crop_to_all_atom_map.squeeze(0),
+            sym_chain_symmetries[0], sym_amino_acid_symmetries[0],
+        )
 
 
 class DeepFoldLinear(nn.Module):
@@ -269,8 +312,34 @@ class DeepFoldLinear(nn.Module):
             l_diff_parts = []
             l_lddt_parts = []
 
-            # Symmetry correction: precompute per-sample corrected coords
-            has_sym = sym_chain_symmetries is not None
+            # ---- Symmetry: mini-rollout to determine best GT permutation ----
+            # Skip rollout for monomers (only identity permutation)
+            has_sym = (sym_chain_symmetries is not None
+                       and any(len(c) > 0 for c in sym_chain_symmetries))
+            sym_true = None   # permuted GT (shared across M samples)
+            sym_rm = None     # permuted resolved mask
+            if has_sym:
+                # 20-step no_grad Heun rollout → reference prediction
+                with torch.no_grad():
+                    sigmas_ro = karras_schedule(20, device)
+                    def _denoise_ro(x, sigma):
+                        return self.diffusion(
+                            h_res, s_inputs, c_atom, x, sigma,
+                            token_idx, pos_bins,
+                            token_atom_starts, token_atom_counts,
+                            token_pad_mask, atom_pad_mask,
+                        )
+                    x_ro = _heun_sample(
+                        _denoise_ro, sigmas_ro,
+                        torch.randn_like(x_atom_true) * SIGMA_MAX,
+                    )
+                sym_true, sym_rm = _apply_symmetry_batch(
+                    x_ro, x_atom_true, atom_resolved_mask, atom_weights,
+                    sym_all_coords, sym_all_resolved_mask,
+                    sym_crop_to_all_atom_map,
+                    sym_chain_symmetries, sym_amino_acid_symmetries,
+                    is_batched,
+                )
 
             for i in range(M):
                 x_true_i = x_atom_aug[i]  # (N_atom, 3) or (B, N_atom, 3)
@@ -299,45 +368,17 @@ class DeepFoldLinear(nn.Module):
                     use_reentrant=False,
                 )
 
-                # Symmetry correction: find best-matching GT arrangement
-                x_true_sym = x_true_i
-                resolved_sym = atom_resolved_mask
-                if has_sym:
-                    if is_batched:
-                        # Per-sample correction
-                        corrected = []
-                        corrected_rm = []
-                        B_cur = x_true_i.shape[0]
-                        for b in range(B_cur):
-                            ct, cr = apply_symmetry_correction(
-                                x_pred_i[b], x_true_i[b],
-                                atom_resolved_mask[b], atom_weights[b],
-                                sym_all_coords[b], sym_all_resolved_mask[b],
-                                sym_crop_to_all_atom_map[b],
-                                sym_chain_symmetries[b],
-                                sym_amino_acid_symmetries[b],
-                            )
-                            corrected.append(ct)
-                            corrected_rm.append(cr)
-                        x_true_sym = torch.stack(corrected)
-                        resolved_sym = torch.stack(corrected_rm)
-                    else:
-                        x_true_sym, resolved_sym = apply_symmetry_correction(
-                            x_pred_i, x_true_i,
-                            atom_resolved_mask, atom_weights,
-                            sym_all_coords.squeeze(0), sym_all_resolved_mask.squeeze(0),
-                            sym_crop_to_all_atom_map.squeeze(0),
-                            sym_chain_symmetries[0],
-                            sym_amino_acid_symmetries[0],
-                        )
+                # Use symmetry-corrected GT if available, otherwise raw
+                x_true_loss = sym_true if sym_true is not None else x_true_i
+                rm_loss = sym_rm if sym_rm is not None else atom_resolved_mask
 
                 if need_diff:
                     l_diff_parts.append(
                         edm_diffusion_loss(
                             x_pred_i,
-                            x_true_sym,
+                            x_true_loss,
                             sigma_i,
-                            resolved_mask=resolved_sym,
+                            resolved_mask=rm_loss,
                             atom_weights=atom_weights,
                         )
                     )
@@ -345,8 +386,8 @@ class DeepFoldLinear(nn.Module):
                     l_lddt_parts.append(
                         smooth_lddt(
                             x_pred_i,
-                            x_true_sym,
-                            resolved_mask=resolved_sym,
+                            x_true_loss,
+                            resolved_mask=rm_loss,
                             is_nucleotide=atom_is_nuc,
                         )
                     )
@@ -470,9 +511,7 @@ class DeepFoldLinear(nn.Module):
             token_atom_starts = torch.stack(sl)
             token_atom_counts = torch.stack(cl)
 
-        # Initialize from noise
         sigmas = karras_schedule(n_steps, device)
-        x_atom = torch.randn(B, M, 3, device=device) * SIGMA_MAX
 
         def _denoise(x, sigma):
             return self.diffusion(
@@ -481,23 +520,171 @@ class DeepFoldLinear(nn.Module):
                 token_atom_starts, token_atom_counts,
             )
 
-        # Heun 2nd-order sampling (probability flow ODE)
-        for i in range(n_steps - 1):
-            sigma_cur = sigmas[i]
-            sigma_next = sigmas[i + 1]
-
-            denoised = _denoise(x_atom, sigma_cur)
-            d_cur = (x_atom - denoised) / sigma_cur
-
-            x_next = x_atom + (sigma_next - sigma_cur) * d_cur
-
-            if sigma_next > 0 and i < n_steps - 2:
-                denoised_next = _denoise(x_next, sigma_next)
-                d_next = (x_next - denoised_next) / sigma_next
-                x_next = x_atom + (sigma_next - sigma_cur) * 0.5 * (d_cur + d_next)
-
-            x_atom = x_next
+        x_atom = _heun_sample(
+            _denoise, sigmas,
+            torch.randn(B, M, 3, device=device) * SIGMA_MAX,
+        )
 
         if is_unbatched:
             x_atom = x_atom.squeeze(0)
         return x_atom
+
+    @torch.no_grad()
+    def mini_rollout(
+        self,
+        token_type: torch.Tensor,
+        profile: torch.Tensor,
+        del_mean: torch.Tensor,
+        has_msa: torch.Tensor,
+        msa_feat: torch.Tensor,
+        c_atom: torch.Tensor,
+        p_lm: torch.Tensor,
+        p_lm_idx: torch.Tensor,
+        token_idx: torch.Tensor,
+        chain_id: torch.Tensor,
+        global_idx: torch.Tensor,
+        bond_matrix: torch.Tensor,
+        msa_token_mask: torch.Tensor,
+        token_atom_starts: torch.Tensor | None = None,
+        token_atom_counts: torch.Tensor | None = None,
+        token_pad_mask: torch.Tensor | None = None,
+        atom_pad_mask: torch.Tensor | None = None,
+        x_atom_true: torch.Tensor | None = None,
+        atom_resolved_mask: torch.Tensor | None = None,
+        token_resolved_mask: torch.Tensor | None = None,
+        sym_all_coords: torch.Tensor | None = None,
+        sym_all_resolved_mask: torch.Tensor | None = None,
+        sym_crop_to_all_atom_map: torch.Tensor | None = None,
+        sym_chain_symmetries: list | None = None,
+        sym_amino_acid_symmetries: list | None = None,
+        n_steps: int = 20,
+        n_samples: int = 5,
+    ) -> dict[str, float]:
+        """Mini-rollout validation: short diffusion + symmetry + metrics.
+
+        Runs trunk once, then n_samples independent Heun denoising rollouts
+        with n_steps each. For each sample, applies symmetry correction and
+        computes MSE / smooth-LDDT against ground truth. Reports best-of-N.
+        """
+        device = token_type.device
+        is_unbatched = token_type.dim() == 1
+
+        # Embed + trunk (once)
+        c_atom = self.atom_single_embed(c_atom)
+        p_lm = self.atom_pair_embed(p_lm[..., :3], p_lm[..., 4:5])
+        s_inputs = self.trunk.token_embed(token_type, profile, del_mean, has_msa)
+        pos_bins = compute_bins(chain_id, global_idx, bond_matrix)
+
+        h_res, x_res = self.trunk(
+            token_type, profile, del_mean, has_msa, msa_feat,
+            c_atom, p_lm, p_lm_idx, token_idx,
+            chain_id, global_idx, bond_matrix, msa_token_mask,
+            num_cycles=self.trunk.inference_cycles,
+        )
+
+        # Ensure batched
+        if is_unbatched:
+            def _unsq(t):
+                return t.unsqueeze(0) if t is not None else None
+            h_res, s_inputs, c_atom, token_idx = (
+                _unsq(h_res), _unsq(s_inputs), _unsq(c_atom), _unsq(token_idx))
+            pos_bins = _unsq(pos_bins)
+            token_atom_starts = _unsq(token_atom_starts)
+            token_atom_counts = _unsq(token_atom_counts)
+            x_atom_true = _unsq(x_atom_true)
+            atom_resolved_mask = _unsq(atom_resolved_mask)
+            token_resolved_mask = _unsq(token_resolved_mask)
+
+        B = h_res.shape[0]
+        M = token_idx.shape[1]
+        N = h_res.shape[1]
+
+        # Compute starts/counts if not provided
+        if token_atom_starts is None or token_atom_counts is None:
+            cl, sl = [], []
+            for b in range(B):
+                c = torch.bincount(token_idx[b], minlength=N).to(torch.int32)
+                cl.append(c)
+                sl.append(torch.cumsum(c, dim=0) - c)
+            token_atom_starts = torch.stack(sl)
+            token_atom_counts = torch.stack(cl)
+
+        # Per-atom weights and nucleotide flags
+        atom_weights = _atom_type_weights(token_idx, token_type if token_type.dim() >= 2 else token_type.unsqueeze(0))
+        token_is_nuc = (
+            (token_type == const.MOL_DNA) | (token_type == const.MOL_RNA)
+        ).float()
+        if token_is_nuc.dim() == 1:
+            token_is_nuc = token_is_nuc.unsqueeze(0)
+        atom_is_nuc = torch.gather(token_is_nuc, 1, token_idx)
+
+        has_sym = sym_chain_symmetries is not None
+
+        sigmas = karras_schedule(n_steps, device)
+
+        def _denoise(x, sigma):
+            return self.diffusion(
+                h_res, s_inputs, c_atom, x, sigma,
+                token_idx, pos_bins,
+                token_atom_starts, token_atom_counts,
+                token_pad_mask, atom_pad_mask,
+            )
+
+        # Run n_samples independent rollouts, collect metrics
+        all_mse = []
+        all_slddt = []
+
+        for s in range(n_samples):
+            x_atom = _heun_sample(
+                _denoise, sigmas,
+                torch.randn(B, M, 3, device=device) * SIGMA_MAX,
+            )
+
+            # Symmetry correction + metrics per batch element
+            for b in range(B):
+                pred = x_atom[b]
+                true = x_atom_true[b]
+                rm = atom_resolved_mask[b] if atom_resolved_mask is not None else torch.ones(M, device=device)
+                w = atom_weights[b]
+
+                if has_sym:
+                    true_sym, rm_sym = apply_symmetry_correction(
+                        pred, true, rm, w,
+                        sym_all_coords[b], sym_all_resolved_mask[b],
+                        sym_crop_to_all_atom_map[b],
+                        sym_chain_symmetries[b],
+                        sym_amino_acid_symmetries[b],
+                    )
+                else:
+                    true_sym, rm_sym = true, rm
+
+                # Kabsch align true to pred for MSE
+                aligned = weighted_rigid_align(
+                    true_sym.unsqueeze(0).float(),
+                    pred.unsqueeze(0).float(),
+                    w.unsqueeze(0),
+                    rm_sym.float().unsqueeze(0),
+                )
+                mse = ((pred.unsqueeze(0) - aligned) ** 2).sum(-1)
+                mask_f = rm_sym.float().unsqueeze(0) * w.unsqueeze(0)
+                mse_val = (mse * mask_f).sum() / mask_f.sum().clamp(min=1e-8)
+                all_mse.append(mse_val)
+
+                slddt = smooth_lddt(
+                    pred.unsqueeze(0), true_sym.unsqueeze(0),
+                    resolved_mask=rm_sym.unsqueeze(0),
+                    is_nucleotide=atom_is_nuc[b:b+1],
+                )
+                all_slddt.append(slddt)
+
+        # Best-of-N per batch element
+        mse_tensor = torch.stack(all_mse).view(n_samples, B)
+        slddt_tensor = torch.stack(all_slddt).view(n_samples, B)
+        best_mse = mse_tensor.min(dim=0).values.mean()
+        best_slddt = slddt_tensor.min(dim=0).values.mean()  # slddt is 1-lddt, lower=better
+
+        return {
+            "rollout_mse": best_mse.item(),
+            "rollout_slddt": best_slddt.item(),
+            "rollout_lddt": 1.0 - best_slddt.item(),
+        }
