@@ -36,12 +36,12 @@ logging:
   extra_log_every: 25 # expensive logs (heatmaps) every N steps
 
 training:
-  batch_size: 4
+  batch_size: 2
   # AF3 LR schedule: warmup → plateau → exponential decay
   lr: 1.0e-3 # max_lr (peak after warmup)
   base_lr: 0.0 # starting LR for warmup
   weight_decay: 0.01
-  betas: [0.9, 0.95]
+  betas: [0.95, 0.95]
   warmup_steps: 1000
   start_decay_after: 50000
   decay_every: 50000
@@ -50,7 +50,7 @@ training:
   ema_decay: 0.999
   ema_warmup_steps: 1000
   max_grad_norm: 10.0
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   crop_schedule:
     - [0, 256]
     # - [0, 256]
