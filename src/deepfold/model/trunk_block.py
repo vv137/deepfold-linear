@@ -7,8 +7,6 @@
 Supports both unbatched (N, d) and batched (B, N, d) inputs via dual-mode pattern.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +14,12 @@ import torch.nn.functional as F
 from deepfold.model.kernels.flash_sinkhorn_transport import balanced_sinkhorn_transport
 from deepfold.model.position_encoding import PositionBias
 from deepfold.model.primitives import SwiGLU
+
+try:
+    from deepfold.model.kernels.flash_diffusion_attn import flash_diffusion_attn
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
 
 K_ITER = 20
 
@@ -47,7 +51,6 @@ class TokenOTBlock(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.w_g = nn.Linear(d_model, d_model, bias=False)  # MHA output gate
         self.pos_bias = PositionBias(n_heads, 68)
-        self.attn_dropout = nn.Dropout(dropout)
 
         # ---- FFN (SwiGLU) ----
         self.ln_ff = nn.LayerNorm(d_model)
@@ -122,23 +125,21 @@ class TokenOTBlock(nn.Module):
         K = self.w_k(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         V = self.w_v(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        # Attention scores + position bias
-        scale = 1.0 / math.sqrt(d_h)
-        scores = torch.einsum("bhid,bhjd->bhij", Q, K) * scale  # (B, H, N, N)
-        scores = scores + self.pos_bias(pos_bins)  # (B, H, N, N)
-
-        # Mask: padded positions get -inf
-        attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
-        scores = scores.masked_fill(attn_mask == 0, float("-inf"))
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # Value aggregation with per-head gate: sigmoid(G) * (attn @ V)
+        # Flash attention with 68-bin position bias
         G = self.w_g(h_n).view(B, N, H, d_h).permute(0, 2, 1, 3)  # (B, H, N, d_h)
-        o = torch.sigmoid(G) * torch.einsum("bhij,bhjd->bhid", attn, V)
-        o = o.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, d)
-        h_update = self.w_o(o)
+
+        if _HAS_TRITON and h.is_cuda:
+            att_out = flash_diffusion_attn(Q, K, V, self.pos_bias.weight,
+                                           pos_bins, mask)
+        else:
+            from deepfold.model.kernels.flash_diffusion_attn import flash_diff_attn_ref
+            att_out = flash_diff_attn_ref(Q.float(), K.float(), V.float(),
+                                          self.pos_bias.weight, pos_bins,
+                                          mask).to(Q.dtype)
+
+        att_out = att_out.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, d)
+        G_flat = G.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
+        h_update = torch.sigmoid(G_flat) * self.w_o(att_out)
         h_update = h_update * mask.unsqueeze(-1)
         h = h + h_update
 

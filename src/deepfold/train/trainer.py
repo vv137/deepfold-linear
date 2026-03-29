@@ -96,11 +96,11 @@ def build_optimizer(
     """Build AdamW optimizer with 2 param groups (SPEC §13.1).
 
     Decay: all weight matrices (MHA Q/K/V/O, Sinkhorn Q/K, SwiGLU, w_gate).
-    No decay: LN γ/β, biases, small scalars (alpha_h, r_h, lambda_h),
+    No decay: LN γ/β, biases, small scalars (alpha_h, r_h, lambda_h_raw),
               position bias (Swin convention).
     """
     # Small per-head scalars — no decay
-    _NO_DECAY_SCALARS = {"alpha_h", "r_h", "lambda_h", "eps"}
+    _NO_DECAY_SCALARS = {"alpha_h", "r_h", "lambda_h_raw", "eps"}
 
     decay_params = []
     no_decay_params = []
