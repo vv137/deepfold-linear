@@ -352,6 +352,12 @@ class DeepFoldLinear(nn.Module):
                 # recomputed during backward. Peak memory = 1 sample at a time
                 # instead of M=16 simultaneously. use_reentrant=False avoids
                 # DDP "marked ready twice" (no hook replay).
+                # context_fn ensures autocast(bf16) is active during recomputation,
+                # preventing dtype mismatch between saved and recomputed tensors.
+                def _diffusion_context():
+                    return (torch.amp.autocast("cuda", dtype=torch.bfloat16),
+                            torch.amp.autocast("cuda", dtype=torch.bfloat16))
+
                 x_pred_i = checkpoint(
                     self.diffusion,
                     h_res,
@@ -366,6 +372,7 @@ class DeepFoldLinear(nn.Module):
                     token_pad_mask,
                     atom_pad_mask,
                     use_reentrant=False,
+                    context_fn=_create_diffusion_context,
                 )
 
                 # Use symmetry-corrected GT if available, otherwise raw
