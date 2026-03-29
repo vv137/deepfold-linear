@@ -1,4 +1,4 @@
-# DeepFold-Linear model configuration (SPEC v6.0)
+# DeepFold-Linear model configuration (SPEC v7.0)
 
 model:
   d_model: 512
@@ -33,7 +33,7 @@ logging:
   save_every: 200 # checkpoint every N steps
   save_every_minutes: 60 # time-based checkpoint interval (0 = disabled)
   log_every: 1 # console/wandb log every N steps
-  extra_log_every: 50 # expensive logs (heatmaps) every N steps
+  extra_log_every: 25 # expensive logs (heatmaps) every N steps
 
 training:
   batch_size: 4
@@ -93,7 +93,7 @@ wandb:
   project: deepfold-linear
   entity: null # your wandb team/user; null = default
   name: null # run name; null = auto-generated
-  tags: ["v6.0"]
+  tags: ["v7.0"]
   log_every: 1 # log every N optimizer steps
 
 sinkhorn:

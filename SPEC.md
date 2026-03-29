@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v6.1
+# Protein Complex Structure Prediction Model: Full Design Specification v7.0
 
 ---
 
@@ -659,6 +659,7 @@ Autograd through K Sinkhorn iterations, implemented as Triton tiled kernels. Cos
 **Saved for backward**: iteration history K × 2 × (B,H,N) ≈ 1-5 MB (negligible).
 
 **Backward kernels** (4 Triton kernels in `balanced_sinkhorn_bwd.py`):
+
 1. `_centroid_bwd_D_kernel` — D[i] = Σ_j T_norm·(grad_xc·x) contraction
 2. `_centroid_bwd_kernel` — g_u, g_v, grad_x_transport + direct cost gradient
 3. `_balanced_row_bwd_kernel` — backward through row update (2-pass: LSE then softmax grad)
