@@ -31,6 +31,7 @@ from deepfold.model.losses import (
 )
 from deepfold.data.augment import batch_augment
 from deepfold.data import const
+from deepfold.data.symmetry import apply_symmetry_correction
 
 
 class DeepFoldLinear(nn.Module):
@@ -128,6 +129,11 @@ class DeepFoldLinear(nn.Module):
         atom_pad_mask: torch.Tensor | None = None,
         pair_valid_mask: torch.Tensor | None = None,
         msa_mask: torch.Tensor | None = None,
+        sym_all_coords: torch.Tensor | None = None,
+        sym_all_resolved_mask: torch.Tensor | None = None,
+        sym_crop_to_all_atom_map: torch.Tensor | None = None,
+        sym_chain_symmetries: list | None = None,
+        sym_amino_acid_symmetries: list | None = None,
         compute_losses: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
@@ -263,6 +269,9 @@ class DeepFoldLinear(nn.Module):
             l_diff_parts = []
             l_lddt_parts = []
 
+            # Symmetry correction: precompute per-sample corrected coords
+            has_sym = sym_chain_symmetries is not None
+
             for i in range(M):
                 x_true_i = x_atom_aug[i]  # (N_atom, 3) or (B, N_atom, 3)
                 sigma_i = sigmas[i]
@@ -290,13 +299,45 @@ class DeepFoldLinear(nn.Module):
                     use_reentrant=False,
                 )
 
+                # Symmetry correction: find best-matching GT arrangement
+                x_true_sym = x_true_i
+                resolved_sym = atom_resolved_mask
+                if has_sym:
+                    if is_batched:
+                        # Per-sample correction
+                        corrected = []
+                        corrected_rm = []
+                        B_cur = x_true_i.shape[0]
+                        for b in range(B_cur):
+                            ct, cr = apply_symmetry_correction(
+                                x_pred_i[b], x_true_i[b],
+                                atom_resolved_mask[b], atom_weights[b],
+                                sym_all_coords[b], sym_all_resolved_mask[b],
+                                sym_crop_to_all_atom_map[b],
+                                sym_chain_symmetries[b],
+                                sym_amino_acid_symmetries[b],
+                            )
+                            corrected.append(ct)
+                            corrected_rm.append(cr)
+                        x_true_sym = torch.stack(corrected)
+                        resolved_sym = torch.stack(corrected_rm)
+                    else:
+                        x_true_sym, resolved_sym = apply_symmetry_correction(
+                            x_pred_i, x_true_i,
+                            atom_resolved_mask, atom_weights,
+                            sym_all_coords.squeeze(0), sym_all_resolved_mask.squeeze(0),
+                            sym_crop_to_all_atom_map.squeeze(0),
+                            sym_chain_symmetries[0],
+                            sym_amino_acid_symmetries[0],
+                        )
+
                 if need_diff:
                     l_diff_parts.append(
                         edm_diffusion_loss(
                             x_pred_i,
-                            x_true_i,
+                            x_true_sym,
                             sigma_i,
-                            resolved_mask=atom_resolved_mask,
+                            resolved_mask=resolved_sym,
                             atom_weights=atom_weights,
                         )
                     )
@@ -304,8 +345,8 @@ class DeepFoldLinear(nn.Module):
                     l_lddt_parts.append(
                         smooth_lddt(
                             x_pred_i,
-                            x_true_i,
-                            resolved_mask=atom_resolved_mask,
+                            x_true_sym,
+                            resolved_mask=resolved_sym,
                             is_nucleotide=atom_is_nuc,
                         )
                     )

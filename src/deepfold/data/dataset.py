@@ -28,6 +28,7 @@ from deepfold.data.crop import (
     spatial_crop_with_resolved_preference,
 )
 from deepfold.data.featurize import featurize
+from deepfold.data.symmetry import compute_chain_symmetries, compute_amino_acid_symmetries
 
 logger = logging.getLogger(__name__)
 
@@ -820,6 +821,21 @@ class DeepFoldDataset(Dataset):
             training=self.training,
         )
 
+        # 6. Symmetry features (training only)
+        if self.training and "chains" in struct:
+            sym = compute_chain_symmetries(
+                struct, cropped_tokens, crop.atom_indices,
+            )
+            aa_sym = compute_amino_acid_symmetries(
+                cropped_tokens, crop.token_to_atom_start, crop.token_to_atom_count,
+            )
+            features["sym_all_coords"] = sym["all_coords"]
+            features["sym_all_resolved_mask"] = sym["all_resolved_mask"]
+            features["sym_crop_to_all_atom_map"] = sym["crop_to_all_atom_map"]
+            # Non-tensor: store as Python lists (handled by collate_fn)
+            features["sym_chain_symmetries"] = sym["chain_symmetries"]
+            features["sym_amino_acid_symmetries"] = aa_sym
+
         return features
 
     def _load_chain_msa(
@@ -961,6 +977,9 @@ class DeepFoldDataset(Dataset):
 # These are float mask tensors where 1.0 = real, 0.0 = padding.
 _MASK_KEYS = {"token_pad_mask", "atom_pad_mask", "pair_valid_mask", "msa_mask"}
 
+# Keys that hold plain Python lists (not tensors) — passed through as lists.
+_LIST_KEYS = {"sym_chain_symmetries", "sym_amino_acid_symmetries"}
+
 
 def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Collate a batch of samples, padding variable-length tensors.
@@ -975,16 +994,28 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         - Bool tensors (e.g. bond_matrix): False-padded
         - Mask tensors (token_pad_mask, atom_pad_mask, pair_valid_mask):
           padded with 0.0 (marks padding positions)
+        - List keys (symmetry specs): collected as list-of-lists
     """
     if len(batch) == 1:
-        return {k: v.unsqueeze(0) for k, v in batch[0].items()}
+        result = {}
+        for k, v in batch[0].items():
+            if k in _LIST_KEYS:
+                result[k] = [v]
+            else:
+                result[k] = v.unsqueeze(0)
+        return result
 
     # Collect all keys (use first sample; all samples have the same keys)
     keys = batch[0].keys()
-    collated: dict[str, Tensor] = {}
+    collated = {}
 
     for key in keys:
         values = [b[key] for b in batch]
+
+        # Non-tensor keys: collect as plain list
+        if key in _LIST_KEYS:
+            collated[key] = values
+            continue
 
         # Determine pad value based on key/dtype
         pad_value: float | bool

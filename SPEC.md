@@ -52,43 +52,37 @@
 | Decision | Rationale |
 |---|---|
 | Remove pair representation | O(N²) → O(N) memory (after tiling) |
-| UOT-Sinkhorn attention | Automatic hot-spot focus, sparse transport |
-| EGNN coordinate update in UOT blocks | SE(3) equivariant structure refinement, no augmentation needed for trunk |
+| Balanced Sinkhorn attention | Automatic hot-spot focus, sparse transport |
+| EGNN coordinate update in OT blocks | SE(3) equivariant structure refinement, no augmentation needed for trunk |
 | Diffusion module for sampling | Stochastic multi-modal sampling; AF3-style augmentation (lightweight, local) |
 | Remove triangle attention | Unnecessary with explicit coordinates |
 | Low-rank co-evolution (rank 16) | Capture multi-modal 2nd-order statistics without pair rep |
-| x_res → cost (geometry-aware UOT) | Geometry modulates attention; coordinates refine through EGNN each block |
+| x_res → cost (geometry-aware Sinkhorn) | Geometry modulates attention; coordinates refine through EGNN each block |
 | Transport-weighted average | Length-invariant output |
 | Unrolled Sinkhorn backward | Exact gradient for K-iteration computation; IFT gives wrong gradients at incomplete convergence |
 
 ### 1.3 Core Contributions
 
-1. **UOT-Flash Attention**: Biology-aware sparse transport without pair representation.
+1. **Flash Sinkhorn Attention**: Biology-aware sparse transport without pair representation.
 2. **O(N) memory architecture**: No N×N stored matrices. Reference implementation uses O(N²) for co-evolution and distogram; tiled versions planned.
-3. **Low-rank co-evolution aggregation (rank 16)**: 2nd-order co-evolution statistics compressed into single representation via rank-16 outer product; r-dimensional co-evolution profile drives per-head marginal bias; co-evolving positions become UOT hubs through ν marginals.
+3. **Low-rank co-evolution aggregation (rank 16)**: 2nd-order co-evolution statistics compressed into single representation via rank-16 outer product; r-dimensional co-evolution profile provides per-head bias for Sinkhorn cost.
 4. **Bond-aware position encoding**: 68-bin scheme unifying sequence separation, chain identity, and covalent bonds.
-5. **EGNN coordinate update in UOT blocks**: Transport-weighted centroid displacement with input-dependent per-head γ gate (residue-specific attraction/repulsion). SE(3) equivariant by construction — no augmentation in trunk. Coordinates refine across 48 blocks × 3 cycles. Fused into Flash-Sinkhorn kernel at ~10% extra cost.
-6. **Geometry-aware UOT**: x_res → metric cost; coordinates improve each block via EGNN → geometry cost becomes increasingly reliable across blocks.
+5. **EGNN coordinate update in OT blocks**: Transport-weighted centroid displacement with input-dependent per-head γ gate (residue-specific attraction/repulsion). SE(3) equivariant by construction — no augmentation in trunk. Coordinates refine across 48 blocks × 3 cycles. Fused into Flash-Sinkhorn kernel at ~10% extra cost.
+6. **Geometry-aware Sinkhorn**: x_res → metric cost; coordinates improve each block via EGNN → geometry cost becomes increasingly reliable across blocks.
 7. **Unrolled Sinkhorn backward**: Standard autograd through K iterations; exact gradient for actual computation, not theoretical fixed point.
-8. **Transport-weighted average**: Length-invariant, ν_i controls how much other residues attend to position i.
+8. **Transport-weighted average**: Length-invariant output via row-sum normalization of the transport plan.
 
-### 1.4 Role of Marginals μ and ν
+### 1.4 Balanced Transport with Uniform Marginals
 
-In Sinkhorn OT, T*_ij = u_i K_ij v_j. The transport-weighted average normalizes by row sum:
+Balanced Sinkhorn transport uses uniform marginals (1/N for all positions). The transport plan T satisfies T·1 = 1/N and T^T·1 = 1/N — every position sends and receives equal total mass. The transport-weighted centroid normalizes naturally:
 
-    o_i = sigmoid(G_i) ⊙ (Σ_j T*_ij V_j) / (Σ_j T*_ij + ε)
+    centroid_i = (Σ_j T_ij x_j) / (Σ_j T_ij)
 
-This makes o_i scale-invariant w.r.t. μ_i — the output magnitude is O(1) regardless of μ_i.
-
-However, the **column marginal ν_i** controls how much mass arrives at position i from other positions. When ν_i is large, v_i grows through Sinkhorn iterations, and Σ_j T*_ji increases — **other residues allocate more transport to position i**. Co-evolving functional sites get large ν_i through the co-evolution bias, automatically becoming UOT hubs.
-
-The **row marginal μ_i** controls how much mass leaves position i. Large μ_i means position i exports more total transport, distributing its information more broadly. Together, μ and ν allow asymmetric hub behavior: a position can be a strong receiver (large ν) without being a strong sender (μ can differ).
-
-In this architecture, μ and ν share the co-evolution bias c̄_i but have separate learned projections W_μ and W_ν, allowing partial independence.
+WHERE mass flows is determined by the cost matrix (feature similarity + geometry + position bias), not by learned marginals. This eliminates the complexity of per-layer marginal projections while MHA handles all feature mixing.
 
 ### 1.5 Honest Complexity Statement
 
-The architecture is **designed** for O(N) memory: no component inherently requires N×N storage. The **reference PyTorch implementation** uses Python-level tiling (tile_size=64) for co-evolution aggregation and distogram loss, keeping their peak memory at O(tile²·d) ≈ constant. The remaining O(N²) bottleneck is `cdist` in Residue UOT blocks, which will be eliminated by the Flash-Sinkhorn kernel (computing distances on-the-fly per tile). Until that kernel is implemented, the reference implementation is O(N²) memory due to cdist only.
+The architecture is **designed** for O(N) memory: no component inherently requires N×N storage. The **reference PyTorch implementation** uses Python-level tiling (tile_size=64) for co-evolution aggregation and distogram loss, keeping their peak memory at O(tile²·d) ≈ constant. The remaining O(N²) bottleneck is `cdist` in Token OT blocks, which will be eliminated by the Flash-Sinkhorn kernel (computing distances on-the-fly per tile). Until that kernel is implemented, the reference implementation is O(N²) memory due to cdist only.
 
 ---
 
@@ -115,10 +109,10 @@ Input: token_types, MSA (protein-only), bond_matrix, reference conformer
 
   for cycle in [0 .. num_cycles-1]:
     MSA blocks × 4 → m, h_res, coevol_bias                           (invariant, no coords)
-    Token UOT+EGNN blocks × 48:
+    Token OT blocks × 48:
       Each block:
-        UOT attention → h_res update                                 (invariant)
-        EGNN → x_res update: x += Σ_h γ_h(h_i) · (x_i − T_norm^h @ x) (equivariant, input-dependent γ)
+        MHA → h_res update                                          (invariant)
+        Sinkhorn transport + EGNN → x_res update: x += Σ_h γ_h(h_i) · (x_i − T_norm^h @ x) (equivariant)
       Geometry cost uses latest x_res each block
     Re-center x_res (once per cycle, float32 hygiene)
 
@@ -129,7 +123,7 @@ Input: token_types, MSA (protein-only), bond_matrix, reference conformer
   AF3-style augmentation for SE(3).
   for each denoise step:
     x_res ← scatter_mean(x_atom, token_idx)
-    h_step ← diffusion UOT blocks × 2 (frozen μ,ν, σ-gated geometry)
+    h_step ← SingleConditioning(h_res, σ)                            conditioning
     q ← c_atom + Lin(3→128)(x_atom / σ_data)
     Atom blocks × 10 → q
     Δx ← zero_init_Lin(LN(q))
@@ -174,7 +168,7 @@ msa_feat = cat(
 m = Lin(34 → 64)(msa_feat)                    # (S, N_prot, 64)
 ```
 
-MSA is defined only for protein (and optionally RNA/DNA) tokens. N_prot ≤ N is the number of tokens with MSA data. The MSA module (§6) operates on these tokens only; non-MSA tokens receive no co-evolution signal and get uniform UOT marginals.
+MSA is defined only for protein (and optionally RNA/DNA) tokens. N_prot ≤ N is the number of tokens with MSA data. The MSA module (§6) operates on these tokens only; non-MSA tokens receive no co-evolution signal and get zero co-evolution bias.
 
 ### 3.3 Atom Single Representation (Frozen)
 
@@ -288,7 +282,7 @@ g_i, g_j: global residue indices, preserved after cropping.
 ### 4.3 Parameters
 
 ```
-w_rel_res:  (H_res, 68) per layer — Residue UOT position bias.  Init: zeros. With decay (unlike Swin — unbounded pos_bias destabilizes Sinkhorn backward at small ε). Each of the 48 UOT blocks has its own w_rel_res.
+w_rel_res:  (H_res, 68) per layer — Token OT position bias.  Init: zeros. With decay (unlike Swin — unbounded pos_bias destabilizes Sinkhorn backward at small ε). Each of the 48 Token OT blocks has its own w_rel_res.
 w_rel_msa:  (H_msa, 68)           — MSA attention position bias.  Init: zeros. With decay (same reason). Shared across MSA blocks.
 ```
 
@@ -404,11 +398,11 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
 
 ### 6.1 Design Intent
 
-- **Scope**: MSA processing operates on protein (and optionally RNA/DNA) tokens only. Non-MSA tokens (ligands, ions) receive no co-evolution signal and get uniform UOT marginals. The MSA block internally works on the protein token subset; results are scattered back to the full token set.
+- **Scope**: MSA processing operates on protein (and optionally RNA/DNA) tokens only. Non-MSA tokens (ligands, ions) receive no co-evolution signal and get zero co-evolution bias. The MSA block internally works on the protein token subset; results are scattered back to the full token set.
 - **Row-wise attention**: Within-sequence residue interactions with position bias.
 - **Column weighted mean**: Learned aggregation capturing 1st-order co-evolution.
-- **Low-rank co-evolution aggregation**: c_ij = (1/S) Σ_s U_si^T V_sj captures 2nd-order co-evolution statistics. Rank r=16 allows multiple co-evolution modes (active site, allosteric site, interface, fold stability). The r-dimensional co-evolution vector per pair is reduced to a scalar weight for aggregation but retained as a full profile for marginal bias.
-- **Co-evolution bias**: Computed once after all 4 MSA blocks. The r-dimensional co-evolution profile c̄_i ∈ R^16 projects to per-head bias via zero-init coevol_to_marginal Lin(16→H_res). Non-MSA tokens get zero bias. Marginals themselves are computed per-layer on the Trunk by shared mu_proj/nu_proj on LN(h_res) + coevol_bias (see §5.2).
+- **Low-rank co-evolution aggregation**: c_ij = (1/S) Σ_s U_si^T V_sj captures 2nd-order co-evolution statistics. Rank r=16 allows multiple co-evolution modes (active site, allosteric site, interface, fold stability). The r-dimensional co-evolution vector per pair is reduced to a scalar weight for aggregation and retained as a full profile for per-head cost bias.
+- **Co-evolution bias**: Computed once after all 4 MSA blocks. The r-dimensional co-evolution profile c̄_i ∈ R^16 projects to per-head bias via zero-init coevol_to_marginal Lin(16→H_res). Non-MSA tokens get zero bias. The bias is added to the Sinkhorn cost matrix in each trunk block.
 
 ### 6.2 Full Block
 
@@ -458,7 +452,7 @@ def msa_block(m, h_res, msa_mask):
 
     # ---- 4. Low-rank co-evolution aggregation (rank 16, tiled) ----
     # c_ij ∈ R^r: multi-modal co-evolution vector per pair
-    # Scalar weight for aggregation, full r-dim profile for marginal bias
+    # Scalar weight for aggregation, full r-dim profile for cost bias
     m_n = LN(m)                                                 # (S, N, 64)
     U = Lin(64 → 16)(m_n)                                      # (S, N, 16)
     V_ = Lin(64 → 16)(m_n)                                     # (S, N, 16)
@@ -486,7 +480,7 @@ def msa_block(m, h_res, msa_mask):
             w_tile = sigmoid(Lin(16 → 1)(c_tile).squeeze(-1))  # (ti, tj)
             h_agg[i0:ie] += w_tile @ h_coevol[j0:je]           # (ti, 512)
 
-            # r-dim profile for marginal bias
+            # r-dim profile for cost bias
             c_bar_accum[i0:ie] += c_tile.sum(dim=1)            # (ti, 16)
 
     h_res = h_res + Lin(512 → 512)(h_agg)                      # (N, 512)
@@ -510,11 +504,10 @@ def msa_block(m, h_res, msa_mask):
 
 def msa_module(m, h_res, msa_token_mask, msa_mask):
     """
-    Run 4 MSA blocks, then compute co-evolution bias for per-layer marginals.
+    Run 4 MSA blocks, then compute co-evolution bias for Sinkhorn cost.
     Returns m, h_res, coevol_bias
 
-    Marginals (mu, nu) are NOT computed here — they are computed per-layer
-    on the Trunk by shared mu_proj/nu_proj on LN(h_res) + coevol_bias (§5.2).
+    The coevol_bias is added to the Sinkhorn cost matrix in each trunk block.
     """
     c_bar = None
     for b in range(4):
@@ -533,7 +526,7 @@ def msa_module(m, h_res, msa_token_mask, msa_mask):
 
 ### 6.3 Why Standard Softmax in MSA Row Attention
 
-MSA row-wise attention operates within individual homologous sequences where every position is informative — there are no "irrelevant" residues within a single alignment row. The sparse-transport motivation for UOT applies to cross-chain and long-range residue interactions, not within-sequence MSA processing. Standard softmax is appropriate and cheaper here.
+MSA row-wise attention operates within individual homologous sequences where every position is informative — there are no "irrelevant" residues within a single alignment row. The sparse-transport motivation for Sinkhorn OT applies to cross-chain and long-range residue interactions, not within-sequence MSA processing. Standard softmax is appropriate and cheaper here.
 
 ---
 
@@ -899,7 +892,7 @@ crop_data = {
 
 ### 10.2 Crop Boundary Effects
 
-UOT handles crop boundaries naturally: unbalanced marginals allow residues at the crop boundary to export/import less mass than their "natural" share. No special masking or padding needed.
+Balanced Sinkhorn transport handles crop boundaries through masking: padded positions are masked out of the Sinkhorn iterations, and uniform marginals are computed over valid positions only (1/N_valid). No special boundary treatment needed beyond standard padding masks.
 
 ### 10.3 Crop Size Schedule
 
@@ -960,7 +953,7 @@ L_lddt = 1 − (1/|P|) Σ_{(i,j)∈P} (1/4) Σ_{δ∈{0.5,1,2,4}} sigmoid(δ −
 
 ### 11.3 Low-Rank Bilinear Distogram Loss (Tiled)
 
-The distogram loss forces h_res to encode pairwise distance information. Since this architecture has no pair representation, the distogram is one of only two training signals for pairwise reasoning (the other being UOT geometry cost in the forward pass). Expressivity here matters.
+The distogram loss forces h_res to encode pairwise distance information. Since this architecture has no pair representation, the distogram is one of only two training signals for pairwise reasoning (the other being Sinkhorn geometry cost in the forward pass). Expressivity here matters.
 
 **Why not simple element-wise**: A naive `(W_u h_i)_b · (W_v h_j)_b` treats each distance bin as independent. But protein distances are continuous — predicting 4Å should share features with 3.5Å and 4.5Å. Element-wise products prevent this cross-bin interaction.
 
@@ -1065,7 +1058,7 @@ Applied to L_diff and L_lddt. L_disto uses intra-chain pairs only (no permutatio
 
 ### 11.5 Trunk Coordinate Losses
 
-Direct structural supervision on the trunk's EGNN-refined coordinates. This is critical: without it, the last UOT+EGNN block's γ gate receives zero gradient (its x_res output is not used by any other loss). With it, every γ gate in all 48 blocks receives direct gradient through the chain of EGNN updates.
+Direct structural supervision on the trunk's EGNN-refined coordinates. This is critical: without it, the last Token OT block's γ gate receives zero gradient (its x_res output is not used by any other loss). With it, every γ gate in all 48 blocks receives direct gradient through the chain of EGNN updates.
 
 Two complementary trunk coordinate losses are available (either or both can be enabled via null weights):
 
@@ -1103,9 +1096,9 @@ Any weight set to null disables that loss term entirely (no computation).
 
 **Gradient flow**:
 
-- L_diff, L_lddt, L_bond → diffusion module parameters (atom blocks, diffusion UOT, coord output)
+- L_diff, L_lddt, L_bond → diffusion module parameters (atom blocks, coord output)
 - L_disto → trunk h_res → all trunk parameters (representation supervision)
-- L_trunk_logmse / L_trunk_slddt → trunk x_res → all EGNN γ gate parameters (W_gamma weight + bias) + all UOT params via geometry cost (coordinate supervision)
+- L_trunk_logmse / L_trunk_slddt → trunk x_res → all EGNN γ gate parameters (W_gamma weight + bias) + all Sinkhorn params via geometry cost (coordinate supervision)
 
 L_disto and L_trunk are complementary: L_disto teaches h_res to encode distance information (pairwise distance classification into 39 bins), L_trunk teaches the EGNN γ gate to produce accurate coordinates. Together they provide the trunk with both representation-level and coordinate-level structural signals.
 
@@ -1233,7 +1226,7 @@ class EMA:
 | Sinkhorn divergence | LN on Q, K | Cost C is O(1) |
 | Sinkhorn convergence | K=20 uniform | Empirically: ~1e-6 residual at K=20; unrolled backprop needs correct forward |
 | Allosteric signal loss | Fixed per-head ε = [0.5, 1.0, 2.0, 4.0] | Diffuse heads (ε=4) maintain global receptive field |
-| Head collapse | Per-head W_μ, W_ν | Separate marginal learning |
+| Head collapse | Per-head multi-scale ε [0.5,1,2,4] | Heads forced to different transport regimes |
 | Length bias | Transport-weighted average | Division by T_sum |
 | Transport output overflow | Running-max subtraction | Same trick as FlashAttention |
 | EGNN coordinate collapse | Per-head signed γ | Repulsive heads counteract attractive heads |
@@ -1245,19 +1238,19 @@ class EMA:
 | Geometry bias domination | w_dist sigmoid-bounded (0,1), init ≈0.12 | Per-block per-head; can't exceed 1.0 |
 | Position bias scale | w_rel zeros init (per-layer), with decay | Starts at zero; per-layer allows specialization; decay prevents unbounded growth that destabilizes Sinkhorn backward at small ε |
 | Co-evolution noise | Zero-init coevol_to_marginal | Must earn influence; starts at zero bias |
-| Per-layer marginals | mu_proj/nu_proj zero-init on LN(h_res) + coevol_bias | Marginals track evolving h_res each block |
+| Uniform marginals | Balanced OT with 1/N marginals | No learned marginal projections; simpler and more stable |
 | SE(3) equivariance (trunk) | EGNN: relative vectors only | No augmentation needed |
 | SE(3) equivariance (diffusion) | AF3-style augmentation | Standard, lightweight |
 | MSA overfitting | Row dropout p=0.15 | Drop entire sequences |
 | Gradient bias (Sinkhorn) | Unrolled backprop through K iterations | Exact gradient for actual computation; IFT gives biased gradients on Q,K,w_dist_raw |
 | Parameter oscillation | EMA decay=0.999 | Smoothed parameters |
-| Crop boundary | UOT unbalanced marginals | Natural mass adjustment |
+| Crop boundary | Padding mask in Sinkhorn iterations | Uniform marginals over valid positions only |
 | Diffusion output at init | Zero-init final Linear | Identity prediction initially |
 | Large coordinate scale (diffusion) | Division by σ_data in atom embedding | O(1) embedding input |
 
 ### 13.4 Backward Pass
 
-Only the last recycling cycle is in the computation graph. All earlier cycles run under `torch.no_grad()`. The graph contains: 4 MSA blocks + 48 UOT+EGNN blocks (with gradient checkpointing) + loss heads. The diffusion module has its own separate graph.
+Only the last recycling cycle is in the computation graph. All earlier cycles run under `torch.no_grad()`. The graph contains: 4 MSA blocks + 48 Token OT blocks (with gradient checkpointing) + loss heads. The diffusion module has its own separate graph.
 
 **Gradient sources** (four losses):
 
@@ -1269,12 +1262,12 @@ L = L_diff + L_lddt + 0.2 · L_disto + 0.5 · L_trunk_coord
 |---|---|---|
 | L_diff | ∂/∂x_atom_pred → atom blocks → h_cond → h_res | Atom blocks + entire trunk (end-to-end) |
 | L_lddt | ∂/∂x_atom_pred → atom blocks → h_cond → h_res | Same path as L_diff |
-| L_disto | ∂/∂h_res^(48) | All trunk params: MSA blocks, UOT attention, SwiGLU |
+| L_disto | ∂/∂h_res^(48) | All trunk params: MSA blocks, MHA, Sinkhorn, SwiGLU |
 | L_trunk_coord | ∂/∂x_res^(48) | All EGNN γ + all trunk params via geometry cost |
 
 **Backward through diffusion module**: Standard backprop through 10 atom blocks. Gradients flow through h_cond into h_res and back through the entire trunk. One σ sampled per training step — only one diffusion forward/backward in the graph. Cost: ~2× diffusion forward.
 
-**Backward through UOT+EGNN blocks** (the complex part):
+**Backward through Token OT blocks** (the complex part):
 
 Each block b receives upstream gradients ∂L/∂h^(b+1) and ∂L/∂x^(b+1) and propagates backward through 4 stages in reverse:
 
@@ -1292,7 +1285,7 @@ Each block b receives upstream gradients ∂L/∂h^(b+1) and ∂L/∂x^(b+1) and
 
 This produces gradients for γ (trains EGNN step sizes), for input x (cascades to previous block), and for T_norm (enters Sinkhorn unrolled backward).
 
-**Stage 2 — UOT attention backward (unrolled through Sinkhorn)**:
+**Stage 2 — Sinkhorn transport backward (unrolled through iterations)**:
 
 The attention output produces ∂L/∂T_norm from the h_res path (through V aggregation). Combined with ∂L/∂T_norm from EGNN (stage 3), autograd differentiates backward through the K Sinkhorn iterations:
 
@@ -1304,7 +1297,6 @@ Iteration K → K-1 → ... → 1 → 0:
         ∂L/∂w_rel             via position bias
         ∂L/∂w_dist_raw        via geometry term (through algebraic sigmoid)
         ∂L/∂x_res             via distance in geometry term
-        ∂L/∂μ, ∂L/∂ν         via marginal terms in Sinkhorn update
 ```
 
 No custom backward needed — standard autograd through the Sinkhorn loop. The K intermediate (log_u, log_v) states are recomputed during gradient checkpointing and consumed by autograd.
@@ -1317,9 +1309,9 @@ No custom backward needed — standard autograd through the Sinkhorn loop. The K
 
 **Stage 1 — Pre-norm + projections backward**: Standard linear backward for W_Q, W_K, W_V, W_G, ln_attn.
 
-**Backward through MSA module**: Standard backprop through 4 blocks + post-loop coevol_bias. Marginal gradients ∂L/∂μ, ∂L/∂ν from per-layer Sinkhorn backward flow through mu_proj/nu_proj → LN(h_res) + coevol_bias → coevol_to_marginal → co-evolution c_bar (last block) → MSA representation → all 4 blocks' h_res. Per-layer marginals mean every UOT block provides gradient to mu_proj/nu_proj and coevol_to_marginal.
+**Backward through MSA module**: Standard backprop through 4 blocks + post-loop coevol_bias. Gradients from Sinkhorn cost bias flow through coevol_to_marginal → co-evolution c_bar (last block) → MSA representation → all 4 blocks' h_res.
 
-**Gradient checkpointing**: Each of the 48 UOT+EGNN blocks is checkpointed. During backward, the block's forward pass (including K Sinkhorn iterations) is recomputed from boundary activations (h_res, x_res, log_u, log_v). The K intermediate states are created fresh and consumed by autograd. Memory per block during backward: K × H × N × 4 bytes for Sinkhorn intermediates + O(N²) for cost matrix (eliminated by Flash-Sinkhorn tiling).
+**Gradient checkpointing**: Each of the 48 Token OT blocks is checkpointed. During backward, the block's forward pass (including K Sinkhorn iterations) is recomputed from boundary activations (h_res, x_res, log_u, log_v). The K intermediate states are created fresh and consumed by autograd. Memory per block during backward: K × H × N × 4 bytes for Sinkhorn intermediates + O(N²) for cost matrix (eliminated by Flash-Sinkhorn tiling).
 
 **Total backward memory**: O(48 × N × d) for boundary activations + O(N²) for one block's recomputed cost matrix. With Flash-Sinkhorn: O(N × d) total.
 
@@ -1402,9 +1394,8 @@ def init_model(model, num_blocks=48):
 | SwiGLU output (ff_out) | Xavier (not scaled) | Product structure already suppresses; double-scaling would starve transitions |
 | γ (EGNN) | randn × 1e-4 | Near-dormant with symmetry-breaking noise; each layer starts with unique γ |
 | w_dist_raw | 0 (alg_sigmoid = 0.5) | Midpoint geometry at init; per-block per-head; algebraic sigmoid bounded (0,1); no weight decay |
-| w_rel | zeros (per-layer for trunk) | Position bias off at init; each UOT block learns its own sequence-distance priors |
+| w_rel | zeros (per-layer for trunk) | Position bias off at init; each Token OT block learns its own sequence-distance priors |
 | coevol_to_marginal | **all zeros** | Co-evolution bias off at init; MSA processing must stabilize first |
-| mu_proj, nu_proj | **all zeros** (bias=False) | Marginals start uniform; h_res must earn influence |
 | LN γ, β | (1, 0) | Identity normalization at init |
 | Input embedding Lin(38→512) | Xavier + bias=zeros | Standard; network adjusts column scales for different input features |
 | Atom encoder projections | Xavier | Standard; encoder output is O(1) at init |
@@ -1443,7 +1434,7 @@ The Sinkhorn function from §7.3 is directly differentiable by PyTorch autograd.
 
 ```python
 # In the recycling loop (last cycle, backprop enabled):
-for block in residue_uot_blocks:
+for block in token_ot_blocks:
     h_res, x_res, log_u_prev, log_v_prev = torch.utils.checkpoint.checkpoint(
         block, h_res, x_res, mu, nu, log_u_prev, log_v_prev,
         use_reentrant=False
@@ -1508,17 +1499,15 @@ All post-LN projections use `bias=False`. Standalone projections (input embed, c
 | MSA SwiGLU: Lin(64→256, bias=F)×2, Lin(256→64, bias=F) | per block × 4 | 4 × 49K = 196K | Xavier | ✅ |
 | MSA position: w_rel_msa | (8, 68) | 544 | zeros | ✅ |
 | **MSA total** | | **~2.7M** | | |
-| Trunk mu_proj: Lin(512→16, bias=F) | shared on Trunk | 8K | **zeros** | ✅ |
-| Trunk nu_proj: Lin(512→16, bias=F) | shared on Trunk | 8K | **zeros** | ✅ |
-| Token UOT+EGNN: LN + Q,K,V,G Lin(512→512, bias=F) | per block × 48 | 48 × 4 × 262K = 50.3M | Xavier | ✅ |
-| Token UOT+EGNN: W_O Lin(512→512, bias=F) | per block × 48 | 48 × 262K = 12.6M | **Xavier/√48** | ✅ |
-| Token UOT+EGNN: SwiGLU Lin(512→2048, bias=F)×2, Lin(2048→512, bias=F) | per block × 48 | 48 × 3.1M = 150M | Xavier | ✅ |
-| Token UOT+EGNN: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **N(0,1e-4)** | ❌ (tanh-bounded) |
-| Token UOT+EGNN: ε (per-head, fixed) | buffer (16,), shared all blocks | 0 (not a parameter) | [1.0]×4+[2.0]×4+[4.0]×4+[8.0]×4 | N/A |
+| Token OT: LN + Q,K,V,G Lin(512→512, bias=F) | per block × 48 | 48 × 4 × 262K = 50.3M | Xavier | ✅ |
+| Token OT: W_O Lin(512→512, bias=F) | per block × 48 | 48 × 262K = 12.6M | **Xavier/√48** | ✅ |
+| Token OT: SwiGLU Lin(512→2048, bias=F)×2, Lin(2048→512, bias=F) | per block × 48 | 48 × 3.1M = 150M | Xavier | ✅ |
+| Token OT: γ (EGNN step sizes) | per block × 48, (16,) each | 768 | **N(0,1e-4)** | ❌ (tanh-bounded) |
+| Token OT: ε (per-head, fixed) | buffer (16,), shared all blocks | 0 (not a parameter) | [1.0]×4+[2.0]×4+[4.0]×4+[8.0]×4 | N/A |
 | Token position: w_rel_res (×48) | (16, 68) per block | 52K | zeros | ✅ |
 | Geometry: w_dist_raw | per block × 48, (16,) each | 768 | **0** (alg_sigmoid = 0.5) | ❌ (alg_sigmoid-bounded) |
 | LN γ, β (attention + transition) | per block × 48, 2 × (512,) each | 48 × 2K = 98K | (1, 0) | ❌ |
-| **Token UOT+EGNN total** | | **~213M** | | |
+| **Token OT total** | | **~213M** | | |
 | **Trunk total** | | **~216M** | | |
 
 ### 14.2 Diffusion Parameters
@@ -1538,7 +1527,7 @@ All post-LN projections use `bias=False`. Standalone projections (input embed, c
 
 **~220M parameters**
 
-AF3 uses c_s=384 (single) and c_z=128 (pair) with 48 Pairformer blocks and 24 atom transformer blocks per diffusion step. Our model uses d=512 (single only) with 48 UOT+EGNN blocks and 10 atom blocks per diffusion step. No UOT blocks in diffusion — the trunk's h_res provides all inter-token context. End-to-end gradient from diffusion loss through h_res into the trunk.
+AF3 uses c_s=384 (single) and c_z=128 (pair) with 48 Pairformer blocks and 24 atom transformer blocks per diffusion step. Our model uses d=512 (single only) with 48 Token OT blocks and 10 atom blocks per diffusion step. No Sinkhorn blocks in diffusion — the trunk's h_res provides all inter-token context. End-to-end gradient from diffusion loss through h_res into the trunk.
 
 ---
 
@@ -1549,13 +1538,13 @@ AF3 uses c_s=384 (single) and c_z=128 (pair) with 48 Pairformer blocks and 24 at
 | MSA row attention (×4) | O(S · N² · d_msa) | O(S · N · d_msa) | same (FlashAttn) |
 | Co-evolution outer product (×4) | O(S · N² · r) | O(tile² · r) per tile | O(tile² · r) per tile |
 | Co-evolution aggregation (×4) | O(N² · d) | O(tile² + tile · d) per tile | O(tile² + tile · d) per tile |
-| Residue UOT (×48, K iters) | O(48 · K · N² · d_h) | **O(N²)** per cdist | O(H · N) with FlashSinkhorn |
+| Token OT (×48, K iters) | O(48 · K · N² · d_h) | **O(N²)** per cdist | O(H · N) with FlashSinkhorn |
 | Distogram | O(N² · d_low) | O(tile² · d_low) per tile | O(tile² · d_low) per tile |
 | Atom self-attention | O(N_atom · w · d_atom) | O(N_atom · d_atom) | same |
 | **Reference total** | | **O(N²)** for cdist only | |
 | **Tiled total** | | | **O(N · d + S · N · d_msa)** |
 
-**Tiling status**: Co-evolution and distogram now use Triton kernels with autograd (forward + backward) for training. Both eliminate O(N²) autograd storage via flash-style recomputation. The remaining O(N²) bottleneck is cdist in Residue UOT blocks, eliminated by the Flash-Sinkhorn kernel which computes distances on-the-fly per tile.
+**Tiling status**: Co-evolution and distogram now use Triton kernels with autograd (forward + backward) for training. Both eliminate O(N²) autograd storage via flash-style recomputation. The remaining O(N²) bottleneck is cdist in Token OT blocks, eliminated by the Flash-Sinkhorn kernel which computes distances on-the-fly per tile.
 
 ---
 
@@ -1578,13 +1567,11 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
     Lin(16→1)(c_ij) → scalar weight → h_res           ← co-evolution aggregation
   coevol_to_marginal(c̄) → coevol_bias                 ← zero-init, per-head bias
 
-  Token UOT+EGNN Block × 48 (warm-start carry across cycles):
-    mu_proj(LN(h_res)) + coevol_bias → μ               ← per-layer row marginals
-    nu_proj(LN(h_res)) + coevol_bias → ν               ← per-layer column marginals
-    LN(Q)^T LN(K) + w_rel + w_dist·f(d) → C          ← content + position + geometry
-    Sinkhorn(C, μ, ν) → T*, T_norm                     ← sparse transport plan
-    T_norm @ V → gated → h_res                         ← long-range interaction (invariant)
-    T_norm @ x_res → centroid                           ← transport-weighted centroid
+  Token OT Block × 48:
+    MHA(Q,K,V,G, pos_bias) → h_res                     ← feature contextualization (invariant)
+    LN(Q_s)^T LN(K_s) + w_rel + w_dist·f(d) → C      ← content + position + geometry
+    Sinkhorn(C, uniform 1/N) → T*                       ← balanced transport plan
+    T* @ x_res → centroid                               ← transport-weighted centroid
     x += Σ_h γ_h · (x − centroid_h)                    ← EGNN update (equivariant)
     Geometry cost in next block uses updated x_res      ← iterative refinement
 
@@ -1616,10 +1603,10 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 |---|---|---|
 | Single representation | c_s = 384 | d = 512 |
 | Pair representation | c_z = 128, O(N²) stored | ❌ none |
-| Trunk blocks | 48 Pairformer (pair + single tracks) | 48 UOT+EGNN (single track + equivariant coords) |
+| Trunk blocks | 48 Pairformer (pair + single tracks) | 48 Token OT (single track + equivariant coords) |
 | Triangle attention/update | ✅ | ❌ |
-| Co-evolution signal | Outer product → z_ij (full pair) | Rank-16 outer product → scalar agg weight + r-dim marginal profile (tiled) |
-| Token-level attention | Softmax + gate | UOT-Sinkhorn (multi-scale ε) + gate |
+| Co-evolution signal | Outer product → z_ij (full pair) | Rank-16 outer product → scalar agg weight + r-dim cost bias profile (tiled) |
+| Token-level attention | Softmax + gate | MHA + balanced Sinkhorn transport (multi-scale ε) |
 | Structure refinement (trunk) | N/A (Pairformer has no structure module) | EGNN via transport-weighted centroid displacement |
 | SE(3) equivariance (trunk) | N/A | EGNN equivariant (no augmentation) |
 | SE(3) equivariance (diffusion) | Augmentation | Augmentation (same) |
@@ -1629,7 +1616,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 | Atom attention | Local window 32→128 | Local window 32 (same pattern) |
 | Atom pair bias | c_atompair = 16, intra-token | d_pair = 16, intra-token (same) |
 | Recycling | 3 fixed | 1–3 random (EGNN refines coords across 48 blocks/cycle) |
-| Marginal handling | N/A (softmax) | Per-layer mu/nu from LN(h_res) + coevol_bias; recomputed each block |
+| Marginal handling | N/A (softmax) | Uniform 1/N (balanced OT); no learned marginals |
 | Template | ✅ | ❌ (v1 excluded) |
 | Confidence heads | pLDDT, PAE, pTM | Planned (§18) |
 | Distogram | In pair rep (c_z track) | Low-rank bilinear (d_low=64, tiled, separate loss head) |
@@ -1647,7 +1634,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 ### Design
 
 1. **Confidence heads**: pLDDT from single rep (standard MLP on h_res). PAE equivalent: bilinear from single rep, same decomposition as distogram but with error bins. pTM: derived from PAE.
-2. **Template integration** (v2): Template coordinates → pairwise distances → binned → bias in UOT cost matrix. No pair representation needed — distance bins directly added to C_ij as another bias term, analogous to w_rel.
+2. **Template integration** (v2): Template coordinates → pairwise distances → binned → bias in Sinkhorn cost matrix. No pair representation needed — distance bins directly added to C_ij as another bias term, analogous to w_rel.
 3. **Detailed training stages**: Learning rate schedule per stage, crop size ramp (Section 10.3).
 
 ### Engineering (Priority Order)
@@ -1661,9 +1648,9 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 - All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
 - Mask support: `-1e9` bias on padded positions in all score computations
 - Flash forward (Triton): N=384 in 0.6ms, O(N) memory
-- Training backward: Triton exact unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
-- IFT backward (CG-based): implemented but gives incorrect gradients for UOT with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
-- FP32 marginal fix: mu.float() before log() prevents BF16 underflow in softmax Jacobian backward
+- Training backward: Triton exact unrolled (autograd through K iterations) — correct gradients for ALL parameters including cost projections and coevol_to_marginal
+- IFT backward (CG-based): implemented but gives incorrect gradients for Sinkhorn with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
+- FP32 log-domain: all Sinkhorn iterations in FP32 to prevent BF16 underflow
 - Kabsch alignment: disable autocast for SVD/det (BF16 not supported)
 - Coevol kernel wired into MSA (training + inference), distogram kernel wired into losses (eval)
 - trunk_block.py: flash Sinkhorn for both training and inference (O(N) memory)
@@ -1678,7 +1665,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
    |---|---|---|---|
    | Cost function | Squared Euclidean `‖x−y‖²` | `-LN(Q)^T LN(K)/√d_h + w_rel[bin] + w_dist·f(d)` | Replace distance computation per tile with dot-product + two additive biases (position lookup, geometry from cdist) |
    | ε | Scalar (`blur²`) | Per-head (H,) buffer `[0.5,1,2,4]×4` | Broadcast: load ε_h once per head per tile |
-   | UOT parameterization | `reach` (KL penalty) | κ = λ/(λ+ε) damping per head | Map: their `reach` → our λ; verify half-step matches `κ·(log_μ − LSE(...))` |
+   | OT parameterization | `reach` (KL penalty for UOT) | Balanced OT (uniform 1/N marginals) | Set `reach=∞` (no KL penalty) or use balanced mode directly |
    | Transport application | `P*V` (apply_plan_vec/mat) | `P*V` (H,N,d_h) + `P*x_res` (H,N,3) for EGNN | Extend kernel: accumulate V (d_h dims) and x_res (3 dims) in same streaming pass |
    | Backward | Analytic gradients (custom) | Unrolled autograd through K iterations | Use their forward kernel as single-iteration building block; call K times in differentiable loop; autograd handles backward |
    | Position encoding | None | 68-bin w_rel[bin(i,j)] per tile | Compute bin indices from chain_id, global_idx, bond_matrix per tile; lookup w_rel as additive bias |
@@ -1722,11 +1709,11 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 
 ### Validation Experiments
 
-1. **Ablation: co-evolution rank** r ∈ {4, 8, 16, 32} — diminishing returns threshold; compare with and without vector marginal profile
-2. **UOT sparsity**: Measure effective support of T* across heads; verify per-head ε learns multi-scale behavior
+1. **Ablation: co-evolution rank** r ∈ {4, 8, 16, 32} — diminishing returns threshold; compare with and without co-evolution cost bias
+2. **Transport sparsity**: Measure effective support of T* across heads; verify per-head ε produces multi-scale behavior
 3. **Multi-scale ε effect**: Compare fixed multi-scale ε [0.5,1,2,4] vs uniform ε=1.0; measure per-head transport sparsity and downstream accuracy
 4. **Transport vs hot-spots**: Correlate T* mass with known functional sites
-5. **ν distribution on Ag-Ab**: CDR-epitope residues should show high ν
+5. **Transport mass on Ag-Ab**: CDR-epitope residues should receive high transport mass from partner chain
 6. **EGNN trajectory**: Track x_res across 48 blocks — verify progressive structure formation, measure per-block RMSD improvement
 7. **EGNN γ distribution**: After training, visualize γ signs across heads/blocks; verify attraction/repulsion pattern
 8. **Anytime performance**: Plot structure quality (LDDT, DockQ) vs cycle count (1–5) at inference
