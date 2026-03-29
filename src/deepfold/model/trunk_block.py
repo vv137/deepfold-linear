@@ -174,7 +174,6 @@ class TokenOTBlock(nn.Module):
 
         # Mobility gate G_i: sigmoid → per-residue ∈ (0, 1)
         gate = torch.sigmoid(self.w_gate(self.ln_gate(h)))  # (B, N, 1)
-        self._last_gate = gate.detach()
 
         # Intensity gate λ_h: tanh(raw) / H → per-head bounded, averaged
         lam = torch.tanh(self.lambda_h_raw).view(1, H, 1, 1) / H

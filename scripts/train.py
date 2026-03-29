@@ -124,16 +124,6 @@ def _log_extra(model, step, wandb):
         [b.lambda_h_raw for b in blocks]
     ).detach().cpu().tanh().numpy()
 
-    # Runtime gate stats from last forward pass (if available)
-    gate_stats = {}
-    if hasattr(blocks[0], "_last_gate"):
-        gates = [b._last_gate.float() for b in blocks if hasattr(b, "_last_gate")]
-        if gates:
-            # Each gate: (B, N, 1) — compute stats across B,N
-            gate_mean = torch.stack([g.mean() for g in gates]).cpu().numpy()  # (L,)
-            gate_std = torch.stack([g.std() for g in gates]).cpu().numpy()
-            gate_stats = {"mean": gate_mean, "std": gate_std}
-
     # Transport entropy removed — requires O(N²) T materialization.
     # Can be re-added with Triton tiled entropy kernel if needed.
     transport_entropy = {}
@@ -149,9 +139,6 @@ def _log_extra(model, step, wandb):
         "params/lambda_h_mean": float(lambda_map.mean()),
         "params/pos_bias_abs_max": float(np.abs(pos_map).max()),
     }
-    if gate_stats:
-        scalars["params/gate_mean"] = float(gate_stats["mean"].mean())
-        scalars["params/gate_std_mean"] = float(gate_stats["std"].mean())
     if transport_entropy:
         scalars["params/transport_entropy_mean"] = float(transport_entropy["entropy"].mean())
     wandb.log(scalars, step=step)
@@ -179,14 +166,6 @@ def _log_extra(model, step, wandb):
         fig = _heatmap(transport_entropy["entropy"],
                        f"Transport entropy — step {step}", "Head", "Layer", cmap="viridis")
         wandb.log({"heatmap/transport_entropy": wandb.Image(fig)}, step=step)
-        plt.close(fig)
-
-    # Runtime gate stats
-    if gate_stats:
-        gate_data = np.stack([gate_stats["mean"], gate_stats["std"]], axis=1)  # (L, 2)
-        fig = _heatmap(gate_data, f"Gate tanh stats — step {step}",
-                       "mean / std", "Layer", cmap="RdBu_r")
-        wandb.log({"heatmap/gate_stats": wandb.Image(fig)}, step=step)
         plt.close(fig)
 
     # trunk pos_bias: per-head heatmap (n_layers, 68) × n_heads

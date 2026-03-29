@@ -706,8 +706,8 @@ class TokenOTBlock(nn.Module):
         self.W_K = Lin(d, d, bias=False)
         self.W_V = Lin(d, d, bias=False)
         self.W_O = Lin(d, d, bias=False)
+        self.W_G = Lin(d, d, bias=False)                  # output gate
         self.pos_bias = PositionBias(H, 68)
-        self.attn_dropout = Dropout(dropout)
 
         # ---- FFN (SwiGLU) ----
         self.ln_ff = LayerNorm(d)
@@ -730,12 +730,11 @@ class TokenOTBlock(nn.Module):
     def forward(self, h, x_res, pos_bins, mask=None):
         # Returns: h, x_res
 
-        # ---- [Step 1] MHA with 68-bin position bias ----
+        # ---- [Step 1] Flash MHA with 68-bin position bias ----
         h_n = self.ln_mha(h)
-        Q, K, V = project_qkv(h_n)
-        scores = QK^T / sqrt(d_h) + pos_bias(pos_bins)
-        attn = dropout(softmax(scores))
-        h = h + W_O(attn @ V)
+        Q, K, V, G = project_qkvg(h_n)
+        att_out = flash_diffusion_attn(Q, K, V, pos_bias.weight, pos_bins, mask)
+        h = h + sigmoid(G) * W_O(att_out)                 # gate after W_O
 
         # ---- FFN (SwiGLU) ----
         h = h + dropout(swiglu(ln_ff(h)))
@@ -743,7 +742,7 @@ class TokenOTBlock(nn.Module):
         # ---- [Step 2–3] Balanced Sinkhorn Transport ----
         Q_s = L2_norm(W_Q_sink(ln_sink(h)))
         K_s = L2_norm(W_K_sink(ln_sink(h)))
-        x_centroid, T = balanced_sinkhorn_transport(Q_s, K_s, x_res, eps, alpha_h, r_h)
+        x_centroid = balanced_sinkhorn_transport(Q_s, K_s, x_res, eps, alpha_h, r_h)
 
         # ---- [Step 4] Three-gate coordinate update ----
         vec_h = x_centroid - x_res[:, None]               # (B, H, N, 3)
