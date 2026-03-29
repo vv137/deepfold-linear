@@ -365,8 +365,7 @@ class DeepFoldLinear(nn.Module):
                               token_atom_counts, token_pad_mask, atom_pad_mask)
                 if self.training:
                     x_pred_i = checkpoint(self.diffusion, *_diff_args,
-                                          use_reentrant=False,
-                                          debug=True)
+                                          use_reentrant=False)
                 else:
                     x_pred_i = self.diffusion(*_diff_args)
 

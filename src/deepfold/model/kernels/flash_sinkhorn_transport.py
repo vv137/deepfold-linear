@@ -534,10 +534,11 @@ def balanced_sinkhorn_transport_dual(
     V_f = V_h.to(cdtype)
     mask_f = mask.to(cdtype) if mask is not None else None
 
-    if HAS_TRITON and Q_s.is_cuda:
-        return BalancedSinkhornDualFn.apply(Q_s, K_s, x_res, V_f, eps, alpha_h, r_h, K_iter, mask)
+    # TODO: BalancedSinkhornDualFn Triton backward has shape bug — use CPU path
+    # if HAS_TRITON and Q_s.is_cuda:
+    #     return BalancedSinkhornDualFn.apply(Q_s, K_s, x_res, V_f, eps, alpha_h, r_h, K_iter, mask)
 
-    # CPU fallback with gradient checkpointing
+    # CPU fallback with gradient checkpointing (O(N²) but correct)
     if torch.is_grad_enabled():
         return checkpoint(_sinkhorn_cpu, Q_s, K_s, x_f, eps, alpha_h, r_h, mask_f, N, K_iter, V_f,
                           use_reentrant=False)
