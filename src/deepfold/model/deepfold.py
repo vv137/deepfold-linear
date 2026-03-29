@@ -366,7 +366,7 @@ class DeepFoldLinear(nn.Module):
                 if self.training:
                     x_pred_i = checkpoint(self.diffusion, *_diff_args,
                                           use_reentrant=False,
-                                          determinism_check="none")
+                                          debug=True)
                 else:
                     x_pred_i = self.diffusion(*_diff_args)
 
