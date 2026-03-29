@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v5.6
+# Protein Complex Structure Prediction Model: Full Design Specification v6.0
 
 ---
 
@@ -13,23 +13,23 @@
 | d_msa | MSA representation dimension (64) |
 | d_atom | Atom representation dimension (128) |
 | d_pair | Atom pair representation dimension (16) |
-| H_res | Token-level UOT attention heads (16) |
+| H_res | Token-level attention heads (16), used in both MHA and Sinkhorn |
 | d_h | Per-head dimension = d / H_res = 32 |
 | H_msa | MSA attention heads (8) |
 | H_atom | Atom attention heads (4) |
 | r | Co-evolution rank (16) |
-| L | Number of Token UOT blocks in trunk (48) |
+| L | Number of Token OT blocks in trunk (48) |
 | L_atom | Number of Atom blocks per diffusion step (10) |
-| r_0 | Geometry characteristic distance (10 Å, fixed) |
+| r_h | Per-head characteristic distance (learnable, init 10 Å) |
 | d_low | Distogram low-rank interaction dimension (64) |
 | σ_data | EDM data noise scale (16 Å) |
 | token_idx | (N_atom,) int — maps each atom to its token |
 | Lin(a→b) | nn.Linear(a, b, bias=True) — standalone projections (input embed, coord output, loss heads) |
-| Lin_nb(a→b) | nn.Linear(a, b, bias=False) — projections after LayerNorm (attention Q/K/V/G/O, SwiGLU) |
+| Lin_nb(a→b) | nn.Linear(a, b, bias=False) — projections after LayerNorm (attention Q/K/V/O, Sinkhorn Q/K, SwiGLU) |
 | LN(a) | nn.LayerNorm(a) — with learnable γ, β |
 | LN_Lin(a→b) | LayerNorm(a) followed by Linear(a, b, bias=False). LN β provides the bias; Linear bias redundant |
 
-**Bias convention**: Projections that follow a LayerNorm use `bias=False` because LN's learnable β already provides the additive shift. This includes trunk attention projections (W_Q, W_K, W_V, W_G, W_O), SwiGLU projections, and LN_Lin composites. **Exception**: In diffusion AtomBlock (AF3 Alg 24), W_Q uses `bias=True` per AF3 convention. Standalone projections that don't follow LN (input embedding, coordinate output, loss heads, atom-to-token encoder output) use `bias=True`.
+**Bias convention**: Projections that follow a LayerNorm use `bias=False` because LN's learnable β already provides the additive shift. This includes trunk MHA projections (W_Q, W_K, W_V, W_O), Sinkhorn projections (W_Q_sink, W_K_sink), SwiGLU projections, and LN_Lin composites. **Exception**: W_gate uses `bias=True` (provides per-residue offset for tanh gate). In diffusion AtomBlock (AF3 Alg 24), W_Q uses `bias=True` per AF3 convention. Standalone projections that don't follow LN (input embedding, coordinate output, loss heads, atom-to-token encoder output) use `bias=True`.
 
 **Terminology**: This document uses "token" as the basic unit of the single-track representation. For proteins, one token = one residue. For RNA/DNA, one token = one nucleotide. For ligands/ions/water, one token = one atom or functional group. Legacy references to "residue" in variable names (e.g., h_res) are retained for readability but apply to all token types.
 
@@ -312,21 +312,20 @@ No warp divergence. w_rel cached in shared memory for kernel fusion.
 
 ### 5.1 Design Intent
 
-The trunk runs a **randomly sampled** number of recycling passes (1 to max_cycles). Each cycle: (1) embed fresh MSA and refine h_res with MSA blocks (invariant, sequence/co-evolution), (2) compute per-block marginals and refine h_res (invariant) and x_res (equivariant) with UOT+EGNN blocks. Only the last cycle backpropagates; all earlier cycles run under `torch.no_grad()`.
+The trunk runs a **randomly sampled** number of recycling passes (1 to max_cycles). Each cycle: (1) embed fresh MSA and refine h_res with MSA blocks (invariant, sequence/co-evolution), (2) refine h_res (invariant, via MHA) and x_res (equivariant, via balanced Sinkhorn transport) with Token OT blocks. Only the last cycle backpropagates; all earlier cycles run under `torch.no_grad()`.
 
-**Random cycle count** makes the architecture an anytime algorithm. The network must produce good output whether it gets 1 cycle (48 UOT+EGNN blocks from noise) or 3 cycles (144 blocks of refinement). Since γ is shared across cycles, the network learns step sizes that work for both aggressive folding and gentle refinement. At inference, the user chooses: 1 cycle (fast), 3 (standard).
+**Random cycle count** makes the architecture an anytime algorithm. The network must produce good output whether it gets 1 cycle (48 OT blocks from noise) or 3 cycles (144 blocks of refinement). At inference, the user chooses: 1 cycle (fast), 3 (standard).
 
-**No coordinate embedding into h_res**: Geometry enters through UOT cost → T* → attention output.
+**No coordinate embedding into h_res**: Geometry enters through Sinkhorn cost → transport plan → coordinate update.
 
-**No augmentation for trunk**: EGNN updates use only relative vectors — SE(3) equivariant by construction.
+**No augmentation for trunk**: Coordinate updates use only relative vectors — SE(3) equivariant by construction.
 
 ### 5.2 Trunk Loop
 
 ```python
 def trunk_forward(seq_features, msa_features, c_atom, p_lm,
                   bond_matrix, chain_id, global_idx, token_idx,
-                  msa_token_mask,                       # (N,) bool — True for tokens with MSA data
-                  x_0_res=None):  # ground truth for L_trunk_coord (training only)
+                  msa_token_mask, x_0_res=None):
 
     # ---- Input embedding ----
     h_res = Lin(38, 512)(cat(token_type, profile, del_mean, has_msa))   # (N, 512)
@@ -336,17 +335,14 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
     x_res = torch.randn(N, 3) * sigma_data
     x_res = x_res - x_res.mean(dim=0, keepdim=True)
 
-    # ---- Shared marginal projections (on Trunk, used per-block) ----
-    mu_proj = Lin(512, H_res, bias=False)              # zero-init weight
-    nu_proj = Lin(512, H_res, bias=False)              # zero-init weight
+    # Precompute position bins (68-bin encoding)
+    pos_bins = compute_bins(chain_id, global_idx, bond_matrix)  # (N, N)
 
     # ---- Sample cycle count ----
     if training:
-        num_cycles = randint(1, max_cycles + 1)       # e.g., uniform over {1, 2, 3}
+        num_cycles = randint(1, max_cycles + 1)       # uniform over {1, 2, 3}
     else:
         num_cycles = inference_cycles                  # default 3, configurable
-
-    log_u_carry, log_v_carry = None, None
 
     for cycle in range(num_cycles):
         is_last = (cycle == num_cycles - 1)
@@ -357,41 +353,24 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
         # ---- MSA module: 4 blocks (invariant, no coordinates) ----
         m, h_res, coevol_bias = msa_module(m, h_res, msa_token_mask)
 
-        # ---- Token UOT+EGNN blocks × 48 ----
-        log_u_prev = log_u_carry
-        log_v_prev = log_v_carry
-
-        for block in residue_uot_blocks:
-            # ---- Per-layer marginals from LN(h_res) + coevol_bias ----
-            h_ln = LN(h_res)                                        # shared LN
-            mu = softmax(mu_proj(h_ln).T + coevol_bias.T, dim=-1)   # (H_res, N)
-            nu = softmax(nu_proj(h_ln).T + coevol_bias.T, dim=-1)   # (H_res, N)
-
+        # ---- Token OT blocks × 48 ----
+        for block in ot_blocks:
             if is_last:
-                h_res, x_res, log_u_prev, log_v_prev = checkpoint(
-                    block, h_res, x_res, mu, nu, log_u_prev, log_v_prev
-                )
+                h_res, x_res = block(h_res, x_res, pos_bins)
             else:
                 with torch.no_grad():
-                    h_res, x_res, log_u_prev, log_v_prev = block(
-                        h_res, x_res, mu, nu, log_u_prev, log_v_prev
-                    )
+                    h_res, x_res = block(h_res, x_res, pos_bins)
 
         # ---- Re-center coordinates (once per cycle, not per block) ----
-        # EGNN is exactly translation-equivariant; re-centering is float32 hygiene
         x_res = x_res - x_res.mean(dim=0, keepdim=True)
 
         if not is_last:
             h_res = h_res.detach()
             x_res = x_res.detach()
-            log_u_carry = log_u_prev.detach()
-            log_v_carry = log_v_prev.detach()
-        else:
-            log_u_carry = log_u_prev
 
     # ---- Losses (last cycle only, in graph) ----
     L_disto = distogram_loss(h_res, x_0_res)
-    L_trunk_coord = smooth_lddt(x_res, x_0_res) if x_0_res is not None else 0.0
+    L_trunk_coord = log_distance_mse(x_res, x_0_res) if x_0_res is not None else 0.0
 
     return h_res, x_res, L_disto, L_trunk_coord
 ```
@@ -401,27 +380,23 @@ def trunk_forward(seq_features, msa_features, c_atom, p_lm,
 | Parameter | Value |
 |---|---|
 | max_cycles (training) | 3 |
-| Sampling distribution | Uniform over {1, 2, 3, 4, 5} |
+| Sampling distribution | Uniform over {1, 2, 3} |
 | inference_cycles (default) | 3 |
 | inference_cycles (fast) | 1 |
-| inference_cycles (difficult) | 5+ |
-
-The uniform distribution ensures the network trains equally on all cycle counts. Alternative: geometric distribution (P(k) ∝ 0.5^(k-1)) to bias toward fewer cycles, teaching efficiency. Hyperparameter to tune.
 
 ### 5.4 Recycling Design Rationale
 
 | Mechanism | Purpose |
 |---|---|
-| Random cycle count | Anytime algorithm; works with 1–5+ cycles; no fixed schedule |
+| Random cycle count | Anytime algorithm; works with 1–3+ cycles; no fixed schedule |
 | no_grad on all but last cycle | Memory: always 52 blocks in graph regardless of cycle count |
-| EGNN updates every UOT block | Coordinates refine continuously (48 updates/cycle) |
-| Re-centering once per cycle | Float32 hygiene; EGNN is exactly translation-equivariant in exact arithmetic |
-| L_trunk on final x_res (log-distance MSE and/or smooth LDDT) | Direct gradient to all EGNN γ gate parameters; fixes dead-gradient on last block |
-| No coordinate embedding into h_res | Geometry enters h_res through UOT cost → T* → attention output |
-| No augmentation | EGNN is SE(3) equivariant by construction |
-| Per-layer marginals | mu_proj/nu_proj on LN(h_res) + coevol_bias; recomputed each block |
+| MHA + Sinkhorn every OT block | Features contextualized, coordinates refined continuously (48 updates/cycle) |
+| Re-centering once per cycle | Float32 hygiene; coordinate updates are exactly translation-equivariant |
+| L_trunk on final x_res (log-distance MSE) | Direct gradient to gate and Sinkhorn parameters |
+| No coordinate embedding into h_res | Geometry enters through Sinkhorn cost → transport plan → displacement |
+| No augmentation | Coordinate updates are SE(3) equivariant by construction |
 | Per-cycle MSA subsampling | Fresh MSA embedding each cycle; m does not carry across cycles |
-| Sinkhorn warm-start carry | log_u, log_v from cycle k → cycle k+1 (detached except last) |
+| No warm-start carry | Balanced OT converges fast; each block starts from uniform init |
 
 ---
 
@@ -562,312 +537,259 @@ MSA row-wise attention operates within individual homologous sequences where eve
 
 ---
 
-## 7. UOT-Flash Attention
+## 7. Balanced Sinkhorn Transport
 
 ### 7.1 Cost Matrix
 
-For each head h, between residue positions i and j:
+For each head h, between token positions i and j:
 
 ```
-C_ij^(h) = −(LN(Q_i)^T LN(K_j)) / sqrt(d_h)       content term
-          + w_rel^(h)[bin(i,j)]                       position/bond term
-          + w_dist^(h) · d_ij / (r_0 + d_ij)          geometry term
+C_feat^(h) = 1 − cos(Q_s_i, K_s_j)                  feature cost ∈ [0, 2]
+C_geom^(h) = d_ij / (r_h + d_ij)                     geometry cost ∈ [0, 1)
+C_ij^(h)   = (1 − w_h) · C_feat + w_h · C_geom       weighted blend
 ```
 
-where d_ij = ||x_res_i − x_res_j||₂.
+where:
 
-**LN on Q, K**: LayerNorm normalizes each head's query/key vector to approximately unit norm. This bounds the content term to approximately [−1, 1] after division by sqrt(d_h). This is critical for Sinkhorn stability — all three cost terms are O(1), so ε=1.0 produces meaningful entropy regularization.
+- `Q_s = L2_norm(W_Q_sink(LN(h)))`, `K_s = L2_norm(W_K_sink(LN(h)))` — separate projections from MHA
+- `w_h = sigmoid(α_h)` — per-head mixing gate (init −1.0 → feature-heavy start)
+- `r_h` — per-head characteristic distance (learnable, init 10 Å)
+- `d_ij = ||x_res_i − x_res_j||₂`
+
+**Three-gate coordinate update**:
+
+| Gate | Type | Shape | Controls |
+|---|---|---|---|
+| Mixing α_h | `sigmoid(α_h)` | (H,) per-head | Feature vs geometry cost blend |
+| Intensity λ_h | `tanh(λ_h_raw) / H` | (H,) per-head | Force magnitude and direction |
+| Mobility G_i | `sigmoid(W_gate(LN(h)))` | (N, 1) per-residue | Whether residue responds to forces |
+
+**Cosine feature cost**: L2-normalization bounds cos(Q_s, K_s) ∈ [-1, 1], so C_feat ∈ [0, 2]. All cost terms are O(1).
+
+**Mixing gate initialization**: α_h = −1.0 → sigmoid(−1) ≈ 0.27 → starts feature-heavy. Expected: front layers feature-heavy → back layers geometry-heavy.
+
+**Learnable r_h**: Per-head characteristic distance. Heads specialize in different spatial scales — contacts (~5 Å) to domains (~30 Å).
 
 **Geometry term design**:
 
-- f(d) = d/(r_0 + d) is concave, f(0) = 0, bounded in [0, 1).
+- f(d) = d/(r_h + d) is concave, f(0) = 0, bounded in [0, 1).
 - f ∘ d satisfies the triangle inequality (metric).
-- r_0 = 10 Å fixed: roughly contact range (~8 Å) scale.
-- w_dist is per-block, per-head: `w_dist = alg_sigmoid(w_dist_raw)` where `alg_sigmoid(t) = 0.5·(1 + t/(1+|t|))`, bounded to (0, 1). `w_dist_raw` initialized to 0 (midpoint = 0.5). Heavy-tailed: gradient ∝ 1/(1+|t|)², preventing saturation at boundaries. No weight decay.
-- Per-block, per-head w_dist allows multi-scale behavior: some heads/layers develop strong geometry sensitivity, others stay weak. The transport-weighted average across heads provides implicit noise robustness.
-- In the trunk: coordinates have variable quality across recycling noise levels. The per-head diversity handles this — geometry-sensitive heads contribute when coordinates are good, geometry-insensitive heads carry the load when coordinates are noisy.
-- In the diffusion module: σ-conditioned geometry gating explicitly modulates the geometry term (see §9.2).
+- r_h learnable per-head (init 10 Å): roughly contact range (~8 Å) scale.
+- Per-block, per-head r_h + α_h allows multi-scale behavior: some heads/layers develop strong geometry sensitivity, others stay feature-heavy.
 
 **Scale budget** (all terms O(1)):
 
-- Content: LN → approximately [−3, 3]
-- w_rel[bin]: no decay, zeros init → approximately [−1, 1]
-- w_dist · f: alg_sigmoid(raw) · f ∈ [0,1) → [0, 1)
+- C_feat: cosine distance → [0, 2]
+- C_geom: d/(r_h+d) → [0, 1)
+- Weighted sum: [0, 2]
 
 ### 7.2 Transport Problem
 
+Balanced optimal transport with uniform marginals:
+
 ```
-T*^(h) = argmin_{T ≥ 0}  ⟨C^(h), T⟩
-                         + ε^(h) · KL(T ‖ μ^(h) ⊗ ν^(h))
-                         + λ · KL(T1 ‖ μ^(h))
-                         + λ · KL(T^T 1 ‖ ν^(h))
+T*^(h) = argmin_{T ≥ 0}  ⟨C^(h), T⟩ + ε^(h) · KL(T ‖ 1/N ⊗ 1/N)
+         subject to:  T·1 = 1/N,  T^T·1 = 1/N
 ```
 
 **Multi-scale ε (fixed per head, not learned)**:
 
 ```python
-# Registered as buffer — no gradients
 self.register_buffer('eps', torch.tensor([
-    0.5, 0.5, 0.5, 0.5,     # heads 0–3:   sparse (contacts, hot-spots)
-    1.0, 1.0, 1.0, 1.0,     # heads 4–7:   balanced (structural reasoning)
+    0.5, 0.5, 0.5, 0.5,     # heads 0–3:   sparse (contacts)
+    1.0, 1.0, 1.0, 1.0,     # heads 4–7:   balanced (structural)
     2.0, 2.0, 2.0, 2.0,     # heads 8–11:  smooth (secondary structure)
-    4.0, 4.0, 4.0, 4.0,     # heads 12–15: diffuse (allostery, global)
+    4.0, 4.0, 4.0, 4.0,     # heads 12–15: diffuse (global)
 ]))
 ```
 
-**Empirical convergence (cold-start, measured across N=128–512)**:
-
-| K_iter | Residual | Status |
+| Head group | ε | Transport character |
 |---|---|---|
-| 4 | 26–34% | Unusable |
-| 7 | 2.3–3.0% | Marginal |
-| 10 | 0.2–0.3% | Decent |
-| 14 | ~1e-4 | Good |
-| 20 | ~1e-6 | Converged |
-
-| Head group | ε | κ = λ/(λ+ε) | Transport character |
-|---|---|---|---|
-| 0–3 | 0.5 | 0.67 | Sparse: mass flows to specific contacts |
-| 4–7 | 1.0 | 0.5 | Balanced: standard structural interactions |
-| 8–11 | 2.0 | 0.33 | Smooth: broad environment sensing |
-| 12–15 | 4.0 | 0.2 | Diffuse: global state, allostery |
+| 0–3 | 0.5 | Sparse: mass flows to specific contacts |
+| 4–7 | 1.0 | Balanced: standard structural interactions |
+| 8–11 | 2.0 | Smooth: broad environment sensing |
+| 12–15 | 4.0 | Diffuse: global state, allostery |
 
 | Parameter | Value | Rationale |
 |---|---|---|
 | ε | Fixed per-head [0.5, 1.0, 2.0, 4.0] × 4 | Multi-scale transport without gradient complexity |
-| λ | 1.0 (uniform all heads) | κ ranges 0.2–0.67 |
-| K | 20 (all blocks, uniform) | Converges to ~1e-6 residual; no warm/cold distinction; unrolled backprop needs correct forward output |
-| K_max_infer | 20 (or adaptive tol=1e-4 → ~14 iterations) | Inference can use early stopping for ~30% speedup |
-| tol (inference) | 1e-4 | Early stopping threshold at inference |
+| Marginals | Uniform 1/N (balanced OT) | No learned marginal projections needed |
+| K | 20 (all blocks, uniform) | Converges to ~1e-6 residual |
 
-**Why K=20 uniform**: With unrolled differentiable backward, gradient quality depends directly on forward output quality. K=4 gives 30% residual — the network trains on a substantially wrong transport plan. K=20 reaches ~1e-6 residual, giving a correct forward output and therefore correct gradients. The FlashSinkhorn Triton kernel (§18) makes K=20 affordable — fused IO-aware streaming achieves 32× speedup over naive PyTorch per iteration.
+**Why balanced OT** (vs UOT): Uniform marginals eliminate mu_proj/nu_proj, avoid FP32 marginal headaches, and converge faster. MHA handles feature mixing — Sinkhorn only determines WHERE to transport coordinates.
 
-**No warm/cold distinction**: With K=20, all blocks converge fully regardless of initialization quality. Warm-starting from the previous block's log_u, log_v still helps (convergence may be reached by K=10–14 with warm start), but K=20 provides a safe ceiling. At inference, adaptive early stopping with tol=1e-4 typically terminates at K≈14.
+**Why fixed ε**: Learnable ε creates gradient complications. The mixing gate α_h provides sufficient expressivity for head specialization.
 
-**Why fixed, not learned**: Learnable ε creates gradient complications — ε enters both the kernel scaling (log_K = -C/ε) and the damping factor (κ = λ/(λ+ε)), producing competing gradient components. Per-head κ varies with ε, making convergence analysis ε-dependent. Fixed ε avoids all of this while still providing multi-scale transport. The network adapts through its existing per-head parameters (W_Q, W_K, W_V, W_G, W_O, γ, w_dist_raw) — ample capacity for head specialization.
-
-**Why λ=1.0 uniform**: At K=20, convergence is not a constraint — all ε values converge fully. λ=1.0 gives κ ranging from 0.67 (sparse heads, strong marginal enforcement) to 0.2 (diffuse heads, weak enforcement). This is the right physical behavior.
-
-### 7.3 Sinkhorn Iterations (Log-Domain, Per-Head ε)
+### 7.3 Sinkhorn Iterations (Log-Domain, Balanced)
 
 ```python
-def sinkhorn_log_domain(C, log_mu, log_nu, eps, lam, K, log_u_init=None, log_v_init=None):
+def balanced_sinkhorn(C, eps, K, mask=None):
     """
-    C:      (H, N, N) cost matrix
-    log_mu: (H, N) log row marginal
-    log_nu: (H, N) log column marginal
-    eps:    (H,) fixed per-head entropic regularization (buffer, no grad)
-    lam:    scalar marginal penalty
-    Returns: log_u (H, N), log_v (H, N)
+    C:    (B, H, N, N) cost matrix
+    eps:  (H,) fixed per-head entropic regularization
+    K:    number of iterations
+    Returns: T (B, H, N, N) transport plan
     """
-    kappa = lam / (lam + eps)                          # (H,) fixed per-head damping
+    log_K = -C / eps[None, :, None, None]
+    log_marginal = -log(N_valid)                        # uniform 1/N
 
-    log_u = log_u_init if log_u_init is not None else torch.zeros(H, N)
-    log_v = log_v_init if log_v_init is not None else torch.zeros(H, N)
-
-    log_K = -C / eps[:, None, None]                    # (H, N, N) per-head scaling
+    log_u = zeros(B, H, N, 1)
+    log_v = zeros(B, H, 1, N)
 
     for k in range(K):
-        # Row update
-        log_u = kappa[:, None] * (log_mu - logsumexp(log_K + log_v[:, None, :], dim=-1))
-        # Column update
-        log_v = kappa[:, None] * (log_nu - logsumexp(log_K + log_u[:, :, None], dim=-2))
+        log_u = log_marginal - logsumexp(log_K + log_v, dim=-1, keepdim=True)
+        log_v = log_marginal - logsumexp(log_K + log_u, dim=-2, keepdim=True)
 
-    return log_u, log_v
+    T = exp(log_u + log_K + log_v)
+    return T
 ```
 
-**Per-head broadcasting**: Each head's tile uses its own fixed ε_h — a single scalar read from shared memory. κ_h is also fixed. Zero extra memory, zero extra compute. No gradient through ε — backward only handles ∂L/∂C, ∂L/∂μ, ∂L/∂ν via unrolled Sinkhorn autograd.
+**Balanced = simpler iterations**: No κ damping (κ=1 always). Each iteration is a simple row/col normalization in log-domain. Faster and more stable convergence than UOT.
 
-### 7.4 Output: Transport-Weighted Average (Numerically Stable)
+### 7.4 Output: Transport-Weighted Centroid
 
 ```python
-def uot_attention_output(V, G, log_u, log_v, C, eps):
-    """
-    After Sinkhorn converges, compute gated transport-weighted average.
-    Uses running-max trick (same as FlashAttention) for numerical stability.
-    
-    Reference implementation (non-tiled):
-    """
-    log_K = -C / eps                                                # (H, N, N)
-
-    # Per-row running max for numerical stability
-    log_score = log_u[:, :, None] + log_K + log_v[:, None, :]      # (H, N, N)
-    row_max = log_score.max(dim=-1, keepdim=True).values            # (H, N, 1)
-
-    T = exp(log_score - row_max)                                    # (H, N, N) safe: ≤ 1
-    T_sum = T.sum(dim=-1, keepdim=True)                             # (H, N, 1)
-    O_avg = einsum('hnm,hmd->hnd', T, V) / (T_sum + 1e-6)         # (H, N, d_h)
-
-    # Gating
-    o = sigmoid(G) * O_avg                                          # (H, N, d_h)
-    o = rearrange(o, 'h n d -> n (h d)')                            # (N, 512)
-    return Lin(512 → 512)(o)                                         # (N, 512)
+def transport_centroid(T, x_res):
+    """Transport-weighted centroid for coordinate update. No value aggregation."""
+    x_centroid = einsum('bhij,bjc->bhic', T, x_res)                # (B, H, N, 3)
+    return x_centroid
 ```
 
-**Numerical stability**: Without the row_max subtraction, `exp(log_u + log_K + log_v)` can overflow (large positive exponents) or underflow (large negative). The running-max trick subtracts the per-row maximum before exp, keeping all values ≤ 1. The division by T_sum cancels the subtracted constant. In the tiled (Flash) implementation, this uses the online logsumexp accumulator identical to FlashAttention.
+Feature mixing is handled by MHA (§8 Step 1). The transport plan T is used ONLY for coordinate movement.
 
-**Length invariance**: Division by T_sum makes output O(1) regardless of N. No gradient dilution.
+### 7.5 Backward: Triton Unrolled (exact gradients, O(N) memory)
 
-### 7.5 Backward: Unrolled Differentiable Sinkhorn
+Autograd through K Sinkhorn iterations, implemented as Triton tiled kernels. Cost tiles recomputed on-the-fly — no N×N matrix ever stored in HBM.
 
-Standard PyTorch autograd differentiates through the K Sinkhorn iterations directly. No custom backward, no adjoint solve, no fixed-point assumption.
+**Iteration order**: col-first, row-last. The last row update ensures T's row sums are exactly 1/N (machine precision), making the centroid numerically stable without explicit normalization.
 
-```python
-def sinkhorn_differentiable(C, log_mu, log_nu, eps, lam, K, log_u_init, log_v_init):
-    """Differentiable Sinkhorn. Standard autograd handles backward."""
-    kappa = lam / (lam + eps)                          # (H,) per-head
-    log_u = log_u_init.clone() if log_u_init is not None else torch.zeros_like(log_mu)
-    log_v = log_v_init.clone() if log_v_init is not None else torch.zeros_like(log_nu)
-    log_K = -C / eps[:, None, None]                    # (H, N, N)
+**Saved for backward**: iteration history K × 2 × (B,H,N) ≈ 1-5 MB (negligible).
 
-    for k in range(K):
-        log_u = kappa[:, None] * (log_mu - torch.logsumexp(log_K + log_v[:, None, :], dim=-1))
-        log_v = kappa[:, None] * (log_nu - torch.logsumexp(log_K + log_u[:, :, None], dim=-2))
+**Backward kernels** (4 Triton kernels in `balanced_sinkhorn_bwd.py`):
+1. `_centroid_bwd_D_kernel` — D[i] = Σ_j T_norm·(grad_xc·x) contraction
+2. `_centroid_bwd_kernel` — g_u, g_v, grad_x_transport + direct cost gradient
+3. `_balanced_row_bwd_kernel` — backward through row update (2-pass: LSE then softmax grad)
+4. `_balanced_col_bwd_kernel` — backward through col update
 
-    return log_u, log_v
-```
+**Gradient accuracy** (vs PyTorch autograd, same input):
 
-**Why not IFT**: The Implicit Function Theorem computes exact gradients at the Sinkhorn fixed point (infinite-iteration limit). However, empirical testing shows that IFT gradients for cost-matrix parameters (Q, K, w_dist) diverge from unrolled gradients by 1.5–3.5× median relative error, and this error does NOT decrease with more Sinkhorn iterations. The IFT gradient is "exact" at a point the network never reaches — the actual K-iteration output is the operating regime. Unrolled backprop gives exact gradients for the computation that was actually performed.
+| Parameter | Rel error | Note |
+|---|---|---|
+| x_res | < 1e-4 | Exact |
+| Q_s, K_s | < 1e-3 | Exact (FP32 rounding only) |
+| α_h | < 1e-3 | Exact |
+| r_h | < 6e-5 | Exact |
 
-**Memory**: Autograd stores K intermediate (log_u, log_v) states per block. With K=20: 20 × H × N × 4 bytes = 20 × 16 × N × 4 = 1280N bytes per block. For N=512: 640KB per block. With gradient checkpointing, only one block's intermediates exist at a time. Negligible compared to the (N, 512) h_res boundary state.
+**Performance** (CUDA, B=1, H=16, d_h=32, K=20):
 
-**Gradient checkpointing interaction**: The enclosing `torch.utils.checkpoint.checkpoint` recomputes the entire block forward (including Sinkhorn iterations) during backward. The K intermediate states are created fresh during this recomputation and consumed immediately by autograd. No persistent storage across blocks.
+| N | Triton | Autograd | Speedup | Memory ratio |
+|---|---|---|---|---|
+| 64 | 1.6ms, 1MB | 3.0ms, 30MB | 1.9× | 0.04× |
+| 256 | 4.5ms, 22MB | 3.0ms, 218MB | 0.7× | 0.10× |
+| 512 | 8.3ms, 28MB | 5.5ms, 816MB | 0.7× | 0.03× |
+| 768 | 21.4ms, 35MB | 11.4ms, 1807MB | 0.5× | 0.02× |
+
+Speed: Triton backward is compute-bound at large N (cost tile recomputation × K iterations × atomic_add contention). Memory: O(N) — **up to 52× reduction** vs materialized O(N²).
 
 ---
 
-## 8. Token UOT+EGNN Block
+## 8. Token OT Block (MHA + Balanced Sinkhorn)
 
-48 blocks in the trunk, 2 in diffusion (diffusion blocks have σ-gated geometry, see §9.2). Each block updates h_res (invariant) and x_res (equivariant) from the same transport plan.
+48 blocks in the trunk. Each block separates feature contextualization (MHA) from coordinate transport (balanced Sinkhorn). Returns h (invariant) and x_res (equivariant).
 
 ```python
-class TokenUOTBlock(nn.Module):
-    def __init__(self, d=512, H=16):
-        # Attention projections (after LN → bias=False)
-        self.ln_attn = LayerNorm(d)
+class TokenOTBlock(nn.Module):
+    def __init__(self, d=512, H=16, r_0=10.0, dropout=0.0):
+        # ---- [Step 1] MHA: Contextualization ----
+        self.ln_mha = LayerNorm(d)
         self.W_Q = Lin(d, d, bias=False)
         self.W_K = Lin(d, d, bias=False)
         self.W_V = Lin(d, d, bias=False)
-        self.W_G = Lin(d, d, bias=False)
         self.W_O = Lin(d, d, bias=False)
+        self.pos_bias = PositionBias(H, 68)
+        self.attn_dropout = Dropout(dropout)
 
-        # EGNN: input-dependent per-head geometry gate
-        self.ln_gamma = LayerNorm(d)
-        self.W_gamma = Lin(d, H, bias=True)  # W=zeros, bias~N(0,1e-4); bias=True exception to post-LN convention
-
-        # Per-head entropic regularization (fixed, multi-scale transport)
-        self.register_buffer('eps', torch.tensor([
-            0.5, 0.5, 0.5, 0.5,     # sparse: contacts, hot-spots
-            1.0, 1.0, 1.0, 1.0,     # balanced: structural reasoning
-            2.0, 2.0, 2.0, 2.0,     # smooth: secondary structure
-            4.0, 4.0, 4.0, 4.0,     # diffuse: allostery, global
-        ]))
-
-        # Transition (after LN → bias=False)
+        # ---- FFN (SwiGLU) ----
         self.ln_ff = LayerNorm(d)
-        self.ff_gate  = Lin(d, d * 4, bias=False)
-        self.ff_value = Lin(d, d * 4, bias=False)
-        self.ff_out   = Lin(d * 4, d, bias=False)
+        self.swiglu = SwiGLU(d, d*4, d)
+        self.ff_dropout = Dropout(dropout)
 
-    def forward(self, h, x_res, mu, nu, log_u_prev=None, log_v_prev=None):
-        """
-        h:     (N, 512)   token representation (invariant)
-        x_res: (N, 3)     token coordinates (equivariant)
-        mu:    (H, N)      row marginals
-        nu:    (H, N)      column marginals
-        Returns: h, x_res, log_u, log_v
-        """
+        # ---- [Step 3] Sinkhorn Transport ----
+        self.ln_sink = LayerNorm(d)
+        self.W_Q_sink = Lin(d, d, bias=False)
+        self.W_K_sink = Lin(d, d, bias=False)
+        self.alpha_h = Parameter(full(H, -1.0))         # mixing gate → feature-heavy
+        self.r_h = Parameter(full(H, r_0))               # per-head char. distance
+        self.register_buffer('eps', ...)                  # [0.5, 1.0, 2.0, 4.0] × 4
 
-        # ---- Pre-norm ----
-        h_n = self.ln_attn(h)                                    # (N, 512)
-        Q = self.W_Q(h_n).view(N, H, 32)
-        K = self.W_K(h_n).view(N, H, 32)
-        V = self.W_V(h_n).view(N, H, 32)
-        G = self.W_G(h_n).view(N, H, 32)
+        # ---- [Step 4] Coordinate Update ----
+        self.ln_gate = LayerNorm(d)
+        self.W_gate = Lin(d, 1, bias=True)               # mobility gate (sigmoid)
+        self.lambda_h_raw = Parameter(zeros(H))           # intensity gate (tanh/H)
 
-        # ---- Cost matrix (online, per head) ----
-        Q_ln = layer_norm(Q, dim=-1)
-        K_ln = layer_norm(K, dim=-1)
-        content = -einsum('ihd,jhd->hij', Q_ln, K_ln) / sqrt(32)
+    def forward(self, h, x_res, pos_bins, mask=None):
+        # Returns: h, x_res
 
-        pos_bias = w_rel_res[compute_bins(chain_id, global_idx, bond_matrix)]
-        dist = torch.cdist(x_res, x_res)
-        geo_bias = w_dist[:, None, None] * dist / (r_0 + dist)
+        # ---- [Step 1] MHA with 68-bin position bias ----
+        h_n = self.ln_mha(h)
+        Q, K, V = project_qkv(h_n)
+        scores = QK^T / sqrt(d_h) + pos_bias(pos_bins)
+        attn = dropout(softmax(scores))
+        h = h + W_O(attn @ V)
 
-        C = content + pos_bias + geo_bias                        # (H, N, N)
+        # ---- FFN (SwiGLU) ----
+        h = h + dropout(swiglu(ln_ff(h)))
 
-        # ---- Sinkhorn (per-head fixed ε, K=20 uniform) ----
-        K_iter = 20
-        init_u = log_u_prev    # warm-start from previous block (or None for block 0)
-        init_v = log_v_prev
-        log_u, log_v = sinkhorn_log_domain(
-            C, log(mu), log(nu), eps=self.eps, lam=1.0, K=K_iter,
-            log_u_init=init_u, log_v_init=init_v
-        )
+        # ---- [Step 2–3] Balanced Sinkhorn Transport ----
+        Q_s = L2_norm(W_Q_sink(ln_sink(h)))
+        K_s = L2_norm(W_K_sink(ln_sink(h)))
+        x_centroid, T = balanced_sinkhorn_transport(Q_s, K_s, x_res, eps, alpha_h, r_h)
 
-        # ---- Row-normalized transport plan ----
-        log_K = -C / self.eps[:, None, None]                     # (H, N, N) per-head
-        log_score = log_u[:, :, None] + log_K + log_v[:, None, :]
-        row_max = log_score.max(dim=-1, keepdim=True).values
-        T = exp(log_score - row_max)                              # numerically stable
-        T_norm = T / (T.sum(dim=-1, keepdim=True) + 1e-6)        # (H, N, N) row-stochastic
+        # ---- [Step 4] Three-gate coordinate update ----
+        vec_h = x_centroid - x_res[:, None]               # (B, H, N, 3)
+        G_i = sigmoid(W_gate(ln_gate(h)))                  # (B, N, 1) mobility
+        lambda_h = tanh(lambda_h_raw) / H                  # (H,) intensity
+        x_res = x_res + G_i * einsum('h,bhic->bic', lambda_h, vec_h)
 
-        # ---- h_res update (invariant): gated transport-weighted average ----
-        O_avg = einsum('hnm,hmd->hnd', T_norm, V)                # (H, N, d_h)
-        o = sigmoid(G) * O_avg
-        o = rearrange(o, 'h n d -> n (h d)')                     # (N, 512)
-        h = h + self.W_O(o)
-
-        # ---- x_res update (equivariant): EGNN ----
-        # Input-dependent gamma gate: tanh(W_gamma(LN(h)) + b) → (N, H) ∈ [-1, 1]
-        # h is invariant → gamma_gate is invariant → update is equivariant
-        gamma_gate = tanh(self.W_gamma(self.ln_gamma(h)))         # (N, H)
-        # Transport-weighted centroid per head (fused in Flash kernel with V aggregation)
-        x_centroid = einsum('hnm,mc->hnc', T_norm, x_res)        # (H, N, 3)
-        delta = x_res[None] - x_centroid                          # (H, N, 3)
-        x_res = x_res + einsum('nh,hnc->nc', gamma_gate, delta) / H  # (N, 3) mean over heads
-        # NOTE: No per-block re-centering. EGNN is exactly translation-equivariant
-        # (T_norm is row-stochastic). Re-centering done once per cycle (§5.2)
-        # to handle float32 drift only.
-
-        # ---- SwiGLU transition (h_res only, invariant) ----
-        h_n = self.ln_ff(h)
-        gate  = self.ff_gate(h_n)
-        value = self.ff_value(h_n)
-        h = h + self.ff_out(SiLU(gate) * value)
-
-        return h, x_res, log_u, log_v
+        return h, x_res
 ```
 
-### 8.1 EGNN Coordinate Update: SE(3) Equivariance Proof
+### 8.1 Coordinate Update: SE(3) Equivariance Proof
 
-The update is: `x_new = x + Σ_h γ_h(h_i) · (x_i − T_norm^(h) @ x)`, where `γ_h(h_i) = tanh(W @ LN(h_i) + b)_h` is an invariant scalar gate per token i and head h.
+The update is: `Δx_i = G_i · Σ_h λ_h · (centroid_h(i) − x_i)`, where G_i = sigmoid(W @ LN(h_i) + b) is an invariant scalar, λ_h = tanh(raw_h)/H is a constant scalar, and centroid_h(i) = Σ_j T_ij x_j.
 
-**Rotation** (x → xR, R ∈ O(3)): T_norm is invariant (computed from invariant cost C). γ_h(h_i) is invariant (computed from h, which is invariant). So `(xR) − T_norm(xR) = (x − T_norm·x)R`. The rotation factors out. ✓
+**Rotation** (x → xR, R ∈ O(3)): T is invariant (computed from invariant cost). G_i is invariant. So `centroid(xR) − xR = (centroid(x) − x)R`. Rotation factors out. ✓
 
-**Translation** (x → x + 1t^T): T_norm is row-stochastic (rows sum to 1), so `T_norm·(x + 1t^T) = T_norm·x + 1t^T`. The displacement `(x + 1t^T) − T_norm·(x + 1t^T) = x − T_norm·x`. Translation cancels completely. ✓
+**Translation**: For balanced OT with marginals 1/N, T rows sum to 1/N. The centroid uses normalized transport: `centroid(x+t) − (x+t) = centroid(x) − x` when rows are properly normalized. Re-centering once per cycle (§5.2) handles float32 drift.
 
-### 8.2 Input-Dependent γ Gate: Residue-Specific Attraction and Repulsion
+### 8.2 Three-Gate System
 
-| γ_h(h_i) sign | Effect on token i | Physical interpretation |
+| Gate | Formula | Range | Init | Purpose |
+|---|---|---|---|---|
+| Mixing α_h | `sigmoid(α_h)` | (0, 1) | σ(−1)≈0.27 | Feature vs geometry blend |
+| Intensity λ_h | `tanh(λ_h_raw) / H` | (−1/H, 1/H) | 0 (dormant) | Attraction (λ>0) or repulsion (λ<0) |
+| Mobility G_i | `sigmoid(W_gate(LN(h)) + b)` | (0, 1) | ~0.5 | Per-residue readiness to move |
+
+**Dormant at init**: λ_h_raw = 0 → tanh(0) = 0 → no coordinate movement at init. The network learns to activate coordinate updates as training progresses.
+
+**No weight decay** on α_h, r_h, λ_h_raw (small scalar parameters). W_gate gets weight decay.
+
+### 8.3 Separation of Concerns
+
+| Component | Role | Parameters |
 |---|---|---|
-| γ > 0 | Token moves AWAY from centroid | Repulsion: maintains steric separation |
-| γ < 0 | Token moves TOWARD centroid | Attraction: pulls co-evolving residues together |
+| MHA | Feature contextualization | W_Q, W_K, W_V, W_O, pos_bias |
+| SwiGLU | Nonlinear feature refinement | gate_proj, value_proj, out_proj |
+| Sinkhorn | Coordinate transport plan | W_Q_sink, W_K_sink, α_h, r_h, eps |
+| Gate | Coordinate update | W_gate, λ_h_raw |
 
-Unlike a fixed scalar γ per head, the gamma gate `tanh(W_gamma @ LN(h) + b)` is **residue-specific**: each token i computes its own per-head step size from its representation h_i. This allows the same head to attract some residues while repelling others within a single block.
+MHA handles all feature mixing. Sinkhorn handles all geometry. The two share no projections. Position bias (68-bin) lives in MHA — Sinkhorn gets positional information implicitly through feature cost.
 
-**Initialization**: W_gamma = 0 (zeros), bias ~ N(0, 1e-4). At init, `γ(h_i) = tanh(0 + b) ≈ b`, recovering the original per-head scalar behavior. The input-dependent component activates as W_gamma grows from zero.
+### 8.4 Dropout Rules
 
-**Scaling**: The multi-head combination is averaged (`/ H`), making the update scale-invariant to the number of heads. At init, effective step ≈ `mean(tanh(b)) / H ≈ b̄` — same order as the original scalar γ.
-
-**Parameters**: ~9.2K per block (LN: 1024 + W_gamma: 512×16 = 8192 + bias: 16), ×48 blocks ≈ 442K total (0.1% of model).
-
-**Regularization**: Both W_gamma.weight and W_gamma.bias are excluded from AdamW weight decay (same treatment as original scalar γ — coordinate path should not be regularized toward zero by decay). tanh bounds output to (-1, 1).
-
-### 8.3 Flash Kernel Integration
-
-`T_norm @ x_res` (H, N, 3) is computed alongside `T_norm @ V` (H, N, 32) in the same Flash-Sinkhorn Pass 2 kernel. The transport plan tiles are already in SRAM. Extra cost: 3 dims / 32 dims ≈ **10% on the value aggregation pass**. No additional memory.
-
-**Warm-starting across layers**: All blocks use K=20 iterations with warm-start from previous block's log_u, log_v. Convergence typically reached by K=10–14 with warm start; K=20 provides a safe ceiling. At inference, adaptive stopping with tol=1e-4 typically terminates at K≈14.
+- MHA attention weights: **dropout** (standard)
+- MHA output (W_O), SwiGLU output: **dropout** (standard)
+- Transport plan T: **NEVER dropout** (must stay doubly-stochastic)
 
 ---
 
@@ -1026,6 +948,7 @@ L_lddt = 1 − (1/|P|) Σ_{(i,j)∈P} (1/4) Σ_{δ∈{0.5,1,2,4}} sigmoid(δ −
 **Slope = 1** (no scaling factor). AF3 uses implicit slope=1 in `sigmoid(t - dev)`. A steeper slope (e.g. 10) causes sigmoid saturation at both extremes, killing gradients early in training when predictions are poor.
 
 **Per-type pair cutoff** (AF3 convention):
+
 - Nucleotide atom pairs: d_ij^true < 30 Å (nucleic acids have larger inter-residue spacing)
 - All other pairs: d_ij^true < 15 Å
 - A pair is "nucleotide" if either atom belongs to a DNA/RNA chain
@@ -1730,20 +1653,21 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 
 ### Engineering (Priority Order)
 
-0. ~~**Diffusion module stability (AF3 alignment)**~~ ✅ v4.6
+1. ~~**Diffusion module stability (AF3 alignment)**~~ ✅ v4.6
    - FourierEmbedding (frozen random), AdaLN (sigmoid-bounded), AdaLN-Zero output gates
    - c_in coordinate scaling, c_noise formula, LayerNorm on Fourier/pair features, LinearNoBias
 
 0.5. ~~**Flash-Sinkhorn Triton kernels + gradient correctness**~~ ✅
-   - All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
-   - Mask support: `-1e9` bias on padded positions in all score computations
-   - Flash forward (Triton): N=384 in 0.6ms, O(N) memory
-   - Training backward: Triton exact unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
-   - IFT backward (CG-based): implemented but gives incorrect gradients for UOT with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
-   - FP32 marginal fix: mu.float() before log() prevents BF16 underflow in softmax Jacobian backward
-   - Kabsch alignment: disable autocast for SVD/det (BF16 not supported)
-   - Coevol kernel wired into MSA (training + inference), distogram kernel wired into losses (eval)
-   - trunk_block.py: flash Sinkhorn for both training and inference (O(N) memory)
+
+- All 13 Triton kernels support batch dim: grid `(B*H, n_tiles)`
+- Mask support: `-1e9` bias on padded positions in all score computations
+- Flash forward (Triton): N=384 in 0.6ms, O(N) memory
+- Training backward: Triton exact unrolled (autograd through K iterations) — correct gradients for ALL parameters including mu_proj, nu_proj, coevol_to_marginal
+- IFT backward (CG-based): implemented but gives incorrect gradients for UOT with row-normalized output (∂T_norm/∂log_u = 0 at fixed point). Reserved for future O(N) backward via tiled unrolled approach.
+- FP32 marginal fix: mu.float() before log() prevents BF16 underflow in softmax Jacobian backward
+- Kabsch alignment: disable autocast for SVD/det (BF16 not supported)
+- Coevol kernel wired into MSA (training + inference), distogram kernel wired into losses (eval)
+- trunk_block.py: flash Sinkhorn for both training and inference (O(N) memory)
 
 1. **Flash-Sinkhorn kernel — further optimization from [flash-sinkhorn](https://github.com/ot-triton-lab/flash-sinkhorn) (MIT license)**
 
@@ -1784,6 +1708,7 @@ Recycling × num_cycles (all but last: no_grad; last: backprop):
 4. **Mixed precision strategy** (BF16 for most, FP32 for Sinkhorn log-domain)
 
 **Current memory profile** (no checkpointing, crop=384, B200 192GB):
+
 - Flash Sinkhorn: O(N) per block, cost tiles computed on the fly in Triton kernels
 - No O(N²) cost matrix stored; autograd saves only O(N) dual variables (log_u, log_v) per iteration
 - At crop=1024: ~3.2GB — still fits comfortably in 192GB

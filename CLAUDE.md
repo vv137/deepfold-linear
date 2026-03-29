@@ -26,9 +26,10 @@
 |-----------|--------|------------|
 | Input embedding | `model/input_embedding.py` | Token (38→512) + atom encoder (scatter_mean) |
 | MSA module | `model/msa.py` | 4 blocks, low-rank co-evolution (rank 16), Triton coevol kernel (inference) |
-| Trunk | `model/trunk.py` | 48 UOT+EGNN blocks, random cycles 1-5, flash Sinkhorn attention |
-| Sinkhorn attention | `model/kernels/sinkhorn_kernel.py` | Triton fwd+bwd, O(N) memory, CG-based IFT backward |
-| EGNN | `model/trunk_block.py` | Transport-weighted centroid, per-head γ (noise init 1e-4), per-layer pos_bias |
+| Trunk | `model/trunk.py` | 48 MHA+Sinkhorn blocks, random cycles 1-3 |
+| Balanced Sinkhorn | `model/kernels/flash_sinkhorn_transport.py` | Triton fwd+bwd, O(N) memory, unrolled backward |
+| Sinkhorn backward | `model/kernels/balanced_sinkhorn_bwd.py` | 4 Triton kernels: centroid_D, centroid, row_bwd, col_bwd |
+| Token OT Block | `model/trunk_block.py` | MHA (68-bin pos_bias, gated) + Sinkhorn transport + 3-gate coord update |
 | Diffusion | `model/diffusion_v2.py` | AF3 style: 3 encoder + 24 transformer + 3 decoder, c_skip EDM |
 | Losses | `model/losses.py` | EDM diffusion (Kabsch-aligned), smooth LDDT, distogram (Triton eval) |
 
@@ -36,8 +37,10 @@
 
 | Kernel | File | Batch | Training | Inference |
 |--------|------|-------|----------|-----------|
-| Flash Sinkhorn (fwd+bwd) | `kernels/sinkhorn_kernel.py` | ✅ (B*H, n_tiles) | ✅ exact unrolled backward | ✅ |
-| Flash Sinkhorn wrapper | `kernels/flash_sinkhorn_attn.py` | ✅ | ✅ (training+inference) | ✅ |
+| Flash Sinkhorn (UOT, legacy) | `kernels/sinkhorn_kernel.py` | ✅ (B*H, n_tiles) | ✅ exact unrolled backward | ✅ |
+| Flash Sinkhorn wrapper (UOT) | `kernels/flash_sinkhorn_attn.py` | ✅ | ✅ (training+inference) | ✅ |
+| Balanced Sinkhorn transport | `kernels/flash_sinkhorn_transport.py` | ✅ (B*H, n_tiles) | ✅ Triton unrolled bwd | ✅ |
+| Balanced Sinkhorn backward | `kernels/balanced_sinkhorn_bwd.py` | ✅ (B*H, n_tiles) | ✅ 4 kernels (D, centroid, row, col) | — |
 | Flash diffusion attn | `kernels/flash_diffusion_attn.py` | ✅ (B*H, n_tiles) | ✅ fwd+bwd | ✅ |
 | Windowed atom attn | `kernels/flash_atom_attn.py` | ✅ (B*H, n_windows) | ✅ fwd+bwd | ✅ |
 | Cross-attention | `kernels/cross_attn_kernel.py` | ✅ | ✅ fwd+bwd (kernel LSE) | ✅ |
@@ -47,7 +50,7 @@
 ## Training Infrastructure
 
 * Script: `scripts/train.py` (DDP, gradient accumulation, EMA)
-* Optimizer: AdamW, 3 param groups (decay, no-decay, EGNN γ)
+* Optimizer: AdamW, 2 param groups (decay, no-decay)
 * LR: AF3 schedule — linear warmup 1000 steps + plateau + exponential decay (0.95× every 50k)
 * Checkpoint: model + optimizer + EMA + scaler + RNG → `latest.pt` symlink
 * Resume: `--resume runs/.../checkpoints/latest.pt`
