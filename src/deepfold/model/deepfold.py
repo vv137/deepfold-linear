@@ -355,16 +355,18 @@ class DeepFoldLinear(nn.Module):
                 noise = torch.randn_like(x_true_i)
                 x_noisy_i = x_true_i + sigma_i * noise
 
-                # Checkpoint each diffusion call during training only.
-                # use_reentrant=True avoids metadata comparison issues with
-                # BalancedSinkhornDualFn saved tensors in trunk's autograd graph.
-                # Skip checkpoint during eval (no backward, no memory savings needed).
+                # Checkpoint during training, direct call during eval.
+                # use_reentrant=False for DDP compatibility (no "marked ready twice").
+                # determinism_check="none" because BalancedSinkhornDualFn in trunk
+                # saves tensors via ctx.save_for_backward that are reachable through
+                # h_res's autograd graph, causing position-shifted metadata mismatches.
                 _diff_args = (h_res, s_inputs, c_atom, x_noisy_i, sigma_i,
                               token_idx, pos_bins, token_atom_starts,
                               token_atom_counts, token_pad_mask, atom_pad_mask)
                 if self.training:
                     x_pred_i = checkpoint(self.diffusion, *_diff_args,
-                                          use_reentrant=True)
+                                          use_reentrant=False,
+                                          determinism_check="none")
                 else:
                     x_pred_i = self.diffusion(*_diff_args)
 
