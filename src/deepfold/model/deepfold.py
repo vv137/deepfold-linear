@@ -355,26 +355,18 @@ class DeepFoldLinear(nn.Module):
                 noise = torch.randn_like(x_true_i)
                 x_noisy_i = x_true_i + sigma_i * noise
 
-                # Checkpoint each diffusion call: only inputs saved, activations
-                # recomputed during backward. Peak memory = 1 sample at a time
-                # instead of M=16 simultaneously.
+                # Checkpoint each diffusion call during training only.
                 # use_reentrant=True avoids metadata comparison issues with
-                # custom autograd Functions (BalancedSinkhornDualFn) in trunk.
-                x_pred_i = checkpoint(
-                    self.diffusion,
-                    h_res,
-                    s_inputs,
-                    c_atom,
-                    x_noisy_i,
-                    sigma_i,
-                    token_idx,
-                    pos_bins,
-                    token_atom_starts,
-                    token_atom_counts,
-                    token_pad_mask,
-                    atom_pad_mask,
-                    use_reentrant=True,
-                )
+                # BalancedSinkhornDualFn saved tensors in trunk's autograd graph.
+                # Skip checkpoint during eval (no backward, no memory savings needed).
+                _diff_args = (h_res, s_inputs, c_atom, x_noisy_i, sigma_i,
+                              token_idx, pos_bins, token_atom_starts,
+                              token_atom_counts, token_pad_mask, atom_pad_mask)
+                if self.training:
+                    x_pred_i = checkpoint(self.diffusion, *_diff_args,
+                                          use_reentrant=True)
+                else:
+                    x_pred_i = self.diffusion(*_diff_args)
 
                 # Use symmetry-corrected GT if available, otherwise raw
                 x_true_loss = sym_true if sym_true is not None else x_true_i
