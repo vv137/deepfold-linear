@@ -37,6 +37,7 @@ class TokenOTBlock(nn.Module):
         r_0: float = 10.0,
         dropout: float = 0.0,
         block_idx: int = 0,
+        feature_transport: bool = True,
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -45,6 +46,7 @@ class TokenOTBlock(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_model // n_heads  # 32
         self.block_idx = block_idx
+        self.feature_transport = feature_transport
 
         # ---- [Step 1] MHA Track ----
         self.ln_mha = nn.LayerNorm(d_model)
@@ -65,9 +67,10 @@ class TokenOTBlock(nn.Module):
         self.w_q_sink = nn.Linear(d_model, d_model, bias=False)
         self.w_k_sink = nn.Linear(d_model, d_model, bias=False)
 
-        # Transport-weighted feature aggregation (coupled update)
-        self.w_v_sink = nn.Linear(d_model, d_model, bias=False)  # V projection for T@V
-        self.w_o_sink = nn.Linear(d_model, d_model, bias=False)  # output projection
+        # Transport-weighted feature aggregation (coupled h+x update)
+        if feature_transport:
+            self.w_v_sink = nn.Linear(d_model, d_model, bias=False)
+            self.w_o_sink = nn.Linear(d_model, d_model, bias=False)
 
         # Mixing gate α_h: sigmoid(alpha_h) blends feat vs geo
         # Init -1.0 → sigmoid(-1) ≈ 0.27 → start sequence/feature-heavy
@@ -161,24 +164,27 @@ class TokenOTBlock(nn.Module):
         h_s = self.ln_sink(h)
         Q_s = self.w_q_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
         K_s = self.w_k_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
-        V_s = self.w_v_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3)
+        V_s = self.w_v_sink(h_s).view(B, N, H, d_h).permute(0, 2, 1, 3) if self.feature_transport else None
 
         # L2-normalize Q, K for cosine cost (V not normalized)
         Q_s = F.normalize(Q_s, dim=-1)
         K_s = F.normalize(K_s, dim=-1)
 
-        # Fused dual transport: T@x (coords) + T@V (features) in one pass
-        x_centroid, h_centroid = balanced_sinkhorn_transport_dual(
-            Q_s, K_s, x_res, V_s, self.eps, self.alpha_h, self.r_h,
-            K_iter=K_ITER, mask=mask,
-        )
-        # x_centroid: (B, H, N, 3), h_centroid: (B, H, N, d_h)
-
-        # ---- Feature update: transport-weighted spatial context → h ----
-        h_transport = h_centroid.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
-        h_update_sink = self.w_o_sink(h_transport)
-        h_update_sink = h_update_sink * mask.unsqueeze(-1)
-        h = h + h_update_sink
+        if self.feature_transport:
+            # Fused dual: T@x + T@V in one Sinkhorn pass (Triton kernel)
+            x_centroid, h_centroid = balanced_sinkhorn_transport_dual(
+                Q_s, K_s, x_res, V_s, self.eps, self.alpha_h, self.r_h,
+                K_iter=K_ITER, mask=mask,
+            )
+            h_transport = h_centroid.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
+            h_update_sink = self.w_o_sink(h_transport)
+            h_update_sink = h_update_sink * mask.unsqueeze(-1)
+            h = h + h_update_sink
+        else:
+            x_centroid = balanced_sinkhorn_transport(
+                Q_s, K_s, x_res, self.eps, self.alpha_h, self.r_h,
+                K_iter=K_ITER, mask=mask,
+            )
 
         # ================================================================
         # [Step 4] Gated Coordinate Update

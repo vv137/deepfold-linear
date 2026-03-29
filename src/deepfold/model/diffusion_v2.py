@@ -161,7 +161,7 @@ class DiffusionTransformerLayer(nn.Module):
         V = self.w_v(s_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         G = self.w_g(s_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        if _HAS_TRITON and s.is_cuda:
+        if _HAS_TRITON and s.is_cuda and not getattr(self, '_use_reference', False):
             att_out = flash_diffusion_attn(Q, K, V, pos_weight, pos_bins, mask)
         else:
             from deepfold.model.kernels.flash_diffusion_attn import flash_diff_attn_ref
@@ -242,7 +242,7 @@ class WindowedAtomBlock(nn.Module):
         V = self.w_v(a_n).view(B, M, H, d_h).permute(0, 2, 1, 3)
         G = self.w_g(a_n).view(B, M, H, d_h).permute(0, 2, 1, 3)
 
-        if _HAS_TRITON and a.is_cuda:
+        if _HAS_TRITON and a.is_cuda and not getattr(self, '_use_reference', False):
             att_out = flash_atom_attn(Q, K, V, atom_mask)
         else:
             from deepfold.model.kernels.flash_atom_attn import flash_atom_attn_ref
@@ -318,7 +318,7 @@ class AtomToTokenCrossAttn(nn.Module):
         V = self.w_v(a_n).view(B, M, H, d_h).permute(0, 2, 1, 3)
         G = self.w_g(s_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
 
-        if _HAS_TRITON and s.is_cuda:
+        if _HAS_TRITON and s.is_cuda and not getattr(self, '_use_reference', False):
             att_out = atom_to_token_attn(Q, K, V, token_atom_starts,
                                          token_atom_counts, token_mask)
         else:
@@ -379,7 +379,7 @@ class TokenToAtomCrossAttn(nn.Module):
         V = self.w_v(s_n).view(B, N, H, d_h).permute(0, 2, 1, 3)
         G = self.w_g(a_n).view(B, M, H, d_h).permute(0, 2, 1, 3)
 
-        if _HAS_TRITON and a.is_cuda:
+        if _HAS_TRITON and a.is_cuda and not getattr(self, '_use_reference', False):
             att_out = token_to_atom_attn(Q, K, V, atom_mask, token_mask)
         else:
             from deepfold.model.kernels.cross_attn_kernel import token_to_atom_ref

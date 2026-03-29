@@ -35,6 +35,21 @@ from deepfold.data import const
 from deepfold.data.symmetry import apply_symmetry_correction
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def _force_reference(module):
+    """Force all sub-modules to use PyTorch reference impls instead of Triton.
+    Prevents Triton auto-tuning from polluting kernel caches."""
+    for m in module.modules():
+        m._use_reference = True
+    try:
+        yield
+    finally:
+        for m in module.modules():
+            m._use_reference = False
+
+
 def _heun_sample(denoise_fn, sigmas, x_init):
     """Heun 2nd-order ODE sampler. All no_grad — caller manages context."""
     x = x_init
@@ -313,25 +328,22 @@ class DeepFoldLinear(nn.Module):
             l_lddt_parts = []
 
             # ---- Symmetry: mini-rollout to determine best GT permutation ----
-            # Skip rollout for monomers (only identity permutation)
             has_sym = (sym_chain_symmetries is not None
                        and any(len(c) > 0 for c in sym_chain_symmetries))
-            sym_true = None   # permuted GT (shared across M samples)
-            sym_rm = None     # permuted resolved mask
+            sym_true = None
+            sym_rm = None
             if has_sym:
-                # 20-step no_grad Heun rollout → reference prediction.
-                # Use eval mode + detached inputs to avoid polluting RNG state
-                # and Triton kernel caches that checkpoint recompute depends on.
-                self.diffusion.eval()
+                # Rollout uses a separate diffusion copy to avoid polluting
+                # Triton/autograd state that checkpoint recompute depends on.
+                import copy
+                diff_copy = copy.deepcopy(self.diffusion)
+                diff_copy.eval()
                 with torch.no_grad():
                     sigmas_ro = karras_schedule(20, device)
-                    h_ro = h_res.detach()
-                    s_ro = s_inputs.detach()
-                    c_ro = c_atom.detach()
                     def _denoise_ro(x, sigma):
-                        return self.diffusion(
-                            h_ro, s_ro, c_ro, x, sigma,
-                            token_idx, pos_bins,
+                        return diff_copy(
+                            h_res.detach(), s_inputs.detach(), c_atom.detach(),
+                            x, sigma, token_idx, pos_bins,
                             token_atom_starts, token_atom_counts,
                             token_pad_mask, atom_pad_mask,
                         )
@@ -339,7 +351,7 @@ class DeepFoldLinear(nn.Module):
                         _denoise_ro, sigmas_ro,
                         torch.randn_like(x_atom_true) * SIGMA_MAX,
                     )
-                self.diffusion.train()
+                del diff_copy
                 sym_true, sym_rm = _apply_symmetry_batch(
                     x_ro, x_atom_true, atom_resolved_mask, atom_weights,
                     sym_all_coords, sym_all_resolved_mask,
@@ -355,11 +367,6 @@ class DeepFoldLinear(nn.Module):
                 noise = torch.randn_like(x_true_i)
                 x_noisy_i = x_true_i + sigma_i * noise
 
-                # Checkpoint during training, direct call during eval.
-                # use_reentrant=False for DDP compatibility (no "marked ready twice").
-                # determinism_check="none" because BalancedSinkhornDualFn in trunk
-                # saves tensors via ctx.save_for_backward that are reachable through
-                # h_res's autograd graph, causing position-shifted metadata mismatches.
                 _diff_args = (h_res, s_inputs, c_atom, x_noisy_i, sigma_i,
                               token_idx, pos_bins, token_atom_starts,
                               token_atom_counts, token_pad_mask, atom_pad_mask)
@@ -369,7 +376,6 @@ class DeepFoldLinear(nn.Module):
                 else:
                     x_pred_i = self.diffusion(*_diff_args)
 
-                # Use symmetry-corrected GT if available, otherwise raw
                 x_true_loss = sym_true if sym_true is not None else x_true_i
                 rm_loss = sym_rm if sym_rm is not None else atom_resolved_mask
 

@@ -60,6 +60,7 @@ class Trunk(nn.Module):
                 TokenOTBlock(
                     d_model=d_model, n_heads=h_res,
                     dropout=dropout, block_idx=i,
+                    feature_transport=False,
                 )
                 for i in range(n_trunk_blocks)
             ]
