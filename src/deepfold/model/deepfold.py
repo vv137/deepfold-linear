@@ -8,8 +8,6 @@ Triton kernels for O(N) memory. Proper c_skip EDM preconditioning.
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
-
 from deepfold.model.trunk import Trunk
 from deepfold.model.init import init_model
 from deepfold.model.position_encoding import compute_bins
@@ -309,12 +307,8 @@ class DeepFoldLinear(nn.Module):
             # Sample M noise levels (one per augmented sample)
             sigmas = sample_training_sigma(M, device)  # (M,)
 
-            # Run M diffusion forwards, accumulate losses.
-            # Each diffusion call is checkpointed individually to bound peak
-            # memory. No DDP issue: the loop runs in forward, checkpoint
-            # replays inside backward but DDP hooks are already resolved.
-            # Explicit None in loss_weights disables that term.
-            # Missing keys fall through to total_loss defaults.
+            # Run M diffusion forwards, accumulate losses (Boltz-1 convention:
+            # no gradient checkpointing — sequential forward, peak memory = 1 sample).
             _w = self.loss_weights
             zero = torch.tensor(0.0, device=device)
 
@@ -327,39 +321,6 @@ class DeepFoldLinear(nn.Module):
             l_diff_parts = []
             l_lddt_parts = []
 
-            # ---- Symmetry: mini-rollout to determine best GT permutation ----
-            has_sym = (sym_chain_symmetries is not None
-                       and any(len(c) > 0 for c in sym_chain_symmetries))
-            sym_true = None
-            sym_rm = None
-            if has_sym:
-                # Rollout uses a separate diffusion copy to avoid polluting
-                # Triton/autograd state that checkpoint recompute depends on.
-                import copy
-                diff_copy = copy.deepcopy(self.diffusion)
-                diff_copy.eval()
-                with torch.no_grad():
-                    sigmas_ro = karras_schedule(20, device)
-                    def _denoise_ro(x, sigma):
-                        return diff_copy(
-                            h_res.detach(), s_inputs.detach(), c_atom.detach(),
-                            x, sigma, token_idx, pos_bins,
-                            token_atom_starts, token_atom_counts,
-                            token_pad_mask, atom_pad_mask,
-                        )
-                    x_ro = _heun_sample(
-                        _denoise_ro, sigmas_ro,
-                        torch.randn_like(x_atom_true) * SIGMA_MAX,
-                    )
-                del diff_copy
-                sym_true, sym_rm = _apply_symmetry_batch(
-                    x_ro, x_atom_true, atom_resolved_mask, atom_weights,
-                    sym_all_coords, sym_all_resolved_mask,
-                    sym_crop_to_all_atom_map,
-                    sym_chain_symmetries, sym_amino_acid_symmetries,
-                    is_batched,
-                )
-
             for i in range(M):
                 x_true_i = x_atom_aug[i]  # (N_atom, 3) or (B, N_atom, 3)
                 sigma_i = sigmas[i]
@@ -367,25 +328,19 @@ class DeepFoldLinear(nn.Module):
                 noise = torch.randn_like(x_true_i)
                 x_noisy_i = x_true_i + sigma_i * noise
 
-                _diff_args = (h_res, s_inputs, c_atom, x_noisy_i, sigma_i,
-                              token_idx, pos_bins, token_atom_starts,
-                              token_atom_counts, token_pad_mask, atom_pad_mask)
-                if self.training:
-                    x_pred_i = checkpoint(self.diffusion, *_diff_args,
-                                          use_reentrant=False)
-                else:
-                    x_pred_i = self.diffusion(*_diff_args)
-
-                x_true_loss = sym_true if sym_true is not None else x_true_i
-                rm_loss = sym_rm if sym_rm is not None else atom_resolved_mask
+                x_pred_i = self.diffusion(
+                    h_res, s_inputs, c_atom, x_noisy_i, sigma_i,
+                    token_idx, pos_bins, token_atom_starts,
+                    token_atom_counts, token_pad_mask, atom_pad_mask,
+                )
 
                 if need_diff:
                     l_diff_parts.append(
                         edm_diffusion_loss(
                             x_pred_i,
-                            x_true_loss,
+                            x_true_i,
                             sigma_i,
-                            resolved_mask=rm_loss,
+                            resolved_mask=atom_resolved_mask,
                             atom_weights=atom_weights,
                         )
                     )
@@ -393,8 +348,8 @@ class DeepFoldLinear(nn.Module):
                     l_lddt_parts.append(
                         smooth_lddt(
                             x_pred_i,
-                            x_true_loss,
-                            resolved_mask=rm_loss,
+                            x_true_i,
+                            resolved_mask=atom_resolved_mask,
                             is_nucleotide=atom_is_nuc,
                         )
                     )
