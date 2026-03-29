@@ -319,12 +319,18 @@ class DeepFoldLinear(nn.Module):
             sym_true = None   # permuted GT (shared across M samples)
             sym_rm = None     # permuted resolved mask
             if has_sym:
-                # 20-step no_grad Heun rollout → reference prediction
+                # 20-step no_grad Heun rollout → reference prediction.
+                # Use eval mode + detached inputs to avoid polluting RNG state
+                # and Triton kernel caches that checkpoint recompute depends on.
+                self.diffusion.eval()
                 with torch.no_grad():
                     sigmas_ro = karras_schedule(20, device)
+                    h_ro = h_res.detach()
+                    s_ro = s_inputs.detach()
+                    c_ro = c_atom.detach()
                     def _denoise_ro(x, sigma):
                         return self.diffusion(
-                            h_res, s_inputs, c_atom, x, sigma,
+                            h_ro, s_ro, c_ro, x, sigma,
                             token_idx, pos_bins,
                             token_atom_starts, token_atom_counts,
                             token_pad_mask, atom_pad_mask,
@@ -333,6 +339,7 @@ class DeepFoldLinear(nn.Module):
                         _denoise_ro, sigmas_ro,
                         torch.randn_like(x_atom_true) * SIGMA_MAX,
                     )
+                self.diffusion.train()
                 sym_true, sym_rm = _apply_symmetry_batch(
                     x_ro, x_atom_true, atom_resolved_mask, atom_weights,
                     sym_all_coords, sym_all_resolved_mask,
