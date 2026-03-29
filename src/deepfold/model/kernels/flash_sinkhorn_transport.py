@@ -12,6 +12,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 BLOCK = 64
+BLOCK_DUAL = 32  # Smaller block for dual centroid kernel (extra SRAM for hc + V_tile)
 
 # ============================================================================
 # Triton forward kernels
@@ -424,17 +425,18 @@ class BalancedSinkhornDualFn(torch.autograd.Function):
             _balanced_row_update[grid](Q_f,K_f,x_f,eps,alpha_h,r_h,log_v,log_u,mask_bias,
                 N,d_h,H,log_marg, sq(0),sq(1),sq(2),sx(0),sx(1),stride_uvb,N,BLOCK)
 
-        # Fused dual centroid kernel
+        # Fused dual centroid kernel (uses smaller BLOCK_DUAL to fit hc + V_tile in SRAM)
         x_cent = torch.zeros(B,H,N,3, device=device, dtype=torch.float32)
         h_cent = torch.zeros(B,H,N,D_V, device=device, dtype=torch.float32)
         log_Z = torch.zeros(B,H,N, device=device, dtype=torch.float32)
-        _transport_centroid_dual_kernel[grid](
+        N_tiles_dual = (N+BLOCK_DUAL-1)//BLOCK_DUAL; grid_dual = (B*H, N_tiles_dual)
+        _transport_centroid_dual_kernel[grid_dual](
             Q_f,K_f,x_f,V_f, eps,alpha_h,r_h, log_u,log_v, x_cent,h_cent,log_Z,mask_bias,
             N,d_h,D_V,H, sq(0),sq(1),sq(2),sx(0),sx(1),
             sv(0),sv(1),sv(2),
             x_cent.stride(0),x_cent.stride(1),x_cent.stride(2),
             h_cent.stride(0),h_cent.stride(1),h_cent.stride(2),
-            stride_uvb,N,BLOCK)
+            stride_uvb,N,BLOCK_DUAL)
 
         ctx.save_for_backward(Q_f,K_f,x_f,V_f,eps,alpha_h,r_h,
                                log_u,log_v,log_Z,mask_bias,
@@ -477,20 +479,21 @@ class BalancedSinkhornDualFn(torch.autograd.Function):
             g_u_x,g_v_x,grad_x, grad_Q,grad_K,grad_x,grad_alpha,grad_r, mask_bias,
             N,d_h,H, sq(0),sq(1),sq(2),sx(0),sx(1),sgx(0),sgx(1),sgx(2),stride_uvb,N*3,N*3,BLOCK)
 
-        # ---- Phase 1b: V_h feature backward ----
+        # ---- Phase 1b: V_h feature backward (BLOCK_DUAL for D_V SRAM) ----
+        N_tiles_dual=(N+BLOCK_DUAL-1)//BLOCK_DUAL; grid_dual=(B*H,N_tiles_dual)
         D_h=torch.zeros(B,H,N,device=device,dtype=torch.float32)
-        _feature_bwd_D_kernel[grid](Q_f,K_f,x_f,V_f,eps,alpha_h,r_h,log_u,log_v,log_Z,
+        _feature_bwd_D_kernel[grid_dual](Q_f,K_f,x_f,V_f,eps,alpha_h,r_h,log_u,log_v,log_Z,
             grad_hc,D_h,mask_bias,
             N,d_h,D_V,H, sq(0),sq(1),sq(2),sx(0),sx(1),
-            sv(0),sv(1),sv(2), sgh(0),sgh(1),sgh(2),stride_uvb,BLOCK)
+            sv(0),sv(1),sv(2), sgh(0),sgh(1),sgh(2),stride_uvb,BLOCK_DUAL)
 
         g_u_h=torch.zeros(B,H,N,device=device,dtype=torch.float32)
         g_v_h=torch.zeros(B,H,N,device=device,dtype=torch.float32)
-        _feature_bwd_kernel[grid](Q_f,K_f,x_f,V_f,eps,alpha_h,r_h,log_u,log_v,log_Z,
+        _feature_bwd_kernel[grid_dual](Q_f,K_f,x_f,V_f,eps,alpha_h,r_h,log_u,log_v,log_Z,
             grad_hc,D_h, g_u_h,g_v_h,grad_V,
             grad_Q,grad_K,grad_x,grad_alpha,grad_r, mask_bias,
             N,d_h,D_V,H, sq(0),sq(1),sq(2),sx(0),sx(1),
-            sv(0),sv(1),sv(2), sgh(0),sgh(1),sgh(2),stride_uvb,N*3,BLOCK)
+            sv(0),sv(1),sv(2), sgh(0),sgh(1),sgh(2),stride_uvb,N*3,BLOCK_DUAL)
 
         # ---- Phase 2: Combine g_u/g_v, then shared Sinkhorn backward ----
         grad_lu = g_u_x + g_u_h
