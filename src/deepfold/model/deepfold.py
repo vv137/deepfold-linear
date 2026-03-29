@@ -379,7 +379,7 @@ class DeepFoldLinear(nn.Module):
                     token_pad_mask,
                     atom_pad_mask,
                     use_reentrant=False,
-                    context_fn=_create_diffusion_context,
+                    context_fn=_diffusion_context,
                 )
 
                 # Use symmetry-corrected GT if available, otherwise raw
