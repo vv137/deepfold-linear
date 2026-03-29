@@ -170,7 +170,7 @@ class DiffusionTransformerLayer(nn.Module):
 
         att_out = att_out.permute(0, 2, 1, 3).reshape(B, N, -1)  # (B, N, d_model)
         G_flat = G.permute(0, 2, 1, 3).reshape(B, N, -1)
-        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = self.w_o(torch.sigmoid(G_flat) * att_out)
 
         s = s + torch.sigmoid(self._attn_gate(s_cond)) * attn_update
         s = s * mask.unsqueeze(-1)
@@ -251,7 +251,7 @@ class WindowedAtomBlock(nn.Module):
 
         att_out = att_out.permute(0, 2, 1, 3).reshape(B, M, -1)
         G_flat = G.permute(0, 2, 1, 3).reshape(B, M, -1)
-        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = self.w_o(torch.sigmoid(G_flat) * att_out)
 
         a = a + torch.sigmoid(self._attn_gate(cond)) * attn_update
         a = a * atom_mask.unsqueeze(-1)

@@ -1,4 +1,4 @@
-# Protein Complex Structure Prediction Model: Full Design Specification v6.0
+# Protein Complex Structure Prediction Model: Full Design Specification v6.1
 
 ---
 
@@ -734,7 +734,7 @@ class TokenOTBlock(nn.Module):
         h_n = self.ln_mha(h)
         Q, K, V, G = project_qkvg(h_n)
         att_out = flash_diffusion_attn(Q, K, V, pos_bias.weight, pos_bins, mask)
-        h = h + sigmoid(G) * W_O(att_out)                 # gate after W_O
+        h = h + W_O(sigmoid(G) * att_out)                 # AF3 Alg 24: gate before W_O
 
         # ---- FFN (SwiGLU) ----
         h = h + dropout(swiglu(ln_ff(h)))

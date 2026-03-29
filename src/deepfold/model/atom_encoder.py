@@ -164,7 +164,7 @@ class AtomToTokenEncoder(nn.Module):
         att_out = att_out.reshape(B, N_atom, -1)  # (B, N_atom, 128)
 
         G_flat = G.reshape(B, N_atom, -1)  # (B, N_atom, 128)
-        q = q + torch.sigmoid(G_flat) * self.w_o(att_out)
+        q = q + self.w_o(torch.sigmoid(G_flat) * att_out)
 
         # --- SwiGLU transition ---
         q = q + self.swiglu(self.ln_ff(q))

@@ -139,7 +139,7 @@ class TokenOTBlock(nn.Module):
 
         att_out = att_out.permute(0, 2, 1, 3).reshape(B, N, H * d_h)  # (B, N, d)
         G_flat = G.permute(0, 2, 1, 3).reshape(B, N, H * d_h)
-        h_update = torch.sigmoid(G_flat) * self.w_o(att_out)
+        h_update = self.w_o(torch.sigmoid(G_flat) * att_out)
         h_update = h_update * mask.unsqueeze(-1)
         h = h + h_update
 

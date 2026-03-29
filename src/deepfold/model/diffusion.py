@@ -245,7 +245,7 @@ class AtomBlock(nn.Module):
         att_out = torch.einsum("bhij,bhjd->bhid", attn, V)  # (B,H,N,d_h)
         att_out = att_out.permute(0, 2, 1, 3).reshape(B, N_atom, -1)  # (B,N,H*d_h)
         G_flat = G.permute(0, 2, 1, 3).reshape(B, N_atom, -1)
-        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = self.w_o(torch.sigmoid(G_flat) * att_out)
 
         # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
         q = q + torch.sigmoid(self._attn_gate(cond)) * attn_update
@@ -307,7 +307,7 @@ class AtomBlock(nn.Module):
         att_out = torch.einsum("hij,jhd->ihd", attn, V)  # (H, N_atom, d_h)
         att_out = att_out.permute(1, 0, 2).reshape(N_atom, -1)  # (N_atom, H*d_h)
         G_flat = G.reshape(N_atom, -1)  # G is (N_atom, H, d_h)
-        attn_update = torch.sigmoid(G_flat) * self.w_o(att_out)
+        attn_update = self.w_o(torch.sigmoid(G_flat) * att_out)
 
         # AdaLN-Zero gate on attention output (AF3 Algorithm 24, lines 12-14)
         q = q + torch.sigmoid(self._attn_gate(cond)) * attn_update

@@ -154,7 +154,7 @@ class MSABlock(nn.Module):
         att_out = torch.einsum("bshij,bsjhd->bsihd", attn, V)  # (B, S, N_prot, H, d_h)
         att_out = att_out.reshape(B, S, N_prot, -1)  # (B, S, N_prot, d_msa)
         G_flat = G.reshape(B, S, N_prot, -1)
-        m = m + torch.sigmoid(G_flat) * self.w_o_row(att_out)
+        m = m + self.w_o_row(torch.sigmoid(G_flat) * att_out)
 
         # ---- 3. Column cross-attention (h_res queries MSA over S dim) ----
         m_n = self.ln_col(m)  # (B, S, N_prot, d_msa)
